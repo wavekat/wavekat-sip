@@ -1,0 +1,30 @@
+[package]
+name = "wavekat-sip"
+description = "SIP signaling and RTP transport for voice pipelines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository = "https://github.com/wavekat/wavekat-sip"
+homepage = "https://github.com/wavekat/wavekat-sip"
+documentation = "https://docs.rs/wavekat-sip"
+readme = "../../README.md"
+keywords = ["sip", "rtp", "voip", "telephony", "wavekat"]
+categories = ["network-programming", "multimedia::audio"]
+build = "build.rs"
+
+[dependencies]
+rsip = "0.4"
+rsipstack = "0.4"
+tokio = { version = "1", features = ["macros", "rt", "net", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+hostname = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
