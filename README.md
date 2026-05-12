@@ -107,6 +107,6 @@ Copyright 2026 WaveKat.
 
 ### Acknowledgements
 
-- [`rsipstack`](https://github.com/restsend/rsipstack) — the SIP transaction
-  / dialog engine this crate wraps.
+- [`rsipstack`](https://crates.io/crates/rsipstack) — the SIP transaction /
+  dialog engine this crate wraps.
 - [`rsip`](https://crates.io/crates/rsip) — SIP message types.
