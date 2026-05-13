@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use rsip::{
-    prelude::HeadersExt, prelude::ToTypedHeader, prelude::UntypedHeader, SipMessage, StatusCode, Uri,
+    prelude::HeadersExt, prelude::ToTypedHeader, prelude::UntypedHeader, SipMessage, StatusCode,
+    Uri,
 };
 use rsipstack::{
     dialog::authenticate::{handle_client_authenticate, Credential},
