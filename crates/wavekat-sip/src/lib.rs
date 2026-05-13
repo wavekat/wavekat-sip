@@ -135,7 +135,7 @@ pub mod sdp;
 pub use account::{SipAccount, Transport};
 pub use callee::{AcceptedCall, Callee};
 pub use endpoint::SipEndpoint;
-pub use registrar::Registrar;
+pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use rtp::{receive_rtp, RtpHeader};
 pub use sdp::{build_sdp, parse_sdp, RemoteMedia};
 
