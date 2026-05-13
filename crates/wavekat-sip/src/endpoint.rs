@@ -4,10 +4,12 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use rsip::StatusCode;
 use rsipstack::{
-    dialog::dialog_layer::DialogLayer,
+    dialog::{dialog::Dialog, dialog_layer::DialogLayer},
     transaction::{
         endpoint::{EndpointBuilder, EndpointInnerRef, EndpointOption},
+        transaction::Transaction,
         TransactionReceiver,
     },
     transport::{udp::UdpConnection, SipAddr, SipConnection, TransportLayer},
@@ -152,6 +154,65 @@ impl SipEndpoint {
     pub fn shutdown(&self) {
         self.transport_cancel.cancel();
     }
+
+    /// Route an inbound in-dialog transaction (BYE, INFO, OPTIONS,
+    /// re-INVITE, …) to its matching dialog and drive the dialog's
+    /// `handle()` to completion.
+    ///
+    /// The incoming-transaction stream returned by [`SipEndpoint::new`]
+    /// yields *every* inbound transaction the transport receives — the
+    /// initial INVITE for a new call, but also subsequent BYE/INFO/etc.
+    /// for already-established dialogs. Initial INVITEs go to
+    /// [`crate::Callee`]; everything else should be handed to this
+    /// helper so the dialog state machine advances (e.g. moving to
+    /// `Terminated` on a remote BYE and sending the matching 200 OK).
+    ///
+    /// On a non-matching transaction this replies with `481 Call/
+    /// Transaction Does Not Exist` per RFC 3261; on a matching dialog
+    /// of an unsupported kind (subscriptions, publications) it replies
+    /// `501 Not Implemented`. The outcome is returned so callers can
+    /// emit diagnostics.
+    pub async fn dispatch_in_dialog(
+        &self,
+        mut tx: Transaction,
+    ) -> Result<DispatchOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(dialog) = self.dialog_layer.match_dialog(&tx) else {
+            // No dialog matched. Best-effort 481; rsipstack's transport
+            // layer drops stateless replies that fail to send.
+            let _ = tx.reply(StatusCode::CallTransactionDoesNotExist).await;
+            return Ok(DispatchOutcome::NoDialog);
+        };
+
+        match dialog {
+            Dialog::ServerInvite(mut d) => {
+                d.handle(&mut tx).await?;
+                Ok(DispatchOutcome::Handled)
+            }
+            Dialog::ClientInvite(mut d) => {
+                d.handle(&mut tx).await?;
+                Ok(DispatchOutcome::Handled)
+            }
+            _ => {
+                let _ = tx.reply(StatusCode::NotImplemented).await;
+                Ok(DispatchOutcome::Unsupported)
+            }
+        }
+    }
+}
+
+/// Outcome of [`SipEndpoint::dispatch_in_dialog`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// A dialog matched and ran its handler. Subsequent state
+    /// transitions (e.g. `Terminated` on a BYE) will appear on the
+    /// dialog's `DialogStateReceiver`.
+    Handled,
+    /// No dialog matched the transaction's `Call-ID` + tag pair. The
+    /// helper replied `481 Call/Transaction Does Not Exist`.
+    NoDialog,
+    /// A dialog matched, but its kind isn't an INVITE dialog (e.g.
+    /// subscriptions). The helper replied `501 Not Implemented`.
+    Unsupported,
 }
 
 /// Build the User-Agent header string.
