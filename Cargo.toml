@@ -7,6 +7,6 @@ resolver = "2"
 # wavekat-voice patches us via [patch.crates-io] = "0.0.2". Bump to 0.0.3
 # only when the in-flight caller/callee port (see docs/01-port-plan.md) is
 # ready to publish.
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 license = "Apache-2.0"
