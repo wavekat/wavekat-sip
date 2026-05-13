@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/wavekat/wavekat-sip/compare/v0.0.4...v0.0.5) - 2026-05-13
+
+### Fixed
+
+- *(registrar)* return Call-ID value without header prefix in diagnostics ([#7](https://github.com/wavekat/wavekat-sip/pull/7))
+
 ## [0.0.4](https://github.com/wavekat/wavekat-sip/compare/v0.0.3...v0.0.4) - 2026-05-13
 
 ### Added
