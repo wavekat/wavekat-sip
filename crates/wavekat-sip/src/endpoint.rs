@@ -263,4 +263,19 @@ mod tests {
         let ip = detect_local_ip(&account).unwrap();
         assert_eq!(ip, IpAddr::from([127, 0, 0, 1]));
     }
+
+    #[tokio::test]
+    async fn endpoint_exposes_local_addr_and_transport() {
+        let account = make_account(Some("127.0.0.1"), Some(5060));
+        let cancel = CancellationToken::new();
+        let (endpoint, _incoming) = SipEndpoint::new(&account, cancel.clone()).await.unwrap();
+
+        let local = endpoint.local_addr().expect("local_addr available");
+        assert_eq!(local.ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_ne!(local.port(), 0, "bound port should be assigned");
+        assert_eq!(endpoint.local_ip(), local.ip());
+        assert_eq!(endpoint.transport(), Transport::Udp);
+
+        endpoint.shutdown();
+    }
 }

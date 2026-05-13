@@ -458,3 +458,110 @@ impl Registrar {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::Transport;
+
+    fn make_account() -> SipAccount {
+        SipAccount {
+            display_name: "Test".to_string(),
+            username: "1001".to_string(),
+            password: "secret".to_string(),
+            domain: "127.0.0.1".to_string(),
+            auth_username: None,
+            server: Some("127.0.0.1".to_string()),
+            port: Some(5060),
+            transport: Transport::Udp,
+        }
+    }
+
+    async fn make_registrar() -> (Registrar, Arc<SipEndpoint>, CancellationToken) {
+        let account = make_account();
+        let cancel = CancellationToken::new();
+        let (endpoint, _incoming) = SipEndpoint::new(&account, cancel.clone()).await.unwrap();
+        let endpoint = Arc::new(endpoint);
+        let registrar = Registrar::new(account, endpoint.clone(), cancel.clone(), 60, 50).unwrap();
+        (registrar, endpoint, cancel)
+    }
+
+    #[tokio::test]
+    async fn diagnostics_initial_state() {
+        let (registrar, endpoint, _cancel) = make_registrar().await;
+        let diag = registrar.diagnostics();
+
+        assert_eq!(diag.server_uri, "sip:127.0.0.1:5060");
+        assert!(diag.contact_uri.is_none());
+        assert!(!diag.call_id.is_empty());
+        assert_eq!(diag.cseq, 0);
+        assert_eq!(diag.configured_expires, 60);
+        assert!(diag.negotiated_expires.is_none());
+        assert!(diag.last_status.is_none());
+        assert!(diag.last_attempt_at.is_none());
+        assert!(diag.last_success_at.is_none());
+        assert!(diag.last_error.is_none());
+        assert_eq!(diag.register_count, 0);
+        assert_eq!(diag.failure_count, 0);
+
+        endpoint.shutdown();
+    }
+
+    #[tokio::test]
+    async fn record_attempt_sets_timestamp() {
+        let (registrar, endpoint, _cancel) = make_registrar().await;
+        registrar.record_attempt();
+        let diag = registrar.diagnostics();
+        assert!(diag.last_attempt_at.is_some());
+        assert!(diag.last_success_at.is_none());
+        endpoint.shutdown();
+    }
+
+    #[tokio::test]
+    async fn record_success_populates_fields_and_clears_error() {
+        let (registrar, endpoint, _cancel) = make_registrar().await;
+        registrar.record_failure(Some(401), "auth required".to_string());
+        registrar.record_success(200, 120, Some("sip:1001@127.0.0.1:5060".to_string()));
+
+        let diag = registrar.diagnostics();
+        assert_eq!(diag.last_status, Some(200));
+        assert_eq!(diag.negotiated_expires, Some(120));
+        assert_eq!(diag.contact_uri.as_deref(), Some("sip:1001@127.0.0.1:5060"));
+        assert!(diag.last_success_at.is_some());
+        assert!(diag.last_error.is_none(), "success should clear error");
+        assert_eq!(diag.register_count, 1);
+        assert_eq!(diag.failure_count, 1, "prior failure count preserved");
+        endpoint.shutdown();
+    }
+
+    #[tokio::test]
+    async fn record_failure_increments_and_keeps_contact() {
+        let (registrar, endpoint, _cancel) = make_registrar().await;
+        registrar.record_success(200, 120, Some("sip:1001@127.0.0.1:5060".to_string()));
+        registrar.record_failure(Some(503), "service unavailable".to_string());
+
+        let diag = registrar.diagnostics();
+        assert_eq!(diag.last_status, Some(503));
+        assert_eq!(diag.last_error.as_deref(), Some("service unavailable"));
+        assert_eq!(diag.failure_count, 1);
+        assert_eq!(diag.register_count, 1);
+        assert_eq!(
+            diag.contact_uri.as_deref(),
+            Some("sip:1001@127.0.0.1:5060"),
+            "failure should not wipe last-known contact"
+        );
+        endpoint.shutdown();
+    }
+
+    #[tokio::test]
+    async fn record_failure_without_status_preserves_none() {
+        let (registrar, endpoint, _cancel) = make_registrar().await;
+        registrar.record_failure(None, "transaction terminated".to_string());
+
+        let diag = registrar.diagnostics();
+        assert!(diag.last_status.is_none());
+        assert_eq!(diag.last_error.as_deref(), Some("transaction terminated"));
+        assert_eq!(diag.failure_count, 1);
+        endpoint.shutdown();
+    }
+}
