@@ -25,6 +25,10 @@ pub struct SipEndpoint {
     pub dialog_layer: Arc<DialogLayer>,
     /// First bound SIP address (host:port).
     pub sip_addr: SipAddr,
+    /// Transport the endpoint was bound for. Mirrors `SipAccount::transport`
+    /// at the moment of `SipEndpoint::new`. Cached here so diagnostics can
+    /// report it without holding onto the account.
+    transport: Transport,
     transport_cancel: CancellationToken,
 }
 
@@ -103,6 +107,7 @@ impl SipEndpoint {
                 inner,
                 dialog_layer,
                 sip_addr,
+                transport: account.transport,
                 transport_cancel,
             },
             incoming,
@@ -111,12 +116,24 @@ impl SipEndpoint {
 
     /// Local IP address this endpoint is bound to.
     pub fn local_ip(&self) -> IpAddr {
-        self.sip_addr
-            .addr
-            .to_string()
-            .parse::<SocketAddr>()
+        self.local_addr()
             .map(|a| a.ip())
             .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+    }
+
+    /// Local socket address (IP + port) this endpoint is bound to.
+    ///
+    /// Returns `None` if the underlying rsipstack address can't be parsed
+    /// as a `SocketAddr` (in practice this only happens before transport
+    /// is fully up, which shouldn't be observable from a constructed
+    /// `SipEndpoint`).
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.sip_addr.addr.to_string().parse::<SocketAddr>().ok()
+    }
+
+    /// Transport this endpoint was bound for (UDP/TCP).
+    pub fn transport(&self) -> Transport {
+        self.transport
     }
 
     /// Cancel the transport — stops the serve loop and frees the socket.

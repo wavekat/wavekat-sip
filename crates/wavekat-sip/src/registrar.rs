@@ -1,6 +1,7 @@
 //! REGISTER + digest auth + keepalive re-registration.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use rsip::{prelude::HeadersExt, prelude::ToTypedHeader, SipMessage, StatusCode, Uri};
 use rsipstack::{
@@ -32,6 +33,62 @@ pub struct Registrar {
     register_expires: u32,
     /// Keepalive re-registration interval (seconds).
     keepalive_secs: u32,
+    /// Observable snapshot of REGISTER outcomes. Held under a sync mutex
+    /// so [`Registrar::diagnostics`] doesn't need to be async; updates
+    /// are short and never block on I/O.
+    diag: Mutex<DiagState>,
+}
+
+/// Mutable state used to populate [`RegistrarDiagnostics`]. Kept separate
+/// from the long-lived registrar fields above so the diagnostics getter
+/// can snapshot it under a single lock.
+#[derive(Debug, Default)]
+struct DiagState {
+    contact_uri: Option<String>,
+    negotiated_expires: Option<u32>,
+    last_status: Option<u16>,
+    last_attempt_at: Option<SystemTime>,
+    last_success_at: Option<SystemTime>,
+    last_error: Option<String>,
+    register_count: u64,
+    failure_count: u64,
+}
+
+/// Snapshot of the registrar's current state. Returned by
+/// [`Registrar::diagnostics`]; cheap to clone.
+///
+/// All timestamps are wall-clock ([`SystemTime`]) so callers can render
+/// them as absolute strings without needing a separate uptime reference.
+#[derive(Debug, Clone)]
+pub struct RegistrarDiagnostics {
+    /// SIP server URI we send REGISTER to, e.g. `sip:pbx.example.com:5060`.
+    pub server_uri: String,
+    /// `Contact` URI advertised in the most recent successful REGISTER.
+    /// `None` until the first 200 OK.
+    pub contact_uri: Option<String>,
+    /// `Call-ID` used across this registrar's REGISTER dialog.
+    pub call_id: String,
+    /// Next CSeq the registrar will send (current value of the internal
+    /// atomic — may have already been incremented past the value used in
+    /// the last sent request).
+    pub cseq: u32,
+    /// `Expires` we ask for. From the registrar's constructor.
+    pub configured_expires: u32,
+    /// `Expires` the server returned in the most recent 200 OK.
+    pub negotiated_expires: Option<u32>,
+    /// SIP status of the most recent final response.
+    pub last_status: Option<u16>,
+    /// When the most recent REGISTER was sent.
+    pub last_attempt_at: Option<SystemTime>,
+    /// When the most recent 200 OK was received.
+    pub last_success_at: Option<SystemTime>,
+    /// Most recent failure message (only set when `last_status` indicates
+    /// failure or the transaction terminated unexpectedly).
+    pub last_error: Option<String>,
+    /// Cumulative count of successful REGISTERs since process start.
+    pub register_count: u64,
+    /// Cumulative count of failed REGISTERs since process start.
+    pub failure_count: u64,
 }
 
 impl Registrar {
@@ -61,7 +118,52 @@ impl Registrar {
             contact: tokio::sync::Mutex::new(None),
             register_expires,
             keepalive_secs,
+            diag: Mutex::new(DiagState::default()),
         })
+    }
+
+    /// Snapshot of REGISTER state — local socket, server target, last
+    /// status, counters, etc. Cheap to clone; safe to call from any task.
+    pub fn diagnostics(&self) -> RegistrarDiagnostics {
+        let diag = self.diag.lock().expect("registrar diag mutex poisoned");
+        RegistrarDiagnostics {
+            server_uri: self.server_uri.to_string(),
+            contact_uri: diag.contact_uri.clone(),
+            call_id: self.call_id.to_string(),
+            cseq: self.seq.load(std::sync::atomic::Ordering::Relaxed),
+            configured_expires: self.register_expires,
+            negotiated_expires: diag.negotiated_expires,
+            last_status: diag.last_status,
+            last_attempt_at: diag.last_attempt_at,
+            last_success_at: diag.last_success_at,
+            last_error: diag.last_error.clone(),
+            register_count: diag.register_count,
+            failure_count: diag.failure_count,
+        }
+    }
+
+    fn record_attempt(&self) {
+        let mut diag = self.diag.lock().expect("registrar diag mutex poisoned");
+        diag.last_attempt_at = Some(SystemTime::now());
+    }
+
+    fn record_success(&self, status: u16, expires: u32, contact_uri: Option<String>) {
+        let mut diag = self.diag.lock().expect("registrar diag mutex poisoned");
+        diag.last_status = Some(status);
+        diag.last_success_at = Some(SystemTime::now());
+        diag.negotiated_expires = Some(expires);
+        if let Some(c) = contact_uri {
+            diag.contact_uri = Some(c);
+        }
+        diag.register_count = diag.register_count.saturating_add(1);
+        diag.last_error = None;
+    }
+
+    fn record_failure(&self, status: Option<u16>, error: String) {
+        let mut diag = self.diag.lock().expect("registrar diag mutex poisoned");
+        diag.last_status = status;
+        diag.last_error = Some(error);
+        diag.failure_count = diag.failure_count.saturating_add(1);
     }
 
     fn next_seq(&self) -> u32 {
@@ -87,6 +189,8 @@ impl Registrar {
             let request = self.build_register_request(seq, &contact, self.register_expires)?;
             debug!("REGISTER request:\n{request}");
 
+            self.record_attempt();
+
             let mut seq_val = seq;
             let final_response = self.send_register_with_auth(request, &mut seq_val).await?;
             self.set_seq(seq_val);
@@ -102,6 +206,8 @@ impl Registrar {
                         .map(|e| e.seconds().unwrap_or(50))
                         .unwrap_or(50);
 
+                    let contact_str = typed_contact.as_ref().map(|c| c.uri.to_string());
+                    self.record_success(200, expires, contact_str);
                     *self.contact.lock().await = typed_contact;
 
                     info!(
@@ -111,10 +217,15 @@ impl Registrar {
                     return Ok(());
                 }
                 Some(resp) => {
-                    warn!("Registration failed with status {}", resp.status_code);
+                    let code = u16::from(resp.status_code.clone());
+                    let msg = format!("registration failed with status {}", resp.status_code);
+                    warn!("{msg}");
+                    self.record_failure(Some(code), msg);
                 }
                 None => {
-                    warn!("Registration transaction terminated unexpectedly");
+                    let msg = "registration transaction terminated unexpectedly".to_string();
+                    warn!("{msg}");
+                    self.record_failure(None, msg);
                 }
             }
 
@@ -149,10 +260,14 @@ impl Registrar {
             let request = match self.build_register_request(seq, &contact, self.register_expires) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("Failed to build re-register request: {e}");
+                    let msg = format!("failed to build re-register request: {e}");
+                    warn!("{msg}");
+                    self.record_failure(None, msg);
                     continue;
                 }
             };
+
+            self.record_attempt();
 
             let mut seq_val = seq;
             match self.send_register_with_auth(request, &mut seq_val).await {
@@ -166,6 +281,8 @@ impl Registrar {
                         .map(|e| e.seconds().unwrap_or(50))
                         .unwrap_or(50);
 
+                    let contact_str = typed_contact.as_ref().map(|c| c.uri.to_string());
+                    self.record_success(200, expires, contact_str);
                     *self.contact.lock().await = typed_contact;
                     self.set_seq(seq_val);
 
@@ -175,15 +292,22 @@ impl Registrar {
                     );
                 }
                 Ok(Some(resp)) => {
-                    warn!("Re-registration failed: {}", resp.status_code);
+                    let code = u16::from(resp.status_code.clone());
+                    let msg = format!("re-registration failed: {}", resp.status_code);
+                    warn!("{msg}");
+                    self.record_failure(Some(code), msg);
                     self.set_seq(seq_val);
                 }
                 Ok(None) => {
-                    warn!("Re-registration got no response");
+                    let msg = "re-registration got no response".to_string();
+                    warn!("{msg}");
+                    self.record_failure(None, msg);
                     self.set_seq(seq_val);
                 }
                 Err(e) => {
-                    warn!("Re-registration error: {e}");
+                    let msg = format!("re-registration error: {e}");
+                    warn!("{msg}");
+                    self.record_failure(None, msg);
                 }
             }
         }
