@@ -3,6 +3,10 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
+# Cargo's 0.0.x range matching is strict — keep version == published while
+# wavekat-voice patches us via [patch.crates-io] = "0.0.2". Bump to 0.0.3
+# only when the in-flight caller/callee port (see docs/01-port-plan.md) is
+# ready to publish.
+version = "0.0.2"
 edition = "2021"
 license = "Apache-2.0"

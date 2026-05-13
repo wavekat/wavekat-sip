@@ -1,6 +1,6 @@
 # 01 — Roadmap
 
-> Status: in-progress · Date: 2026-05-12
+> Status: in-progress · Date: 2026-05-13
 
 This crate extracts the SIP signaling and RTP transport pieces from an
 earlier softphone prototype into a focused, reusable SDK.
@@ -15,6 +15,13 @@ earlier softphone prototype into a focused, reusable SDK.
 | `rtp`       | `RtpHeader::parse` + debug `receive_rtp` loop.                       |
 | `registrar` | REGISTER + digest auth retry + keepalive + unregister.               |
 
+## Landing in v0.0.3 (in flight)
+
+| Module      | Status        | Notes                                                                |
+|-------------|---------------|----------------------------------------------------------------------|
+| `callee`    | implemented   | `accept_transaction` / `reject_transaction` returning `AcceptedCall` (dialog, RTP socket, remote media, state receiver). No audio. |
+| `caller`    | not started   | `Caller::invite(target)` returning `(Dialog, RemoteMedia, Arc<UdpSocket>)`. |
+
 ## Pending
 
 ### `caller` — outbound INVITE
@@ -22,12 +29,6 @@ earlier softphone prototype into a focused, reusable SDK.
 `Caller::invite(target)` returns `(Dialog, RemoteMedia, Arc<UdpSocket>)`
 and lets the consumer drive RTP themselves. A higher-level helper can sit
 on top for the common case.
-
-### `callee` — inbound INVITE
-
-Mirror of `caller`. Expose `accept_transaction(tx, sdp_answer)` and
-`reject_transaction(tx, status_code)` returning the bound RTP socket and
-remote media descriptor, without touching audio devices.
 
 ### RTP send helper
 
