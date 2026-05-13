@@ -3,7 +3,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use rsip::{prelude::HeadersExt, prelude::ToTypedHeader, SipMessage, StatusCode, Uri};
+use rsip::{
+    prelude::HeadersExt, prelude::ToTypedHeader, prelude::UntypedHeader, SipMessage, StatusCode,
+    Uri,
+};
 use rsipstack::{
     dialog::authenticate::{handle_client_authenticate, Credential},
     transaction::{
@@ -66,7 +69,9 @@ pub struct RegistrarDiagnostics {
     /// `Contact` URI advertised in the most recent successful REGISTER.
     /// `None` until the first 200 OK.
     pub contact_uri: Option<String>,
-    /// `Call-ID` used across this registrar's REGISTER dialog.
+    /// `Call-ID` value used across this registrar's REGISTER dialog. The
+    /// bare value only (e.g. `abc123@example.com`) — no `Call-ID:` header
+    /// prefix, so callers can render it directly without stripping.
     pub call_id: String,
     /// Next CSeq the registrar will send (current value of the internal
     /// atomic — may have already been incremented past the value used in
@@ -129,7 +134,7 @@ impl Registrar {
         RegistrarDiagnostics {
             server_uri: self.server_uri.to_string(),
             contact_uri: diag.contact_uri.clone(),
-            call_id: self.call_id.to_string(),
+            call_id: self.call_id.value().to_string(),
             cseq: self.seq.load(std::sync::atomic::Ordering::Relaxed),
             configured_expires: self.register_expires,
             negotiated_expires: diag.negotiated_expires,
@@ -494,6 +499,9 @@ mod tests {
         assert_eq!(diag.server_uri, "sip:127.0.0.1:5060");
         assert!(diag.contact_uri.is_none());
         assert!(!diag.call_id.is_empty());
+        // Bare value, no header prefix — callers render this directly.
+        assert!(!diag.call_id.starts_with("Call-ID"));
+        assert!(!diag.call_id.contains(": "));
         assert_eq!(diag.cseq, 0);
         assert_eq!(diag.configured_expires, 60);
         assert!(diag.negotiated_expires.is_none());
