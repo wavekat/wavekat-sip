@@ -21,9 +21,9 @@ use crate::account::{SipAccount, Transport};
 ///
 /// rsipstack's default is `restsend.com` (its author's product domain), which
 /// would otherwise leak into every REGISTER and INVITE we send. We override it
-/// to a branded, neutral hostname-like identifier; the random prefix already
-/// provides global uniqueness per RFC 3261.
-const CALLID_SUFFIX: &str = "wavekat.local";
+/// to our own product domain; the random prefix already provides global
+/// uniqueness per RFC 3261, so the suffix is purely cosmetic/branding.
+const CALLID_SUFFIX: &str = "wavekat.com";
 
 /// A bound SIP endpoint that owns its transport and dialog layer.
 pub struct SipEndpoint {
