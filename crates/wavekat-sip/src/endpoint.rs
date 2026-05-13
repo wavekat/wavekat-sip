@@ -7,7 +7,7 @@ use std::sync::Arc;
 use rsipstack::{
     dialog::dialog_layer::DialogLayer,
     transaction::{
-        endpoint::{EndpointBuilder, EndpointInnerRef},
+        endpoint::{EndpointBuilder, EndpointInnerRef, EndpointOption},
         TransactionReceiver,
     },
     transport::{udp::UdpConnection, SipAddr, SipConnection, TransportLayer},
@@ -16,6 +16,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::account::{SipAccount, Transport};
+
+/// Host part appended to the random prefix in generated `Call-ID` headers.
+///
+/// rsipstack's default is `restsend.com` (its author's product domain), which
+/// would otherwise leak into every REGISTER and INVITE we send. We override it
+/// to our own product domain; the random prefix already provides global
+/// uniqueness per RFC 3261, so the suffix is purely cosmetic/branding.
+const CALLID_SUFFIX: &str = "wavekat.com";
 
 /// A bound SIP endpoint that owns its transport and dialog layer.
 pub struct SipEndpoint {
@@ -81,6 +89,10 @@ impl SipEndpoint {
             .with_user_agent(&user_agent)
             .with_transport_layer(transport_layer)
             .with_cancel_token(transport_cancel.clone())
+            .with_option(EndpointOption {
+                callid_suffix: Some(CALLID_SUFFIX.to_string()),
+                ..EndpointOption::default()
+            })
             .build();
 
         let inner = endpoint.inner.clone();
@@ -275,6 +287,27 @@ mod tests {
         assert_ne!(local.port(), 0, "bound port should be assigned");
         assert_eq!(endpoint.local_ip(), local.ip());
         assert_eq!(endpoint.transport(), Transport::Udp);
+
+        endpoint.shutdown();
+    }
+
+    #[tokio::test]
+    async fn endpoint_overrides_callid_suffix() {
+        let account = make_account(Some("127.0.0.1"), Some(5060));
+        let cancel = CancellationToken::new();
+        let (endpoint, _incoming) = SipEndpoint::new(&account, cancel.clone()).await.unwrap();
+
+        let suffix = endpoint
+            .inner
+            .option
+            .callid_suffix
+            .as_deref()
+            .expect("callid_suffix should be configured");
+        assert_eq!(suffix, CALLID_SUFFIX);
+        assert_ne!(
+            suffix, "restsend.com",
+            "should not fall back to rsipstack's default"
+        );
 
         endpoint.shutdown();
     }
