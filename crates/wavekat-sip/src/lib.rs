@@ -28,8 +28,9 @@
 //! - Account persistence (TOML files, system keychain).
 //! - Call orchestration, AI pipeline, business logic.
 //!
-//! See the [roadmap](https://github.com/wavekat/wavekat-sip/blob/main/docs/01-port-plan.md)
-//! for the planned `caller` / `callee` INVITE wrappers and RTP send helper.
+//! Inbound INVITE handling lives in [`Callee`]; the outbound `caller`
+//! wrapper and an RTP send helper are still on the
+//! [roadmap](https://github.com/wavekat/wavekat-sip/blob/main/docs/01-port-plan.md).
 //!
 //! # Quick start: register against a SIP server
 //!
@@ -63,8 +64,8 @@
 //! ```
 //!
 //! The `_incoming` stream returned by [`SipEndpoint::new`] yields inbound
-//! transactions (INVITE, OPTIONS, …). Until the `callee` helper lands,
-//! consume it by driving [`SipEndpoint::dialog_layer`] directly.
+//! transactions (INVITE, OPTIONS, …). For INVITEs, hand the transaction to
+//! [`Callee::accept_transaction`] or [`Callee::reject_transaction`].
 //!
 //! # Building SDP and parsing the answer
 //!
@@ -108,14 +109,15 @@
 //! | [`account`]     | Runtime [`SipAccount`] + [`Transport`] enum.                   |
 //! | [`endpoint`]    | [`SipEndpoint`] — bound transport, dialog layer, RX stream.    |
 //! | [`registrar`]   | REGISTER + digest auth + keepalive re-registration.            |
+//! | [`callee`]      | Inbound INVITE accept/reject helper.                           |
 //! | [`sdp`]         | Minimal G.711 offer/answer build + parse.                      |
 //! | [`rtp`]         | RTP header parser and async receive loop.                      |
 //!
 //! # Stability
 //!
 //! Pre-1.0. The public API will shift between minor versions while the
-//! `caller` / `callee` helpers land. Pin an exact version if you need
-//! stability today.
+//! `caller` helper lands. Pin an exact version if you need stability
+//! today.
 //!
 //! # License
 //!
@@ -124,16 +126,26 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod account;
+pub mod callee;
 pub mod endpoint;
 pub mod registrar;
 pub mod rtp;
 pub mod sdp;
 
 pub use account::{SipAccount, Transport};
+pub use callee::{AcceptedCall, Callee};
 pub use endpoint::SipEndpoint;
 pub use registrar::Registrar;
 pub use rtp::{receive_rtp, RtpHeader};
 pub use sdp::{build_sdp, parse_sdp, RemoteMedia};
+
+/// Re-exports of upstream types that appear in our public API. Pinning
+/// them here lets consumers depend only on `wavekat-sip` without taking
+/// a direct dep on `rsip` / `rsipstack`.
+pub mod re_exports {
+    pub use rsip::{Header, Method, StatusCode};
+    pub use rsipstack::transaction::transaction::Transaction;
+}
 
 /// Short git hash this crate was built from, or `"unknown"` if unavailable.
 pub const GIT_HASH: &str = env!("WAVEKAT_SIP_GIT_HASH");
