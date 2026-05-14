@@ -31,6 +31,11 @@ Planned (see `docs/01-port-plan.md`):
 ## Testing
 
 - Every module must have unit tests at the bottom of the file.
+- **Every change that adds or modifies public surface must land with a
+  unit test in the same PR.** "It's mostly glue over rsipstack" is not
+  an exemption — if the function is too entangled for a pure unit test,
+  add an `#[ignore]`'d integration test in `tests/` in the same PR.
+  Deferring tests to a follow-up is not acceptable.
 - Test pure functions first: parsers, builders, helpers.
 - Round-trip tests where applicable (e.g. `build_sdp` ↔ `parse_sdp`).
 - Integration tests requiring a SIP server go in `tests/` and are `#[ignore]`.
