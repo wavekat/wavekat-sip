@@ -66,3 +66,21 @@ RTP header).
   (no dashes in the date) for time-sensitive plans, or `NN-<topic>.md` for
   evergreen design docs.
 - Each non-trivial change gets a plan doc before implementation.
+
+## Public-repo hygiene
+
+`wavekat-sip` is a **public** repository. Sibling consumer projects are
+**private** and outside contributors cannot see them. Anything checked
+into this repo — source, comments, tests, docs, commit messages, PR
+descriptions — must read on its own without referencing those private
+repos.
+
+- Do **not** name private sibling repos, their files, modules, or
+  internal APIs in this repo. Refer to "the consumer" or "a downstream
+  consumer" instead.
+- Do **not** link to private repos. If a design note's motivation lives
+  in a private doc, paraphrase the rationale here so the public reader
+  gets the full picture without the link.
+- Generic words like "voice", "softphone", "voice pipeline" describe
+  this crate's domain and are fine — the rule is about naming the
+  private repo, not the problem space.

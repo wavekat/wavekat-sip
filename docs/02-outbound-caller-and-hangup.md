@@ -2,15 +2,15 @@
 
 > Status: planning · Date: 2026-05-15 · Target release: v0.0.10
 
-This note is the upstream half of a feature being designed in `wavekat-voice` — see [`wavekat-voice/docs/15-active-call-history-and-outbound.md`](https://github.com/wavekat/wavekat-voice/blob/main/docs/15-active-call-history-and-outbound.md). That doc plans an in-call UI, durable call history, and **outbound dialing** for the desktop product. The outbound half can't ship until this crate exposes a way to place an INVITE; this note specifies what that surface should look like.
+This note is the upstream half of a consumer-side feature: an in-call UI, durable call history, and **outbound dialing** for a softphone built on top of this crate. The outbound half can't ship until this crate exposes a way to place an INVITE; this note specifies what that surface should look like.
 
-The other two `wavekat-voice` features (active-call screen, call history) **do not need anything new from this crate** — `ServerInviteDialog::bye()` already supports user-initiated hangup on inbound calls, and `DialogState::Terminated(_, TerminatedReason)` already supplies enough information to populate a per-call disposition. We just need to call that out so consumers don't reinvent it. See [§3](#3-local-hangup-on-inbound-already-supported-document-it).
+The other two consumer-side features (active-call screen, call history) **do not need anything new from this crate** — `ServerInviteDialog::bye()` already supports user-initiated hangup on inbound calls, and `DialogState::Terminated(_, TerminatedReason)` already supplies enough information to populate a per-call disposition. We just need to call that out so consumers don't reinvent it. See [§3](#3-local-hangup-on-inbound-already-supported-document-it).
 
 ## TL;DR
 
 Three additions:
 
-1. **`Caller` + `PendingDial` + accepted/answered handles** — a `Callee`-shaped module for outbound. `Caller::dial(target)` sends INVITE, returns a `PendingDial` whose `state_rx` surfaces early progress (`Trying`, `EarlyMedia`, `Confirmed`, `Terminated`). On `Confirmed` the consumer gets an `AcceptedCall` of the same shape we already have for inbound, so the audio/RTP layer in `wavekat-voice` doesn't branch on direction.
+1. **`Caller` + `PendingDial` + accepted/answered handles** — a `Callee`-shaped module for outbound. `Caller::dial(target)` sends INVITE, returns a `PendingDial` whose `state_rx` surfaces early progress (`Trying`, `EarlyMedia`, `Confirmed`, `Terminated`). On `Confirmed` the consumer gets an `AcceptedCall` of the same shape we already have for inbound, so the consumer's audio/RTP layer doesn't branch on direction.
 2. **`PendingDial::cancel()`** — sends `CANCEL` if the early dialog is still pre-answer. Maps to "user hit End on the dialing screen before the remote picked up."
 3. **Documentation polish** — `AcceptedCall.dialog.bye().await` (already present via `ServerInviteDialog::bye`) is the local-hangup path for *both* directions. Add a short paragraph and a code sample to `callee.rs`'s module-level docs and to the new `caller.rs`, so consumers don't write their own.
 
@@ -18,7 +18,7 @@ Plus a cleanup: `docs/01-port-plan.md` lists `caller` under "v0.0.3 (in flight)"
 
 ## Why now
 
-The deferral in `wavekat-voice` docs 10 and 12 — "outbound is post-MVP" — has been reversed in doc 15. The reasoning there: bundling outbound with the active-call screen and hangup endpoint costs the marginal price of `Caller` plus a UI sheet, because every other piece (current-call hook, call-screen route, hangup wire path) is already being built. The bottleneck is now this crate.
+Earlier consumer-side planning deferred outbound as post-MVP, but that has been reversed: bundling outbound with the active-call screen and hangup endpoint costs the marginal price of `Caller` plus a UI sheet, because every other piece (current-call hook, call-screen route, hangup wire path) is already being built consumer-side. The bottleneck is now this crate.
 
 `Callee` shipped in v0.0.7 + v0.0.8 with a deliberately UI-friendly two-phase API (`handle_pending` → `accept` / `reject`) so that an Electron renderer can show a ringing card before committing to a `200 OK`. Outbound has the symmetric need: the renderer should show a "Dialing…" screen while the INVITE is in flight, and only commit to streaming audio when the remote answers. `rsipstack::DialogLayer::do_invite` exists, but it returns `(ClientInviteDialog, Option<Response>)` synchronously at the *end* of the transaction — the UI has nothing to render between "user clicked Call" and "call is up." We need to split that the way `handle_pending` split the inbound path.
 
@@ -93,7 +93,7 @@ The existing `AcceptedCall` in `callee.rs` is a `ServerInviteDialog`-flavoured s
 - **Option A — generic `AcceptedCall<D>`** parameterised over `ServerInviteDialog | ClientInviteDialog`. Clean but invasive: every downstream usage signature has to choose.
 - **Option B — split into `AcceptedCall` (inbound, unchanged) and `AcceptedDial` (outbound, ClientInviteDialog).** No breaking change to the existing type; consumer-side code branches on direction via a small enum if it wants direction-agnostic handling. **Recommended.**
 
-Rationale for B: today there is exactly one consumer (`wavekat-voice`), and that consumer's `LiveCall::start` in `call_audio.rs` only uses `accepted.remote_media`, `accepted.rtp_socket`, and `accepted.local_rtp_addr` — *not* the dialog field's concrete type. So a tiny `enum CallDialog { Inbound(ServerInviteDialog), Outbound(ClientInviteDialog) }` (or a trait with `bye() -> impl Future`) lets the consumer hold "the live call's dialog" without branching, and `wavekat-sip` stays free of generics noise.
+Rationale for B: today the known consumer's call-audio path only uses `accepted.remote_media`, `accepted.rtp_socket`, and `accepted.local_rtp_addr` — *not* the dialog field's concrete type. So a tiny `enum CallDialog { Inbound(ServerInviteDialog), Outbound(ClientInviteDialog) }` (or a trait with `bye() -> impl Future`) lets the consumer hold "the live call's dialog" without branching, and `wavekat-sip` stays free of generics noise.
 
 Either choice is acceptable; ship whichever has the smaller diff against current tests.
 
@@ -162,7 +162,7 @@ Target **v0.0.10**. Single release that ships:
 - Module-doc additions to `callee` and `caller` covering local hangup
 - `docs/01-port-plan.md` cleanup (delete stale "v0.0.3 (in flight)" section, move `caller` to v0.0.10)
 
-Once v0.0.10 is on crates.io, `wavekat-voice` bumps its `wavekat-sip` dep from `0.0.9` → `0.0.10` and implements step 5 of doc 15's migration order (`POST /calls/dial` + `OutgoingCall` event + dial sheet).
+Once v0.0.10 is on crates.io, consumers can bump their `wavekat-sip` dep from `0.0.9` → `0.0.10` and wire the new `Caller` surface into whatever dial UI they expose (e.g. an outgoing-call event and a dial sheet in a desktop softphone).
 
 No breaking changes are required; this is purely additive. `Callee`, `Registrar`, `SipEndpoint`, `rtp::send_loop`, `AcceptedCall` (inbound) all keep their current public shapes.
 
@@ -172,7 +172,7 @@ No breaking changes are required; this is purely additive. `Callee`, `Registrar`
 - **Address book / contacts.** Consumer concern.
 - **REFER / transfer.** Separate design pass.
 - **Hold / re-INVITE.** Separate design pass; will need API on both `Caller`-side and `Callee`-side dialogs.
-- **Outbound recording or transcript taps.** Belongs in the consumer's audio pipeline — `wavekat-voice` is already planning the recording slice as M3.
+- **Outbound recording or transcript taps.** Belongs in the consumer's audio pipeline, not this crate.
 
 ## 8. Doc 01 cleanup (do this in the same PR)
 
