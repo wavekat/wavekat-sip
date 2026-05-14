@@ -14,33 +14,31 @@ earlier softphone prototype into a focused, reusable SDK.
 | `sdp`       | Minimal G.711 offer/answer (PCMU + PCMA, sendrecv).                  |
 | `rtp`       | `RtpHeader::parse` + debug `receive_rtp` loop.                       |
 
+## Shipped in v0.0.7 / v0.0.8
+
+| Module   | Notes                                                                                                                                |
+|----------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `callee` | `handle_pending` / `accept_transaction` / `reject_transaction` returning `AcceptedCall` (dialog, RTP socket, remote media, state RX). |
+
 ## Shipped in v0.0.9
 
-| Module | Notes                                                                                  |
-|--------|----------------------------------------------------------------------------------------|
-| `rtp`  | `send_loop` — codec-agnostic packetizer: payload bytes in (mpsc), RTP on the wire out. |
-| `registrar` | REGISTER + digest auth retry + keepalive + unregister.               |
+| Module      | Notes                                                                                  |
+|-------------|----------------------------------------------------------------------------------------|
+| `rtp`       | `send_loop` — codec-agnostic packetizer: payload bytes in (mpsc), RTP on the wire out. |
+| `registrar` | REGISTER + digest auth retry + keepalive + unregister.                                 |
 
-## Landing in v0.0.3 (in flight)
+## Landing in v0.0.10
 
-| Module      | Status        | Notes                                                                |
-|-------------|---------------|----------------------------------------------------------------------|
-| `callee`    | implemented   | `accept_transaction` / `reject_transaction` returning `AcceptedCall` (dialog, RTP socket, remote media, state receiver). No audio. |
-| `caller`    | not started   | `Caller::invite(target)` returning `(Dialog, RemoteMedia, Arc<UdpSocket>)`. |
+| Module   | Notes                                                                                                                                                                                            |
+|----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `caller` | `Caller::dial(target)` → `PendingDial` (state_rx) → `AcceptedDial` on `Confirmed`. `PendingDial::cancel` for pre-answer CANCEL; `accepted.dialog.bye().await` for BYE. See `docs/02-…` for shape. |
 
 ## Pending
 
-### `caller` — outbound INVITE
+### Integration tests against a SIP server
 
-`Caller::invite(target)` returns `(Dialog, RemoteMedia, Arc<UdpSocket>)`
-and lets the consumer drive RTP themselves. A higher-level helper can sit
-on top for the common case.
-
-### Integration tests
-
-Once `caller` lands, add an `#[ignore]`d integration test in `tests/` that
-registers against a local Asterisk and places a call. Run manually; not in
-CI.
+Add an `#[ignore]`d integration test in `tests/` that registers against
+a local Asterisk and places a call. Run manually; not in CI.
 
 ## Out of scope
 

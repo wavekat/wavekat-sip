@@ -30,9 +30,8 @@
 //! - Account persistence (TOML files, system keychain).
 //! - Call orchestration, AI pipeline, business logic.
 //!
-//! Inbound INVITE handling lives in [`Callee`]; the outbound `caller`
-//! wrapper is still on the
-//! [roadmap](https://github.com/wavekat/wavekat-sip/blob/main/docs/01-port-plan.md).
+//! Inbound INVITE handling lives in [`Callee`]; outbound INVITEs are
+//! placed via [`Caller`].
 //!
 //! # Quick start: register against a SIP server
 //!
@@ -68,6 +67,29 @@
 //! The `_incoming` stream returned by [`SipEndpoint::new`] yields inbound
 //! transactions (INVITE, OPTIONS, …). For INVITEs, hand the transaction to
 //! [`Callee::accept_transaction`] or [`Callee::reject_transaction`].
+//!
+//! # Placing an outbound call
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use wavekat_sip::{Caller, SipAccount, SipEndpoint};
+//!
+//! # async fn run(account: SipAccount, endpoint: Arc<SipEndpoint>)
+//! #     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! let caller = Caller::new(account, endpoint);
+//! let target: wavekat_sip::re_exports::Uri = "sip:bob@example.com".try_into()?;
+//! let mut pending = caller.dial(target).await?;
+//!
+//! // Pump pending.state_rx to render "Dialing…" / "Ringing…" in the UI.
+//! // When you see DialogState::Confirmed, promote to AcceptedDial:
+//! let accepted = pending.on_confirmed().await?;
+//!
+//! // Wire RTP to your audio / AI pipeline using accepted.rtp_socket
+//! // and accepted.remote_media. Hang up locally with:
+//! accepted.dialog.bye().await?;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Building SDP and parsing the answer
 //!
@@ -112,14 +134,14 @@
 //! | [`endpoint`]    | [`SipEndpoint`] — bound transport, dialog layer, RX stream.    |
 //! | [`registrar`]   | REGISTER + digest auth + keepalive re-registration.            |
 //! | [`callee`]      | Inbound INVITE accept/reject helper.                           |
+//! | [`caller`]      | Outbound INVITE / dial-cancel helper.                          |
 //! | [`sdp`]         | Minimal G.711 offer/answer build + parse.                      |
 //! | [`rtp`]         | RTP header parser, debug receive loop, codec-agnostic send loop. |
 //!
 //! # Stability
 //!
-//! Pre-1.0. The public API will shift between minor versions while the
-//! `caller` helper lands. Pin an exact version if you need stability
-//! today.
+//! Pre-1.0. The public API may still shift between minor versions. Pin
+//! an exact version if you need stability today.
 //!
 //! # License
 //!
@@ -129,6 +151,7 @@
 
 pub mod account;
 pub mod callee;
+pub mod caller;
 pub mod endpoint;
 pub mod registrar;
 pub mod rtp;
@@ -136,6 +159,7 @@ pub mod sdp;
 
 pub use account::{SipAccount, Transport};
 pub use callee::{AcceptedCall, Callee, PendingCall};
+pub use caller::{AcceptedDial, Caller, PendingDial};
 pub use endpoint::{DispatchOutcome, SipEndpoint};
 pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
@@ -145,10 +169,11 @@ pub use sdp::{build_sdp, parse_sdp, RemoteMedia};
 /// them here lets consumers depend only on `wavekat-sip` without taking
 /// a direct dep on `rsip` / `rsipstack`.
 pub mod re_exports {
-    pub use rsip::{Header, Method, StatusCode};
+    pub use rsip::{Header, Method, StatusCode, Uri};
     pub use rsipstack::dialog::dialog::{DialogState, DialogStateReceiver, TerminatedReason};
     pub use rsipstack::dialog::DialogId;
     pub use rsipstack::transaction::transaction::Transaction;
+    pub use rsipstack::transport::SipAddr;
 }
 
 /// Short git hash this crate was built from, or `"unknown"` if unavailable.
