@@ -13,6 +13,12 @@ earlier softphone prototype into a focused, reusable SDK.
 | `endpoint`  | Shared SIP endpoint: bound transport, dialog layer, incoming stream. |
 | `sdp`       | Minimal G.711 offer/answer (PCMU + PCMA, sendrecv).                  |
 | `rtp`       | `RtpHeader::parse` + debug `receive_rtp` loop.                       |
+
+## Shipped in v0.0.9
+
+| Module | Notes                                                                                  |
+|--------|----------------------------------------------------------------------------------------|
+| `rtp`  | `send_loop` — codec-agnostic packetizer: payload bytes in (mpsc), RTP on the wire out. |
 | `registrar` | REGISTER + digest auth retry + keepalive + unregister.               |
 
 ## Landing in v0.0.3 (in flight)
@@ -29,12 +35,6 @@ earlier softphone prototype into a focused, reusable SDK.
 `Caller::invite(target)` returns `(Dialog, RemoteMedia, Arc<UdpSocket>)`
 and lets the consumer drive RTP themselves. A higher-level helper can sit
 on top for the common case.
-
-### RTP send helper
-
-Once `caller` / `callee` land, add `rtp::send_loop` — "forward bytes from
-this channel out as RTP" — so end-to-end calls work without dragging audio
-into this crate.
 
 ### Integration tests
 
