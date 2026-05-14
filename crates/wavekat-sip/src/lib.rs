@@ -134,7 +134,7 @@ pub mod sdp;
 
 pub use account::{SipAccount, Transport};
 pub use callee::{AcceptedCall, Callee};
-pub use endpoint::SipEndpoint;
+pub use endpoint::{DispatchOutcome, SipEndpoint};
 pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use rtp::{receive_rtp, RtpHeader};
 pub use sdp::{build_sdp, parse_sdp, RemoteMedia};
@@ -144,6 +144,8 @@ pub use sdp::{build_sdp, parse_sdp, RemoteMedia};
 /// a direct dep on `rsip` / `rsipstack`.
 pub mod re_exports {
     pub use rsip::{Header, Method, StatusCode};
+    pub use rsipstack::dialog::dialog::{DialogState, TerminatedReason};
+    pub use rsipstack::dialog::DialogId;
     pub use rsipstack::transaction::transaction::Transaction;
 }
 
