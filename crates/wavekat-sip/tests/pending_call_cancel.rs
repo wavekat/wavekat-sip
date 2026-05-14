@@ -8,7 +8,7 @@
 //! - Alice's `do_invite` resolves with a `487 Request Terminated` final
 //!   response (the canonical CANCEL outcome).
 //!
-//! This covers the regression where wavekat-voice's pending invite map
+//! This covers the regression where a consumer's pending-invite map
 //! had no path to surface a pre-answer cancel — the INVITE just sat
 //! there until the caller's own timeout, and the UI stayed ringing.
 
