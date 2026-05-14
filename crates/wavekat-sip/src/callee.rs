@@ -16,12 +16,30 @@
 //!   **not** detect a pre-answer cancel (there's no window to detect it
 //!   in).
 //!
-//! Audio device I/O, codecs, recording — all of those are the caller's
+//! Audio device I/O, codecs, recording — all of those are the consumer's
 //! problem. See `docs/01-port-plan.md`.
 //!
 //! `Transaction` is yielded by [`crate::endpoint::SipEndpoint`]'s incoming
 //! transaction receiver. Filter for `Method::Invite` before calling
 //! these.
+//!
+//! ## Hanging up a connected call
+//!
+//! [`AcceptedCall::dialog`] is a
+//! [`ServerInviteDialog`]. To hang up locally (user hit "End call" in
+//! the UI, an AI agent decided the call is over, …):
+//!
+//! ```ignore
+//! accepted.dialog.bye().await?;
+//! ```
+//!
+//! The dialog state machine then transitions to
+//! `Terminated(_, TerminatedReason::UasBye)` on `state_rx`, so a single
+//! watcher pumping `state_rx` handles both local and remote hangup
+//! through the same code path. The outbound side ([`crate::caller`])
+//! exposes the same pattern on [`ClientInviteDialog`].
+//!
+//! [`ClientInviteDialog`]: rsipstack::dialog::client_dialog::ClientInviteDialog
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
