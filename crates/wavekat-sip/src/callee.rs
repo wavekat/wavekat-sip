@@ -1,22 +1,29 @@
 //! Inbound INVITE handling — focused SIP-only layer.
 //!
-//! Two operations:
+//! There are two flows:
 //!
-//! - [`Callee::accept_transaction`] takes an inbound `Transaction`, parses
-//!   the SDP offer, binds a local RTP socket, sends `200 OK` with a
-//!   matching SDP answer, and returns the dialog plus the bound socket
-//!   and remote media descriptor. The consumer drives audio.
-//! - [`Callee::reject_transaction`] responds with the given non-2xx
-//!   status. No dialog is established.
+//! - **Deferred decision** (recommended for UI-driven apps):
+//!   [`Callee::handle_pending`] parses the SDP offer, creates the server
+//!   dialog, sends `100 Trying`, and spawns the transaction handler. It
+//!   returns a [`PendingCall`] whose `state_rx` surfaces a pre-answer
+//!   cancel (`Terminated(UacCancel)`) so the UI can clear its ringing
+//!   indicator. The consumer then calls [`PendingCall::accept`] or
+//!   [`PendingCall::reject`] when the user decides.
+//! - **One-shot accept / reject**: [`Callee::accept_transaction`] and
+//!   [`Callee::reject_transaction`] do everything in one call — useful
+//!   when the decision is already known (auto-answer, hard-coded busy).
+//!   They are thin convenience wrappers over the deferred flow and do
+//!   **not** detect a pre-answer cancel (there's no window to detect it
+//!   in).
 //!
 //! Audio device I/O, codecs, recording — all of those are the caller's
 //! problem. See `docs/01-port-plan.md`.
 //!
 //! `Transaction` is yielded by [`crate::endpoint::SipEndpoint`]'s incoming
 //! transaction receiver. Filter for `Method::Invite` before calling
-//! `accept_transaction` / `reject_transaction`.
+//! these.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use rsip::{Header, StatusCode};
@@ -29,6 +36,8 @@ use tracing::{debug, info, warn};
 use crate::account::SipAccount;
 use crate::endpoint::SipEndpoint;
 use crate::sdp::{build_sdp, parse_sdp, RemoteMedia};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// SIP-only callee handles. The consumer wires audio onto the returned
 /// `rtp_socket`, uses `remote_media` to know where to send/expect RTP, and
@@ -47,6 +56,73 @@ pub struct AcceptedCall {
     pub state_rx: DialogStateReceiver,
 }
 
+/// An inbound INVITE that has been hooked into the dialog layer — the
+/// transaction handler is running (`100 Trying` sent, a pre-answer
+/// `CANCEL` will be auto-replied with `487`) but no final response has
+/// been sent yet.
+///
+/// Consumers should pump `state_rx` while the call is "ringing" in the
+/// UI. If it yields `DialogState::Terminated` *before* you call
+/// [`accept`](Self::accept) / [`reject`](Self::reject), the remote side
+/// cancelled — clear any ringing indicator. After that, the dialog is
+/// gone; do not call `accept` / `reject`.
+pub struct PendingCall {
+    /// Server-side dialog. The transaction handler task is already
+    /// pumping it; do not call `dialog.handle` yourself.
+    pub dialog: ServerInviteDialog,
+    /// Parsed SDP offer — where the remote expects RTP, what codec.
+    pub remote_media: RemoteMedia,
+    /// Dialog state updates. Watch for `Terminated(UacCancel)` to learn
+    /// the caller hung up before you answered.
+    pub state_rx: DialogStateReceiver,
+    /// Local IP the endpoint is bound to — used for the SDP answer's
+    /// connection address when `accept` is called.
+    local_ip: IpAddr,
+}
+
+impl PendingCall {
+    /// Send `200 OK` with an SDP answer matching the offer. Binds a
+    /// local RTP socket. Returns the [`AcceptedCall`] (dialog + audio
+    /// plumbing) for the caller to drive.
+    ///
+    /// On error the dialog handler keeps running and will time out
+    /// naturally; the caller can also call [`Self::reject`] *before*
+    /// `accept` if they want to fail fast.
+    pub async fn accept(self) -> Result<AcceptedCall, BoxError> {
+        let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let local_rtp_addr = rtp_socket.local_addr()?;
+        let rtp_port = local_rtp_addr.port();
+        info!(local_ip = %self.local_ip, rtp_port, "bound RTP socket");
+
+        let sdp_answer = build_sdp(self.local_ip, rtp_port);
+        debug!("SDP answer:\n{}", String::from_utf8_lossy(&sdp_answer));
+
+        let headers = vec![Header::ContentType("application/sdp".into())];
+        self.dialog.accept(Some(headers), Some(sdp_answer))?;
+        info!("sent 200 OK with SDP answer");
+
+        Ok(AcceptedCall {
+            dialog: self.dialog,
+            remote_media: self.remote_media,
+            rtp_socket: Arc::new(rtp_socket),
+            local_rtp_addr,
+            state_rx: self.state_rx,
+        })
+    }
+
+    /// Send a non-2xx final response (typical: `486 Busy Here`,
+    /// `603 Decline`). The transaction handler task drains any retransmit
+    /// and exits.
+    pub fn reject(self, status: StatusCode) -> Result<(), BoxError> {
+        if status.code() < 300 {
+            return Err(format!("reject() got 2xx status {status}").into());
+        }
+        self.dialog.reject(Some(status.clone()), None)?;
+        info!(%status, "rejected inbound INVITE");
+        Ok(())
+    }
+}
+
 /// Stateless helper bound to an account + endpoint.
 pub struct Callee {
     account: SipAccount,
@@ -58,17 +134,17 @@ impl Callee {
         Self { account, endpoint }
     }
 
-    /// Accept an inbound INVITE: parse offer, bind RTP, build answer,
-    /// send `200 OK`. The returned `AcceptedCall` exposes the dialog
-    /// and socket for the consumer to drive audio.
+    /// Begin handling an inbound INVITE: parse the SDP offer, create
+    /// the server dialog, send `100 Trying`, and spawn the handler that
+    /// drives the transaction state machine.
     ///
-    /// Spawns a task that drives the INVITE transaction to completion
-    /// (sends `100 Trying`, waits for `ACK`).
-    pub async fn accept_transaction(
-        &self,
-        mut tx: Transaction,
-    ) -> Result<AcceptedCall, Box<dyn std::error::Error + Send + Sync>> {
-        // 1. Parse SDP offer.
+    /// The handler auto-replies `487 Request Terminated` to a pre-answer
+    /// `CANCEL` and transitions the dialog to `Terminated(UacCancel)` —
+    /// watch [`PendingCall::state_rx`] to surface that to your UI.
+    ///
+    /// Returns a [`PendingCall`] you call [`accept`](PendingCall::accept)
+    /// or [`reject`](PendingCall::reject) on when the UI decides.
+    pub async fn handle_pending(&self, mut tx: Transaction) -> Result<PendingCall, BoxError> {
         let remote_media = parse_sdp(&tx.original.body)?;
         info!(
             remote_addr = %remote_media.addr,
@@ -77,18 +153,6 @@ impl Callee {
             "parsed SDP offer",
         );
 
-        // 2. Bind a UDP socket for RTP.
-        let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let local_rtp_addr = rtp_socket.local_addr()?;
-        let local_ip = self.endpoint.local_ip();
-        let rtp_port = local_rtp_addr.port();
-        info!(%local_ip, rtp_port, "bound RTP socket");
-
-        // 3. Build a matching SDP answer (recvonly G.711, see sdp.rs).
-        let sdp_answer = build_sdp(local_ip, rtp_port);
-        debug!("SDP answer:\n{}", String::from_utf8_lossy(&sdp_answer));
-
-        // 4. Create the server dialog.
         let (state_sender, state_rx) = self.endpoint.dialog_layer.new_dialog_state_channel();
         let contact_uri: rsip::Uri = format!(
             "sip:{}@{}",
@@ -102,12 +166,6 @@ impl Callee {
             Some(contact_uri),
         )?;
 
-        // 5. Send 200 OK + SDP answer.
-        let headers = vec![Header::ContentType("application/sdp".into())];
-        dialog.accept(Some(headers), Some(sdp_answer))?;
-        info!("sent 200 OK with SDP answer");
-
-        // 6. Drive the INVITE transaction (100 Trying / ACK).
         let dialog_for_handler = dialog.clone();
         tokio::spawn(async move {
             let mut dialog = dialog_for_handler;
@@ -116,26 +174,35 @@ impl Callee {
             }
         });
 
-        Ok(AcceptedCall {
+        Ok(PendingCall {
             dialog,
             remote_media,
-            rtp_socket: Arc::new(rtp_socket),
-            local_rtp_addr,
             state_rx,
+            local_ip: self.endpoint.local_ip(),
         })
     }
 
-    /// Reject an inbound INVITE with a non-2xx status (typical: 486 Busy
-    /// Here, 487 Request Terminated, 603 Decline).
+    /// Accept an inbound INVITE in one shot — bind RTP, send `200 OK`
+    /// with SDP answer. Equivalent to [`handle_pending`](Self::handle_pending)
+    /// followed immediately by [`PendingCall::accept`]; use that pair if
+    /// the answer depends on a UI decision and you need to detect a
+    /// pre-answer cancel.
+    pub async fn accept_transaction(&self, tx: Transaction) -> Result<AcceptedCall, BoxError> {
+        self.handle_pending(tx).await?.accept().await
+    }
+
+    /// Reject an inbound INVITE in one shot with a non-2xx status
+    /// (typical: `486 Busy Here`, `603 Decline`). No SDP parsing, no RTP
+    /// socket — useful when refusing without inspecting the offer (e.g.
+    /// daemon shutdown clearing pending invites).
     ///
-    /// No dialog is established and no RTP socket is bound. The transaction
-    /// is driven via the dialog layer so the response reaches the wire and
-    /// re-transmissions are handled.
+    /// Use [`PendingCall::reject`] instead when you already have a
+    /// `PendingCall` from [`handle_pending`](Self::handle_pending).
     pub async fn reject_transaction(
         &self,
         mut tx: Transaction,
         status: StatusCode,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), BoxError> {
         if status.code() < 300 {
             return Err(format!("reject_transaction got 2xx status {status}").into());
         }
@@ -174,8 +241,7 @@ mod tests {
 
     #[test]
     fn reject_with_2xx_is_an_error() {
-        // We can't exercise reject_transaction without a real Transaction,
-        // but the guard is pure: status.code() < 300 should fail fast.
+        // The guard is pure: status.code() < 300 should fail fast.
         let ok = StatusCode::OK;
         assert!(ok.code() < 300);
         let busy = StatusCode::BusyHere;
