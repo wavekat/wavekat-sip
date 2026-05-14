@@ -17,9 +17,11 @@
 //!   ([`SipEndpoint`]).
 //! - **SDP** — minimal G.711 (PCMU + PCMA) offer/answer with round-trip
 //!   parsing ([`build_sdp`], [`parse_sdp`]).
-//! - **RTP** — header parser ([`RtpHeader`]) and a debug-friendly receive
+//! - **RTP** — header parser ([`RtpHeader`]), a debug-friendly receive
 //!   loop ([`receive_rtp`]) suitable for transcription, recording, or
-//!   smoke-testing inbound media.
+//!   smoke-testing inbound media, and a codec-agnostic send loop
+//!   ([`send_loop`]) that packetizes consumer-supplied payloads onto
+//!   the wire.
 //!
 //! Explicitly out of scope (push these to the consuming application):
 //!
@@ -29,7 +31,7 @@
 //! - Call orchestration, AI pipeline, business logic.
 //!
 //! Inbound INVITE handling lives in [`Callee`]; the outbound `caller`
-//! wrapper and an RTP send helper are still on the
+//! wrapper is still on the
 //! [roadmap](https://github.com/wavekat/wavekat-sip/blob/main/docs/01-port-plan.md).
 //!
 //! # Quick start: register against a SIP server
@@ -111,7 +113,7 @@
 //! | [`registrar`]   | REGISTER + digest auth + keepalive re-registration.            |
 //! | [`callee`]      | Inbound INVITE accept/reject helper.                           |
 //! | [`sdp`]         | Minimal G.711 offer/answer build + parse.                      |
-//! | [`rtp`]         | RTP header parser and async receive loop.                      |
+//! | [`rtp`]         | RTP header parser, debug receive loop, codec-agnostic send loop. |
 //!
 //! # Stability
 //!
@@ -136,7 +138,7 @@ pub use account::{SipAccount, Transport};
 pub use callee::{AcceptedCall, Callee, PendingCall};
 pub use endpoint::{DispatchOutcome, SipEndpoint};
 pub use registrar::{Registrar, RegistrarDiagnostics};
-pub use rtp::{receive_rtp, RtpHeader};
+pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
 pub use sdp::{build_sdp, parse_sdp, RemoteMedia};
 
 /// Re-exports of upstream types that appear in our public API. Pinning
