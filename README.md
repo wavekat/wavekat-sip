@@ -99,6 +99,15 @@ PSTN / SIP trunk
    your app  ──► audio device I/O, codec, recording, AI pipeline
 ```
 
+## Stars
+
+<a href="https://stars.wavekat.com/wavekat/wavekat-sip">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://stars.wavekat.com/wavekat/wavekat-sip/chart.svg?theme=dark">
+    <img alt="wavekat/wavekat-sip stars" src="https://stars.wavekat.com/wavekat/wavekat-sip/chart.svg?theme=light">
+  </picture>
+</a>
+
 ## License
 
 Licensed under [Apache 2.0](LICENSE).
