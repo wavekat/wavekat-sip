@@ -43,6 +43,12 @@ release ships the complete RFC 4733 + SIP INFO surface. See
 |--------|-------|
 | `sdp`  | Advertises `telephone-event/8000` (PT 101) in offers/answers; `RemoteMedia.dtmf_payload_type` exposes the negotiated PT (or `None`) so consumers can route DTMF to RFC 4733 or fall back to SIP INFO. |
 
+## Landing in v0.0.12
+
+| Module     | Notes |
+|------------|-------|
+| `rtp::dtmf`| RFC 4733 event-packet construction (`build_event_payload`, `build_rtp_dtmf_packet`) plus `send_dtmf_burst` — the async transmit helper that drives the 3× initial / continuation / 3× end packet pattern on its own RTP stream (separate SSRC, per RFC 4733 §2.6.2). `DtmfDigit` enum + `from_char` / `as_char` / `event_code`. |
+
 ## Pending
 
 ### Integration tests against a SIP server
