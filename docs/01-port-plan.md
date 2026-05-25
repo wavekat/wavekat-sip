@@ -49,6 +49,12 @@ release ships the complete RFC 4733 + SIP INFO surface. See
 |------------|-------|
 | `rtp::dtmf`| RFC 4733 event-packet construction (`build_event_payload`, `build_rtp_dtmf_packet`) plus `send_dtmf_burst` — the async transmit helper that drives the 3× initial / continuation / 3× end packet pattern on its own RTP stream (separate SSRC, per RFC 4733 §2.6.2). `DtmfDigit` enum + `from_char` / `as_char` / `event_code`. |
 
+## Landing in v0.0.13
+
+| Module      | Notes |
+|-------------|-------|
+| `dtmf_info` | SIP `INFO` fallback for DTMF when the SDP answer omits `telephone-event/8000`. `build_info_body` produces the `application/dtmf-relay` body (`Signal=X\nDuration=N`). `send_dtmf_info_client` / `send_dtmf_info_server` wrap the rsipstack `dialog.info()` call with the right `Content-Type` and surface a typed `InfoOutcome` (Accepted / UnsupportedMedia / OtherFailure / DialogNotConfirmed) so the consumer can stop retrying after a 415. |
+
 ## Pending
 
 ### Integration tests against a SIP server

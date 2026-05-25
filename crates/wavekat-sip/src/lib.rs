@@ -152,6 +152,7 @@
 pub mod account;
 pub mod callee;
 pub mod caller;
+pub mod dtmf_info;
 pub mod endpoint;
 pub mod registrar;
 pub mod rtp;
@@ -160,6 +161,7 @@ pub mod sdp;
 pub use account::{SipAccount, Transport};
 pub use callee::{AcceptedCall, Callee, PendingCall};
 pub use caller::{AcceptedDial, Caller, PendingDial};
+pub use dtmf_info::{send_dtmf_info_client, send_dtmf_info_server, InfoOutcome};
 pub use endpoint::{DispatchOutcome, SipEndpoint};
 pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use rtp::dtmf::{
