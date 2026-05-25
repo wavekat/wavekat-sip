@@ -33,6 +33,12 @@ earlier softphone prototype into a focused, reusable SDK.
 |----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `caller` | `Caller::dial(target)` → `PendingDial` (state_rx) → `AcceptedDial` on `Confirmed`. `PendingDial::cancel` for pre-answer CANCEL; `accepted.dialog.bye().await` for BYE. See `docs/02-…` for shape. |
 
+## Landing in v0.0.11
+
+| Module | Notes |
+|--------|-------|
+| `sdp`  | Advertises `telephone-event/8000` (PT 101) in offers/answers; `RemoteMedia.dtmf_payload_type` exposes the negotiated PT (or `None`) so consumers can route DTMF to RFC 4733 or fall back to SIP INFO. See [doc 03](03-dtmf-rfc-4733-and-info-fallback.md). |
+
 ## Pending
 
 ### Integration tests against a SIP server
