@@ -162,7 +162,10 @@ pub use callee::{AcceptedCall, Callee, PendingCall};
 pub use caller::{AcceptedDial, Caller, PendingDial};
 pub use endpoint::{DispatchOutcome, SipEndpoint};
 pub use registrar::{Registrar, RegistrarDiagnostics};
-pub use rtp::dtmf::{send_dtmf_burst, DtmfBurstConfig, DtmfDigit};
+pub use rtp::dtmf::{
+    build_event_payload, build_rtp_dtmf_packet, send_dtmf_burst, DtmfBurstConfig, DtmfDigit,
+    DEFAULT_VOLUME_DBM0,
+};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
 pub use sdp::{build_sdp, parse_sdp, RemoteMedia, DTMF_DEFAULT_PT};
 

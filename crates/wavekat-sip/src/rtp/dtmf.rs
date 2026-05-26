@@ -55,6 +55,7 @@ use std::sync::Arc;
 
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, Duration};
+use tracing::debug;
 
 /// Default volume (dBm0) advertised in each event packet.
 ///
@@ -286,6 +287,14 @@ pub async fn send_dtmf_burst(
 ) -> Result<(u16, u32), std::io::Error> {
     let event = digit.event_code();
     let volume = config.volume_dbm0.min(0x3F);
+
+    debug!(
+        "DTMF burst '{}' → {remote} (PT={}, SSRC=0x{:08X}, hold={}ms)",
+        digit.as_char(),
+        config.payload_type,
+        config.ssrc,
+        config.hold_duration_ms,
+    );
 
     // Total packets in the press: at least the 3 initial + 3 end.
     // Continuation packets fill in the middle every 20 ms.
