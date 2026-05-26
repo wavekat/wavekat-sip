@@ -163,7 +163,7 @@ pub use caller::{AcceptedDial, Caller, PendingDial};
 pub use endpoint::{DispatchOutcome, SipEndpoint};
 pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
-pub use sdp::{build_sdp, parse_sdp, RemoteMedia};
+pub use sdp::{build_sdp, parse_sdp, RemoteMedia, DTMF_DEFAULT_PT};
 
 /// Re-exports of upstream types that appear in our public API. Pinning
 /// them here lets consumers depend only on `wavekat-sip` without taking
