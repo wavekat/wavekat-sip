@@ -43,7 +43,7 @@ release ships the complete RFC 4733 + SIP INFO surface. See
 |--------|-------|
 | `sdp`  | Advertises `telephone-event/8000` (PT 101) in offers/answers; `RemoteMedia.dtmf_payload_type` exposes the negotiated PT (or `None`) so consumers can route DTMF to RFC 4733 or fall back to SIP INFO. |
 
-## Landing in v0.0.12
+## Landing next — DTMF, slice 2 of 3
 
 | Module     | Notes |
 |------------|-------|
