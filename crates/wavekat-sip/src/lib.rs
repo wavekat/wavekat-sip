@@ -161,7 +161,10 @@ pub mod sdp;
 pub use account::{SipAccount, Transport};
 pub use callee::{AcceptedCall, Callee, PendingCall};
 pub use caller::{AcceptedDial, Caller, PendingDial};
-pub use dtmf_info::{send_dtmf_info_client, send_dtmf_info_server, InfoOutcome};
+pub use dtmf_info::{
+    build_info_body, content_type_header, send_dtmf_info_client, send_dtmf_info_server,
+    InfoOutcome, CONTENT_TYPE,
+};
 pub use endpoint::{DispatchOutcome, SipEndpoint};
 pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use rtp::dtmf::{
