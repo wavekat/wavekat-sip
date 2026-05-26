@@ -7,6 +7,6 @@ resolver = "2"
 # downstream consumers pin us via [patch.crates-io] to a specific 0.0.x.
 # Bump only when the in-flight port (see docs/01-port-plan.md) is ready
 # to publish.
-version = "0.0.10"
+version = "0.0.11"
 edition = "2021"
 license = "Apache-2.0"

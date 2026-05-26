@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/wavekat/wavekat-sip/compare/v0.0.10...v0.0.11) - 2026-05-26
+
+### Added
+
+- *(dtmf-info)* SIP INFO fallback for application/dtmf-relay ([#25](https://github.com/wavekat/wavekat-sip/pull/25))
+- *(rtp)* RFC 4733 DTMF event-packet writer + send_dtmf_burst ([#24](https://github.com/wavekat/wavekat-sip/pull/24))
+- *(sdp)* advertise + parse RFC 4733 telephone-event (DTMF) ([#23](https://github.com/wavekat/wavekat-sip/pull/23))
+
+### Other
+
+- add stars chart to README ([#20](https://github.com/wavekat/wavekat-sip/pull/20))
+
 ## [0.0.10](https://github.com/wavekat/wavekat-sip/compare/v0.0.9...v0.0.10) - 2026-05-14
 
 ### Added
