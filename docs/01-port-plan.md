@@ -49,7 +49,7 @@ release ships the complete RFC 4733 + SIP INFO surface. See
 |------------|-------|
 | `rtp::dtmf`| RFC 4733 event-packet construction (`build_event_payload`, `build_rtp_dtmf_packet`) plus `send_dtmf_burst` — the async transmit helper that drives the 3× initial / continuation / 3× end packet pattern on its own RTP stream (separate SSRC, per RFC 4733 §2.6.2). `DtmfDigit` enum + `from_char` / `as_char` / `event_code`. |
 
-## Landing in v0.0.13
+## Landing next — DTMF, slice 3 of 3
 
 | Module      | Notes |
 |-------------|-------|
