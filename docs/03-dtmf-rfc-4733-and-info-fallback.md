@@ -7,13 +7,16 @@ reaches an IVR ("press 1 for sales"), a conference PIN, or a voicemail
 prompt. This crate ships SIP signaling + RTP transport, so DTMF is on
 us — the consumer hands us digits, we put them on the wire.
 
-This note covers the design that lands across three releases:
+This note covers the design that lands across three PR slices. All
+three ship behind one release tag at the end — no per-slice version
+pin so the changelog reads as a single coherent "DTMF support" entry
+rather than three half-features.
 
-| Release | Slice |
-|---------|-------|
-| 0.0.11 (this PR) | SDP negotiates `telephone-event/8000` (PT 101). `RemoteMedia` exposes the negotiated DTMF payload type. |
-| 0.0.12 | RFC 4733 event-packet writer + `send_dtmf(digit)` on the live dialog handle. |
-| 0.0.13 | SIP INFO (`application/dtmf-relay`) fallback when the answer omits `telephone-event`. |
+| Slice | What it adds |
+|-------|--------------|
+| 1 (this PR) | SDP negotiates `telephone-event/8000` (PT 101). `RemoteMedia` exposes the negotiated DTMF payload type. |
+| 2 | RFC 4733 event-packet writer + `send_dtmf(digit)` on the live dialog handle. |
+| 3 | SIP INFO (`application/dtmf-relay`) fallback when the answer omits `telephone-event`. |
 
 ## Background — the three transports
 
