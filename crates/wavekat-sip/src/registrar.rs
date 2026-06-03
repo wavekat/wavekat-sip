@@ -179,7 +179,20 @@ impl Registrar {
         self.seq.store(val, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Send the initial REGISTER. Retries on failure until cancelled.
+    /// Send the initial REGISTER.
+    ///
+    /// Transient failures (request timeout, server-side `5xx`, temporary
+    /// unavailability, or a transaction that terminated without a final
+    /// response) are retried with a fixed backoff until cancelled — these
+    /// are conditions a retry can resolve once the server or network
+    /// recovers.
+    ///
+    /// **Permanent** failures — the server answered and rejected us for a
+    /// reason a retry will never fix (bad credentials → `401`/`407`,
+    /// `403 Forbidden`, `404 Not Found`, other `4xx`/`6xx`) — return `Err`
+    /// immediately. Retrying those would spin forever and hide the cause
+    /// from the user; surfacing the error lets the caller put the account
+    /// into a visible failed state so the user can correct it.
     pub async fn register(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
             info!(
@@ -225,7 +238,13 @@ impl Registrar {
                     let code = u16::from(resp.status_code.clone());
                     let msg = format!("registration failed with status {}", resp.status_code);
                     warn!("{msg}");
-                    self.record_failure(Some(code), msg);
+                    self.record_failure(Some(code), msg.clone());
+                    if is_permanent_register_failure(&resp.status_code) {
+                        // Retrying can't fix a rejection like this — return
+                        // so the caller can surface it instead of looping
+                        // silently forever.
+                        return Err(msg.into());
+                    }
                 }
                 None => {
                     let msg = "registration transaction terminated unexpectedly".to_string();
@@ -464,6 +483,24 @@ impl Registrar {
     }
 }
 
+/// Whether a final REGISTER response is a *permanent* rejection the caller
+/// must act on, versus a *transient* condition worth retrying.
+///
+/// Transient (returns `false`): `408 Request Timeout`, `480 Temporarily
+/// Unavailable`, and any `5xx` server-side error — the server (or path) is
+/// saying "not right now", which a retry can clear once it recovers.
+///
+/// Permanent (returns `true`): everything else the server answers with —
+/// `401`/`407` (bad credentials after the auth retry), `403 Forbidden`,
+/// `404 Not Found`, other `4xx`, and `6xx` global failures. Retrying these
+/// never succeeds, so the registrar returns the error to its caller rather
+/// than spinning on it forever.
+fn is_permanent_register_failure(status: &StatusCode) -> bool {
+    let code = status.code();
+    let transient = code == 408 || code == 480 || (500..600).contains(&code);
+    !transient
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +526,31 @@ mod tests {
         let endpoint = Arc::new(endpoint);
         let registrar = Registrar::new(account, endpoint.clone(), cancel.clone(), 60, 50).unwrap();
         (registrar, endpoint, cancel)
+    }
+
+    #[test]
+    fn auth_and_client_rejections_are_permanent() {
+        // The server answered "no" for a reason a retry can't fix. These
+        // must return from register() so the account lands in a visible
+        // failed state instead of the registrar looping forever (the bug
+        // this classifier fixes: a wrong password → 401 spun silently).
+        for code in [400u16, 401, 403, 404, 407, 410, 486, 600, 603, 604, 606] {
+            assert!(
+                is_permanent_register_failure(&StatusCode::from(code)),
+                "status {code} should be treated as permanent",
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_and_server_errors_are_transient() {
+        // "Not right now" — worth retrying once the server/path recovers.
+        for code in [408u16, 480, 500, 502, 503, 504] {
+            assert!(
+                !is_permanent_register_failure(&StatusCode::from(code)),
+                "status {code} should be treated as transient",
+            );
+        }
     }
 
     #[tokio::test]
