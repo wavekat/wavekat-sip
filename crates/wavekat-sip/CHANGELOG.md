@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/wavekat/wavekat-sip/compare/v0.0.11...v0.0.12) - 2026-06-03
+
+### Fixed
+
+- surface permanent REGISTER rejections instead of retrying forever ([#27](https://github.com/wavekat/wavekat-sip/pull/27))
+
 ## [0.0.11](https://github.com/wavekat/wavekat-sip/compare/v0.0.10...v0.0.11) - 2026-05-26
 
 ### Added
