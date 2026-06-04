@@ -7,7 +7,7 @@
 [![Crates.io](https://img.shields.io/crates/v/wavekat-sip.svg)](https://crates.io/crates/wavekat-sip)
 [![docs.rs](https://docs.rs/wavekat-sip/badge.svg)](https://docs.rs/wavekat-sip)
 
-SIP signaling and RTP transport for voice pipelines, built on
+SIP signaling and RTP transport for [WaveKat](https://wavekat.com) voice pipelines, built on
 [`rsipstack`](https://crates.io/crates/rsipstack). Same pattern as
 [wavekat-vad](https://github.com/wavekat/wavekat-vad) and
 [wavekat-turn](https://github.com/wavekat/wavekat-turn).
@@ -98,6 +98,12 @@ PSTN / SIP trunk
        ▼
    your app  ──► audio device I/O, codec, recording, AI pipeline
 ```
+
+## About WaveKat
+
+`wavekat-sip` is part of WaveKat, an open-source ecosystem of Rust crates for building real-time voice pipelines. It handles SIP signaling and RTP transport, alongside sibling crates for voice activity detection, turn detection, speech-to-text, and text-to-speech.
+
+See [wavekat.com](https://wavekat.com) for the full project.
 
 ## Stars
 
