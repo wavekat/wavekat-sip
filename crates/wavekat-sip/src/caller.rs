@@ -38,7 +38,7 @@ use rsipstack::dialog::client_dialog::ClientInviteDialog;
 use rsipstack::dialog::dialog::{DialogState, DialogStateReceiver};
 use rsipstack::dialog::invitation::{InviteAsyncResult, InviteOption};
 use rsipstack::transport::SipAddr;
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
@@ -211,11 +211,13 @@ impl Caller {
 }
 
 /// Resolve the account's configured SIP server to a single
-/// [`SipAddr`]. Returns `None` if the host has no A/AAAA records.
+/// [`SipAddr`] via [`crate::resolve::resolve_sip_server`] (RFC 3263
+/// subset: SRV when no explicit port / IP literal, A/AAAA otherwise).
+/// Returns `None` if DNS yields no usable address.
 async fn resolve_server(account: &SipAccount) -> Result<Option<SipAddr>, BoxError> {
-    let host_port = format!("{}:{}", account.server(), account.port());
-    let mut addrs = lookup_host(&host_port).await?;
-    Ok(addrs.next().map(SipAddr::from))
+    Ok(crate::resolve::resolve_sip_server(account)
+        .await?
+        .map(SipAddr::from))
 }
 
 /// Compose an [`InviteOption`] from `account` + target. `contact_host`

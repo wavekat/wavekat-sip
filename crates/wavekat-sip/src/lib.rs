@@ -133,6 +133,7 @@
 //! | [`account`]     | Runtime [`SipAccount`] + [`Transport`] enum.                   |
 //! | [`endpoint`]    | [`SipEndpoint`] — bound transport, dialog layer, RX stream.    |
 //! | [`registrar`]   | REGISTER + digest auth + keepalive re-registration.            |
+//! | [`resolve`]     | RFC 3263 (subset) server location: SRV + A/AAAA fallback.      |
 //! | [`callee`]      | Inbound INVITE accept/reject helper.                           |
 //! | [`caller`]      | Outbound INVITE / dial-cancel helper.                          |
 //! | [`sdp`]         | Minimal G.711 offer/answer build + parse.                      |
@@ -155,6 +156,7 @@ pub mod caller;
 pub mod dtmf_info;
 pub mod endpoint;
 pub mod registrar;
+pub mod resolve;
 pub mod rtp;
 pub mod sdp;
 
@@ -167,6 +169,7 @@ pub use dtmf_info::{
 };
 pub use endpoint::{DispatchOutcome, SipEndpoint};
 pub use registrar::{Registrar, RegistrarDiagnostics};
+pub use resolve::{order_candidates, resolve_sip_server, SrvRecord};
 pub use rtp::dtmf::{
     build_event_payload, build_rtp_dtmf_packet, send_dtmf_burst, DtmfBurstConfig, DtmfDigit,
     DEFAULT_VOLUME_DBM0,

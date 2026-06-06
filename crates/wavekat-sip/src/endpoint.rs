@@ -303,6 +303,12 @@ fn os_version() -> String {
 ///
 /// Opens a temporary UDP socket, connects to the server (no data sent),
 /// and reads back the OS-chosen source address.
+///
+/// Deliberately uses the OS resolver (`connect` → getaddrinfo), not the
+/// SRV-aware [`crate::resolve`] path: this only needs *a* route to pick
+/// a source IP, not the actual SIP target. Consequence: a domain with
+/// SRV records but no A/AAAA on the bare host still fails here — see
+/// `docs/06-srv-lookup.md`.
 fn detect_local_ip(
     account: &SipAccount,
 ) -> Result<IpAddr, Box<dyn std::error::Error + Send + Sync>> {
