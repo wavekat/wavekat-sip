@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/wavekat/wavekat-sip/compare/v0.0.13...v0.0.14) - 2026-06-06
+
+### Added
+
+- let consumers prepend an app product token to the User-Agent ([#31](https://github.com/wavekat/wavekat-sip/pull/31))
+
 ## [0.0.13](https://github.com/wavekat/wavekat-sip/compare/v0.0.12...v0.0.13) - 2026-06-06
 
 ### Fixed
