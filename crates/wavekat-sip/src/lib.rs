@@ -138,6 +138,7 @@
 //! | [`caller`]      | Outbound INVITE / dial-cancel helper.                          |
 //! | [`sdp`]         | Minimal G.711 offer/answer build + parse.                      |
 //! | [`rtp`]         | RTP header parser, debug receive loop, codec-agnostic send loop. |
+//! | [`session_timer`] | RFC 4028 session timers — refresh re-INVITEs + expiry watchdog. |
 //!
 //! # Stability
 //!
@@ -159,6 +160,7 @@ pub mod registrar;
 pub mod resolve;
 pub mod rtp;
 pub mod sdp;
+pub mod session_timer;
 
 pub use account::{SipAccount, Transport};
 pub use callee::{AcceptedCall, Callee, PendingCall};
@@ -177,13 +179,21 @@ pub use rtp::dtmf::{
 pub use rtp::dtmf_recv::{parse_event_payload, DtmfEvent, DtmfEventPayload, DtmfReceiver};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
 pub use sdp::{build_sdp, parse_sdp, RemoteMedia, DTMF_DEFAULT_PT};
+pub use session_timer::{
+    min_se_in, negotiate_uac, negotiate_uas, require_timer_header, session_expires_in,
+    session_timer_loop, supported_timer_header, supports_timer, Refresher, SessionDialogOps,
+    SessionExpires, SessionTimer, SessionTimerOutcome, UasSessionTimer,
+    DEFAULT_SESSION_EXPIRES_SECS, MIN_SESSION_EXPIRES_SECS,
+};
 
 /// Re-exports of upstream types that appear in our public API. Pinning
 /// them here lets consumers depend only on `wavekat-sip` without taking
 /// a direct dep on `rsip` / `rsipstack`.
 pub mod re_exports {
-    pub use rsip::{Header, Method, StatusCode, Uri};
-    pub use rsipstack::dialog::dialog::{DialogState, DialogStateReceiver, TerminatedReason};
+    pub use rsip::{Header, Headers, Method, StatusCode, Uri};
+    pub use rsipstack::dialog::dialog::{
+        DialogState, DialogStateReceiver, TerminatedReason, TransactionHandle,
+    };
     pub use rsipstack::dialog::DialogId;
     pub use rsipstack::transaction::transaction::Transaction;
     pub use rsipstack::transport::SipAddr;

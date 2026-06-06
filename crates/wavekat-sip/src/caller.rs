@@ -45,6 +45,10 @@ use tracing::{debug, info};
 use crate::account::SipAccount;
 use crate::endpoint::SipEndpoint;
 use crate::sdp::{build_sdp, parse_sdp, RemoteMedia};
+use crate::session_timer::{
+    negotiate_uac, supported_timer_header, SessionExpires, SessionTimer,
+    DEFAULT_SESSION_EXPIRES_SECS,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -67,6 +71,11 @@ pub struct AcceptedDial {
     /// Dialog state updates — re-INVITE acks, BYE, termination reasons.
     /// Pump this to detect remote hangup.
     pub state_rx: DialogStateReceiver,
+    /// RFC 4028 session timer negotiated from the 2xx, if the remote
+    /// supports it. Spawn [`crate::session_timer_loop`] with this to
+    /// keep the session refreshed / watched; `None` means the remote
+    /// declined session timers and no timer should run.
+    pub session_timer: Option<SessionTimer>,
 }
 
 /// An outbound INVITE on the wire whose final response has not arrived.
@@ -128,10 +137,12 @@ impl PendingDial {
             return Err(format!("INVITE did not confirm: status {}", resp.status_code).into());
         }
         let remote_media = parse_sdp(&resp.body)?;
+        let session_timer = negotiate_uac(&resp.headers);
         info!(
             remote_addr = %remote_media.addr,
             remote_port = remote_media.port,
             payload_type = remote_media.payload_type,
+            ?session_timer,
             "parsed SDP answer",
         );
         Ok(AcceptedDial {
@@ -140,6 +151,7 @@ impl PendingDial {
             rtp_socket: self.rtp_socket,
             local_rtp_addr: self.local_rtp_addr,
             state_rx: self.state_rx,
+            session_timer,
         })
     }
 }
@@ -251,6 +263,18 @@ fn build_invite_option(
         offer: Some(offer),
         contact: contact_uri,
         credential: Some(credential),
+        // Advertise RFC 4028 session timers: ask for the default 30 min
+        // interval and leave the refresher choice to the answerer (no
+        // `refresher` param). A remote without timer support simply
+        // omits Session-Expires from its 2xx and no timer runs.
+        headers: Some(vec![
+            supported_timer_header(),
+            SessionExpires {
+                interval_secs: DEFAULT_SESSION_EXPIRES_SECS,
+                refresher: None,
+            }
+            .header(),
+        ]),
         ..Default::default()
     })
 }
@@ -326,6 +350,27 @@ mod tests {
         let offer = b"v=0\r\nm=audio 30000 RTP/AVP 0\r\n".to_vec();
         let opt = build_invite_option(&acct, "10.0.0.1:5060", target, offer.clone(), None).unwrap();
         assert_eq!(opt.offer.as_deref(), Some(offer.as_slice()));
+    }
+
+    #[test]
+    fn build_invite_option_advertises_session_timers() {
+        let acct = test_account();
+        let target: rsip::Uri = "sip:bob@example.com".try_into().unwrap();
+        let opt = build_invite_option(&acct, "10.0.0.1:5060", target, vec![], None).unwrap();
+        let headers = opt.headers.expect("extra headers should be set");
+
+        let rendered: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+        assert!(
+            rendered.iter().any(|h| h == "Supported: timer"),
+            "INVITE must advertise Supported: timer, got {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|h| h == &format!("Session-Expires: {DEFAULT_SESSION_EXPIRES_SECS}")),
+            "INVITE must request the default session interval without \
+             pinning a refresher, got {rendered:?}"
+        );
     }
 
     #[test]
