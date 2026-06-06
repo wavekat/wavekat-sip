@@ -100,9 +100,14 @@ impl Registrar {
     /// Build a registrar bound to an endpoint.
     ///
     /// `register_expires` is the `Expires` value sent in REGISTERs (typical:
-    /// 60–300 seconds). `keepalive_secs` is how long to wait between
-    /// re-registrations (typical: `register_expires` minus a small margin,
-    /// e.g. `expires - 10`).
+    /// 60–300 seconds). `keepalive_secs` is the *requested* re-registration
+    /// cadence (typical: `register_expires` minus a small margin, e.g.
+    /// `expires - 10`).
+    ///
+    /// Note that `keepalive_secs` is only an upper bound on the wait between
+    /// re-registrations. Servers routinely grant a shorter `Expires` than we
+    /// ask for, so the keepalive loop refreshes shortly before whatever the
+    /// server actually granted lapses — see `refresh_interval_secs`.
     pub fn new(
         account: SipAccount,
         endpoint: Arc<SipEndpoint>,
@@ -262,15 +267,32 @@ impl Registrar {
         }
     }
 
-    /// Re-register loop: sleeps `keepalive_secs`, then re-REGISTERs.
-    /// Runs until cancelled.
+    /// Re-register loop: sleeps until shortly before the current binding
+    /// lapses, then re-REGISTERs. Runs until cancelled.
+    ///
+    /// The wait is driven by the `Expires` the server actually *granted* in
+    /// the last 200 OK, not the value we asked for. Registrars commonly hand
+    /// back a shorter lifetime than requested; sleeping the requested cadence
+    /// would let the binding expire and leave the account silently
+    /// unreachable until the next cycle. See `refresh_interval_secs`.
     pub async fn keepalive_loop(&self) {
         loop {
-            let keepalive_secs = self.keepalive_secs;
-            info!("Re-registering in {keepalive_secs}s...");
+            // Latest server-granted lifetime (populated by the initial
+            // `register()` before this loop starts; refreshed on every
+            // successful re-REGISTER below). Fall back to what we asked for
+            // if, somehow, we never recorded a grant.
+            let granted = self
+                .diag
+                .lock()
+                .expect("registrar diag mutex poisoned")
+                .negotiated_expires
+                .unwrap_or(self.register_expires);
+            let interval =
+                refresh_interval_secs(self.register_expires, self.keepalive_secs, granted);
+            info!("Re-registering in {interval}s...");
 
             select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(keepalive_secs as u64)) => {}
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(interval as u64)) => {}
                 _ = self.cancel.cancelled() => return,
             }
 
@@ -483,6 +505,46 @@ impl Registrar {
     }
 }
 
+/// Smallest interval the keepalive loop will ever sleep, in seconds. Guards
+/// against a pathologically short server-granted `Expires` turning the loop
+/// into a hot re-REGISTER spin.
+const MIN_REFRESH_INTERVAL_SECS: u32 = 10;
+
+/// Smallest gap we insist on between a re-REGISTER and the moment the current
+/// binding would lapse — one round-trip plus slack — even when the configured
+/// margin works out smaller. Keeps us from refreshing right on the edge.
+const MIN_REFRESH_MARGIN_SECS: u32 = 5;
+
+/// How long to wait before the next re-REGISTER, given the `Expires` the
+/// server granted in the last 200 OK and the locally configured values.
+///
+/// Servers frequently downgrade the `Expires` we request to a shorter value.
+/// Refreshing on the *requested* cadence (`keepalive_secs`) would then fire
+/// long after the granted binding had already expired, leaving the account
+/// unreachable for the gap. So the interval is driven by what the server
+/// actually granted:
+///
+/// - Refresh `margin` seconds before the granted lifetime lapses, where
+///   `margin` is the operator's configured headroom
+///   (`register_expires - keepalive_secs`), floored at
+///   [`MIN_REFRESH_MARGIN_SECS`] so we never sit right on the edge.
+/// - Never wait longer than `keepalive_secs` (covers the rare case of a
+///   server granting *more* than we asked for).
+/// - Never wait less than [`MIN_REFRESH_INTERVAL_SECS`], so an absurdly short
+///   grant can't spin the loop.
+///
+/// When the server honors the requested `Expires`, this reduces to
+/// `keepalive_secs` — identical to the previous fixed-cadence behavior.
+fn refresh_interval_secs(register_expires: u32, keepalive_secs: u32, granted_expires: u32) -> u32 {
+    let margin = register_expires
+        .saturating_sub(keepalive_secs)
+        .max(MIN_REFRESH_MARGIN_SECS);
+    granted_expires
+        .saturating_sub(margin)
+        .min(keepalive_secs)
+        .max(MIN_REFRESH_INTERVAL_SECS)
+}
+
 /// Whether a final REGISTER response is a *permanent* rejection the caller
 /// must act on, versus a *transient* condition worth retrying.
 ///
@@ -551,6 +613,57 @@ mod tests {
                 "status {code} should be treated as transient",
             );
         }
+    }
+
+    #[test]
+    fn refresh_honors_request_when_server_grants_what_we_asked() {
+        // Server returns exactly the requested expiry → behavior is unchanged
+        // from the old fixed-cadence loop: wait the configured keepalive.
+        assert_eq!(refresh_interval_secs(600, 590, 600), 590);
+        assert_eq!(refresh_interval_secs(60, 50, 60), 50);
+    }
+
+    #[test]
+    fn refresh_shortens_when_server_downgrades_expiry() {
+        // The regression: ask for 600 (keepalive 590), server grants 174.
+        // Refreshing at 590 would lapse the binding ~7 minutes early. We must
+        // refresh before 174s, preserving the operator's 10s margin → 164s.
+        assert_eq!(refresh_interval_secs(600, 590, 174), 164);
+        assert!(refresh_interval_secs(600, 590, 174) < 174);
+        // A moderate downgrade keeps the same margin.
+        assert_eq!(refresh_interval_secs(600, 590, 120), 110);
+    }
+
+    #[test]
+    fn refresh_caps_at_keepalive_when_server_grants_more() {
+        // Some servers grant a longer lifetime than requested; we still
+        // refresh no later than the configured cadence.
+        assert_eq!(refresh_interval_secs(600, 590, 1200), 590);
+    }
+
+    #[test]
+    fn refresh_floors_short_grants_to_avoid_hot_loop() {
+        // A tiny grant must not turn into a busy re-REGISTER spin; the
+        // interval is floored even though it then lands after expiry.
+        assert_eq!(
+            refresh_interval_secs(600, 590, 5),
+            MIN_REFRESH_INTERVAL_SECS
+        );
+        assert_eq!(
+            refresh_interval_secs(600, 590, 0),
+            MIN_REFRESH_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_a_margin_even_with_zero_configured_headroom() {
+        // keepalive == register_expires means no configured margin; we still
+        // refresh strictly before the granted expiry, not right on it.
+        assert_eq!(
+            refresh_interval_secs(600, 600, 174),
+            174 - MIN_REFRESH_MARGIN_SECS
+        );
+        assert!(refresh_interval_secs(600, 600, 174) < 174);
     }
 
     #[tokio::test]
