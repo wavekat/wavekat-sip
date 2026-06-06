@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/wavekat/wavekat-sip/compare/v0.0.12...v0.0.13) - 2026-06-06
+
+### Fixed
+
+- refresh REGISTER on the server-granted Expires ([#30](https://github.com/wavekat/wavekat-sip/pull/30))
+
+### Other
+
+- link wavekat.com from README ([#28](https://github.com/wavekat/wavekat-sip/pull/28))
+
 ## [0.0.12](https://github.com/wavekat/wavekat-sip/compare/v0.0.11...v0.0.12) - 2026-06-03
 
 ### Fixed
