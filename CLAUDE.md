@@ -62,9 +62,9 @@ RTP header).
 
 ## Conventions
 
-- Plan docs go in `docs/` with date-prefixed names: `YYYYMMDD-<slug>.md`
-  (no dashes in the date) for time-sensitive plans, or `NN-<topic>.md` for
-  evergreen design docs.
+- All docs go in `docs/` with sequential `NN-<topic>.md` names — plan
+  docs and evergreen design docs alike. **No dates in file names**; if
+  the date matters, put it in the doc's header (`> Status: … · Date: …`).
 - Each non-trivial change gets a plan doc before implementation.
 
 ## Public-repo hygiene
