@@ -329,7 +329,7 @@ pub struct UasSessionTimer {
 /// Returns `None` when the INVITE carries no `Session-Expires` — we do
 /// not insert timers into sessions the caller didn't ask for (allowed
 /// by RFC 4028, deliberately deferred; see
-/// `docs/20260606-session-timers.md`).
+/// `docs/07-session-timers.md`).
 ///
 /// The interval is floored at `max(90, Min-SE)`. The refresher is the
 /// request's `refresher` parameter when the peer advertised timer
