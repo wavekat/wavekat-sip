@@ -50,6 +50,25 @@ impl SipEndpoint {
     /// callee handler).
     pub async fn new(
         account: &SipAccount,
+        cancel: CancellationToken,
+    ) -> Result<(Self, TransactionReceiver), Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_app(account, None, cancel).await
+    }
+
+    /// Like [`SipEndpoint::new`], but prepends an application product
+    /// token to the `User-Agent` header, ahead of this library's own
+    /// token (the convention from RFC 7231 §5.5.3 / RFC 3261 §20.41:
+    /// most significant product first).
+    ///
+    /// Pass the token preformatted, e.g. `"my-app/1.2.3 (abc1234)"`,
+    /// yielding a header like:
+    ///
+    /// ```text
+    /// my-app/1.2.3 (abc1234) wavekat-sip/0.0.13 (macOS 15.5/aarch64) myhost.local
+    /// ```
+    pub async fn new_with_app(
+        account: &SipAccount,
+        app_product: Option<&str>,
         _cancel: CancellationToken,
     ) -> Result<(Self, TransactionReceiver), Box<dyn std::error::Error + Send + Sync>> {
         let local_ip = detect_local_ip(account)?;
@@ -76,6 +95,7 @@ impl SipEndpoint {
         }
 
         let user_agent = build_user_agent(
+            app_product,
             env!("CARGO_PKG_VERSION"),
             crate::GIT_HASH,
             &os_version(),
@@ -216,8 +236,26 @@ pub enum DispatchOutcome {
 }
 
 /// Build the User-Agent header string.
-fn build_user_agent(version: &str, git_hash: &str, os: &str, arch: &str, host: &str) -> String {
-    format!("wavekat-sip/{version} ({git_hash}) ({os}/{arch}) {host}")
+///
+/// `app_product` is an optional consumer-supplied product token (e.g.
+/// `"my-app/1.2.3 (abc1234)"`) placed before the library's own token.
+/// The library git hash is omitted when unavailable (registry builds
+/// have no `.git`, so `GIT_HASH` is `"unknown"` there).
+fn build_user_agent(
+    app_product: Option<&str>,
+    version: &str,
+    git_hash: &str,
+    os: &str,
+    arch: &str,
+    host: &str,
+) -> String {
+    let app = app_product.map(|a| format!("{a} ")).unwrap_or_default();
+    let hash = if git_hash.is_empty() || git_hash == "unknown" {
+        String::new()
+    } else {
+        format!(" ({git_hash})")
+    };
+    format!("{app}wavekat-sip/{version}{hash} ({os}/{arch}) {host}")
 }
 
 /// Returns a human-friendly OS name with version, e.g. `"macOS 15.5"`.
@@ -294,7 +332,14 @@ mod tests {
 
     #[test]
     fn build_user_agent_format() {
-        let ua = build_user_agent("0.0.1", "abc1234", "macOS 15.5", "aarch64", "myhost.local");
+        let ua = build_user_agent(
+            None,
+            "0.0.1",
+            "abc1234",
+            "macOS 15.5",
+            "aarch64",
+            "myhost.local",
+        );
         assert_eq!(
             ua,
             "wavekat-sip/0.0.1 (abc1234) (macOS 15.5/aarch64) myhost.local"
@@ -303,8 +348,44 @@ mod tests {
 
     #[test]
     fn build_user_agent_empty_host() {
-        let ua = build_user_agent("1.0.0", "def5678", "Linux", "x86_64", "");
+        let ua = build_user_agent(None, "1.0.0", "def5678", "Linux", "x86_64", "");
         assert_eq!(ua, "wavekat-sip/1.0.0 (def5678) (Linux/x86_64) ");
+    }
+
+    #[test]
+    fn build_user_agent_with_app_product() {
+        let ua = build_user_agent(
+            Some("my-app/1.2.3 (cafe123)"),
+            "0.0.13",
+            "abc1234",
+            "macOS 15.5",
+            "aarch64",
+            "myhost.local",
+        );
+        assert_eq!(
+            ua,
+            "my-app/1.2.3 (cafe123) wavekat-sip/0.0.13 (abc1234) (macOS 15.5/aarch64) myhost.local"
+        );
+    }
+
+    #[test]
+    fn build_user_agent_omits_unknown_git_hash() {
+        // Registry builds have no .git checkout, so GIT_HASH falls back
+        // to "unknown" — that's noise on the wire, drop the parens.
+        let ua = build_user_agent(
+            Some("my-app/1.2.3 (cafe123)"),
+            "0.0.13",
+            "unknown",
+            "macOS 15.5",
+            "aarch64",
+            "myhost.local",
+        );
+        assert_eq!(
+            ua,
+            "my-app/1.2.3 (cafe123) wavekat-sip/0.0.13 (macOS 15.5/aarch64) myhost.local"
+        );
+        let ua = build_user_agent(None, "0.0.13", "", "Linux", "x86_64", "host");
+        assert_eq!(ua, "wavekat-sip/0.0.13 (Linux/x86_64) host");
     }
 
     #[test]
