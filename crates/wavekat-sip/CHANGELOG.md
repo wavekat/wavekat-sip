@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/wavekat/wavekat-sip/compare/v0.0.14...v0.0.15) - 2026-06-06
+
+### Added
+
+- add RFC 4028 session timers ([#37](https://github.com/wavekat/wavekat-sip/pull/37))
+- resolve SIP servers via DNS SRV ([#35](https://github.com/wavekat/wavekat-sip/pull/35))
+- decode incoming RFC 4733 DTMF ([#34](https://github.com/wavekat/wavekat-sip/pull/34))
+
 ## [0.0.14](https://github.com/wavekat/wavekat-sip/compare/v0.0.13...v0.0.14) - 2026-06-06
 
 ### Added
