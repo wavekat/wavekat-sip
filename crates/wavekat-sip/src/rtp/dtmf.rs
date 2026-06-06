@@ -150,6 +150,31 @@ impl DtmfDigit {
         }
     }
 
+    /// Map an RFC 4733 §2.5.2.1 event code back to a digit — the
+    /// inverse of [`DtmfDigit::event_code`]. Returns `None` for codes
+    /// ≥ 16 (flash-hook and the other non-DTMF telephone events).
+    pub fn from_event_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::D0,
+            1 => Self::D1,
+            2 => Self::D2,
+            3 => Self::D3,
+            4 => Self::D4,
+            5 => Self::D5,
+            6 => Self::D6,
+            7 => Self::D7,
+            8 => Self::D8,
+            9 => Self::D9,
+            10 => Self::Star,
+            11 => Self::Pound,
+            12 => Self::A,
+            13 => Self::B,
+            14 => Self::C,
+            15 => Self::D,
+            _ => return None,
+        })
+    }
+
     /// The RFC 4733 §2.5.2.1 event code (0-15) for this digit.
     pub fn event_code(self) -> u8 {
         match self {
@@ -389,6 +414,23 @@ mod tests {
             DtmfDigit::D,
         ] {
             assert_eq!(DtmfDigit::from_char(d.as_char()), Some(d), "digit {d:?}");
+        }
+    }
+
+    #[test]
+    fn digit_from_event_code_round_trips() {
+        for code in 0u8..16 {
+            let d = DtmfDigit::from_event_code(code).expect("codes 0-15 are digits");
+            assert_eq!(d.event_code(), code, "code {code}");
+        }
+    }
+
+    #[test]
+    fn digit_from_event_code_rejects_non_dtmf_events() {
+        // 16 = flash-hook, and everything above is fax/modem signaling
+        // per the RFC 4733 event registry — not keypad digits.
+        for code in [16u8, 17, 63, 255] {
+            assert_eq!(DtmfDigit::from_event_code(code), None, "code {code}");
         }
     }
 

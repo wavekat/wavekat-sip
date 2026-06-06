@@ -1,14 +1,16 @@
 //! RTP header parsing, a debug receive loop, a codec-agnostic send loop,
-//! and RFC 4733 DTMF (`telephone-event`) packet construction + transmission.
+//! and RFC 4733 DTMF (`telephone-event`) in both directions.
 //!
 //! This module intentionally stops at the wire: it parses RTP headers
 //! (RFC 3550), exposes a debug-friendly receive loop, packetizes
-//! caller-supplied payloads onto the wire via [`send_loop`], and ships
-//! DTMF bursts via [`dtmf::send_dtmf_burst`]. Decoding payloads
-//! (G.711, Opus, …), jitter buffering, audio device routing, and pacing
-//! are consumer-layer concerns and live outside this crate.
+//! caller-supplied payloads onto the wire via [`send_loop`], ships
+//! DTMF bursts via [`dtmf::send_dtmf_burst`], and decodes inbound
+//! digit presses via [`dtmf_recv::DtmfReceiver`]. Decoding audio
+//! payloads (G.711, Opus, …), jitter buffering, audio device routing,
+//! and pacing are consumer-layer concerns and live outside this crate.
 
 pub mod dtmf;
+pub mod dtmf_recv;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
