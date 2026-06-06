@@ -54,6 +54,9 @@ use tracing::{debug, info, warn};
 use crate::account::SipAccount;
 use crate::endpoint::SipEndpoint;
 use crate::sdp::{build_sdp, parse_sdp, RemoteMedia};
+use crate::session_timer::{
+    negotiate_uas, require_timer_header, supported_timer_header, SessionTimer, UasSessionTimer,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -72,6 +75,11 @@ pub struct AcceptedCall {
     /// Dialog state updates — UAC BYE, re-INVITE acks, termination reasons.
     /// Pump this to detect remote hangup.
     pub state_rx: DialogStateReceiver,
+    /// RFC 4028 session timer negotiated from the INVITE, if the caller
+    /// asked for one (the 200 OK echoed it back). Spawn
+    /// [`crate::session_timer_loop`] with this; `None` means no timer
+    /// was negotiated and none should run.
+    pub session_timer: Option<SessionTimer>,
 }
 
 /// An inbound INVITE that has been hooked into the dialog layer — the
@@ -93,6 +101,11 @@ pub struct PendingCall {
     /// Dialog state updates. Watch for `Terminated(UacCancel)` to learn
     /// the caller hung up before you answered.
     pub state_rx: DialogStateReceiver,
+    /// RFC 4028 session timer negotiated from the INVITE's
+    /// `Session-Expires` / `Min-SE` / `Supported: timer` headers.
+    /// [`accept`](Self::accept) echoes it in the 200 OK; `None` when
+    /// the caller didn't ask for session timers.
+    pub session_timer: Option<UasSessionTimer>,
     /// Local IP the endpoint is bound to — used for the SDP answer's
     /// connection address when `accept` is called.
     local_ip: IpAddr,
@@ -115,7 +128,7 @@ impl PendingCall {
         let sdp_answer = build_sdp(self.local_ip, rtp_port);
         debug!("SDP answer:\n{}", String::from_utf8_lossy(&sdp_answer));
 
-        let headers = vec![Header::ContentType("application/sdp".into())];
+        let headers = accept_headers(self.session_timer.as_ref());
         self.dialog.accept(Some(headers), Some(sdp_answer))?;
         info!("sent 200 OK with SDP answer");
 
@@ -125,6 +138,7 @@ impl PendingCall {
             rtp_socket: Arc::new(rtp_socket),
             local_rtp_addr,
             state_rx: self.state_rx,
+            session_timer: self.session_timer.map(|uas| uas.timer),
         })
     }
 
@@ -164,10 +178,12 @@ impl Callee {
     /// or [`reject`](PendingCall::reject) on when the UI decides.
     pub async fn handle_pending(&self, mut tx: Transaction) -> Result<PendingCall, BoxError> {
         let remote_media = parse_sdp(&tx.original.body)?;
+        let session_timer = negotiate_uas(&tx.original.headers);
         info!(
             remote_addr = %remote_media.addr,
             remote_port = remote_media.port,
             payload_type = remote_media.payload_type,
+            ?session_timer,
             "parsed SDP offer",
         );
 
@@ -196,6 +212,7 @@ impl Callee {
             dialog,
             remote_media,
             state_rx,
+            session_timer,
             local_ip: self.endpoint.local_ip(),
         })
     }
@@ -253,9 +270,26 @@ impl Callee {
     }
 }
 
+/// Headers for the 200 OK sent by [`PendingCall::accept`]: the SDP
+/// content type plus, when a session timer was negotiated, the RFC 4028
+/// echo (`Supported: timer`, `Require: timer` if the caller advertised
+/// support, and the negotiated `Session-Expires`).
+fn accept_headers(session_timer: Option<&UasSessionTimer>) -> Vec<Header> {
+    let mut headers = vec![Header::ContentType("application/sdp".into())];
+    if let Some(uas) = session_timer {
+        headers.push(supported_timer_header());
+        if uas.require_timer {
+            headers.push(require_timer_header());
+        }
+        headers.push(uas.echo.header());
+    }
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_timer::{Refresher, SessionExpires};
 
     #[test]
     fn reject_with_2xx_is_an_error() {
@@ -264,5 +298,62 @@ mod tests {
         assert!(ok.code() < 300);
         let busy = StatusCode::BusyHere;
         assert!(busy.code() >= 300);
+    }
+
+    #[test]
+    fn accept_headers_without_timer_is_content_type_only() {
+        let rendered: Vec<String> = accept_headers(None).iter().map(|h| h.to_string()).collect();
+        assert_eq!(rendered, vec!["Content-Type: application/sdp"]);
+    }
+
+    #[test]
+    fn accept_headers_echoes_negotiated_session_timer() {
+        let uas = UasSessionTimer {
+            timer: SessionTimer {
+                interval_secs: 1800,
+                we_are_refresher: false,
+            },
+            echo: SessionExpires {
+                interval_secs: 1800,
+                refresher: Some(Refresher::Uac),
+            },
+            require_timer: true,
+        };
+        let rendered: Vec<String> = accept_headers(Some(&uas))
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "Content-Type: application/sdp",
+                "Supported: timer",
+                "Require: timer",
+                "Session-Expires: 1800;refresher=uac",
+            ]
+        );
+    }
+
+    #[test]
+    fn accept_headers_omits_require_when_caller_lacks_timer_support() {
+        // Proxy-inserted Session-Expires: we refresh, and we must not
+        // Require: timer from a caller that never advertised it.
+        let uas = UasSessionTimer {
+            timer: SessionTimer {
+                interval_secs: 90,
+                we_are_refresher: true,
+            },
+            echo: SessionExpires {
+                interval_secs: 90,
+                refresher: Some(Refresher::Uas),
+            },
+            require_timer: false,
+        };
+        let rendered: Vec<String> = accept_headers(Some(&uas))
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        assert!(!rendered.iter().any(|h| h.starts_with("Require")));
+        assert!(rendered.contains(&"Session-Expires: 90;refresher=uas".to_string()));
     }
 }
