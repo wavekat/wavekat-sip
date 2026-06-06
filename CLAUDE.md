@@ -62,9 +62,15 @@ RTP header).
 
 ## Conventions
 
-- All docs go in `docs/` with sequential `NN-<topic>.md` names — plan
-  docs and evergreen design docs alike. **No dates in file names**; if
-  the date matters, put it in the doc's header (`> Status: … · Date: …`).
+- All docs go in `docs/`. Two kinds:
+  - **Plan docs** — point-in-time records of one change, named with a
+    sequential `NN-<topic>.md` prefix. Never updated after the change
+    lands.
+  - **Living docs** — maintained in place over time (e.g.
+    `RFC-COVERAGE.md`), named `UPPERCASE.md` with no sequence number.
+- **No dates in file names** for either kind; if the date matters, put
+  it in the doc's header (`> Status: … · Date: …`).
+- List every new doc in `docs/README.md`.
 - Each non-trivial change gets a plan doc before implementation.
 
 ## Public-repo hygiene
