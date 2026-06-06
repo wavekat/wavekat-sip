@@ -308,7 +308,7 @@ fn os_version() -> String {
 /// SRV-aware [`crate::resolve`] path: this only needs *a* route to pick
 /// a source IP, not the actual SIP target. Consequence: a domain with
 /// SRV records but no A/AAAA on the bare host still fails here — see
-/// `docs/20260606-srv-lookup.md`.
+/// `docs/06-srv-lookup.md`.
 fn detect_local_ip(
     account: &SipAccount,
 ) -> Result<IpAddr, Box<dyn std::error::Error + Send + Sync>> {

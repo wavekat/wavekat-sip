@@ -1,7 +1,7 @@
 //! SIP server location per a subset of RFC 3263: DNS SRV lookup with
 //! RFC 2782 ordering, falling back to plain A/AAAA.
 //!
-//! Scope (see `docs/20260606-srv-lookup.md` for the full design):
+//! Scope (see `docs/06-srv-lookup.md` for the full design):
 //!
 //! - An explicit `port` on the account, or an IP-literal `server`,
 //!   skips SRV entirely and resolves A/AAAA directly (RFC 3263 §4.1) —
