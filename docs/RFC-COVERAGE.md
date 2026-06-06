@@ -1,6 +1,6 @@
-# 04 — RFC coverage
+# RFC coverage
 
-> Status: living document · Last audited: 2026-06-06 (v0.0.14)
+> Status: living document · Last audited: 2026-06-07 (post-v0.0.14 main)
 
 What standards this crate's **public API** implements, which parts of
 each, and what is knowingly absent. The yardstick is the surface a
@@ -77,7 +77,9 @@ Static payload types 0 (PCMU) and 8 (PCMA); dynamic range 96–127
 honored when the remote maps `telephone-event` somewhere other
 than 101. No other codecs are negotiated or named.
 
-### RFC 4733 — DTMF events over RTP (send side only)
+### RFC 4733 — DTMF events over RTP (send and receive)
+
+Send side:
 
 - Event codes 0–15 (`0`–`9`, `*`, `#`, `A`–`D`) — `DtmfDigit`.
 - 4-byte event payload (E bit, 6-bit volume with clamping, duration in
@@ -91,8 +93,18 @@ than 101. No other codecs are negotiated or named.
   `a=fmtp 0-15`); the 16000 Hz clock variant is deliberately not
   selected — `DTMF_DEFAULT_PT`, `RemoteMedia::dtmf_payload_type`.
 
-Not covered: **receiving/decoding** incoming telephone-event packets
-into digits, tones (§3), trunk/line events beyond DTMF, RFC 2198
+Receive side:
+
+- Payload decoding (event code, E bit, volume, duration) —
+  `parse_event_payload`, `DtmfEventPayload`.
+- Stateful per-stream decoder that turns raw RTP packets into
+  exactly-once `Pressed` / `Released { duration_ticks }` events,
+  deduplicating the redundant burst packets (by SSRC + event-start
+  timestamp + event code) and tolerating loss, reordering, and SSRC
+  changes — `DtmfReceiver`, `DtmfEvent`. Feed it every packet matching
+  the negotiated `dtmf_payload_type` from the consumer's receive loop.
+
+Not covered: tones (§3), trunk/line events beyond DTMF, RFC 2198
 redundancy encoding. (RFC 2833 is the obsoleted predecessor — we
 implement the 4733 revision.)
 
@@ -109,6 +121,46 @@ Not covered: the RFC 6086 Info Package negotiation framework
 an incoming INFO is absorbed by the dialog state machine via
 `dispatch_in_dialog` but its payload is not exposed.
 
+### RFC 3263 — Locating SIP servers (SRV subset)
+
+- SRV lookup (`_sip._udp.` / `_sip._tcp.` per the account transport)
+  with RFC 2782 priority ordering and weighted-random selection within
+  a priority — `resolve_sip_server`, `order_candidates`, `SrvRecord`.
+- §4.1 short-circuits: an explicit port or an IP-literal server skips
+  SRV entirely and resolves A/AAAA directly (or uses the literal as
+  is), keeping the pre-SRV behavior byte-identical for those accounts.
+- No-SRV-records fallback to A/AAAA on the bare host at the default
+  port; SRV-target resolution failure does *not* fall back (per the
+  RFC).
+
+Not covered: NAPTR (§4.1 transport selection starts from the account's
+configured transport instead), `_sips._tcp` / TLS targets, and failover
+across multiple SRV targets on connection failure — only the first
+candidate is used today.
+
+### RFC 4028 — Session timers (partial)
+
+- `Session-Expires` / `Min-SE` / `Supported: timer` parsing and
+  building (manual, header-shape tolerant) — `SessionExpires`,
+  `Refresher`, `session_expires_in`, `min_se_in`, `supports_timer`.
+- Outbound INVITEs advertise `Supported: timer` +
+  `Session-Expires: 1800`; the negotiated result is surfaced as
+  `AcceptedDial::session_timer` (UAC, from the 2xx) and
+  `PendingCall::session_timer` / `AcceptedCall::session_timer` (UAS,
+  echoed into the 200 OK with `Require: timer` when the caller asked).
+- 90 s `Min-SE` floor (§4) — `MIN_SESSION_EXPIRES_SECS`.
+- `session_timer_loop` drives one confirmed dialog in either role:
+  refresher sends re-INVITE refreshes at interval/2 (repeating the
+  original SDP — a no-op offer per RFC 3264); non-refresher runs the
+  expiry watchdog and tears the call down with BYE if no refresh lands
+  in time — `SessionTimerOutcome`.
+
+Not covered: UPDATE-based refreshes (re-INVITE only), `422 Session
+Interval Too Small` retry, initiating timers as the UAS when the
+caller didn't offer them, and answering the *peer's* refresh
+re-INVITEs in-crate — the consumer answers those from its dialog-state
+pump and pings the loop's `peer_refreshed` notifier.
+
 ### RFC 3581 — Symmetric response routing (`rport`)
 
 Client side only, inherited from the underlying stack: every request
@@ -124,14 +176,12 @@ typically a PBX/SBC on the same network or a trunk that latches):
 
 | RFC | What it is | Status |
 |-----|------------|--------|
-| 3263 | Locating SIP servers via NAPTR/SRV | Only A/AAAA via the OS resolver (`lookup_host`); no SRV, no NAPTR, no transport fallback chain |
 | 3311 | UPDATE method | Not exposed |
 | 3326 | Reason header | Not emitted or parsed |
 | 3515 / 3891 / 3892 | REFER, Replaces, Referred-By (call transfer) | Not implemented |
 | 3428 | MESSAGE (pager-mode IM) | Not implemented |
 | 6665 (ex-3265) | SUBSCRIBE/NOTIFY event framework | Matching dialogs answered `501 Not Implemented` |
 | 3856 / 3863 | Presence, PIDF | Not implemented |
-| 4028 | Session timers (`Session-Expires`) | Not implemented — dead dialogs are detected only via BYE or transaction failure |
 | 5626 / 5627 | Outbound connection reuse, GRUU | Not implemented |
 | 3711 / 5763 / 5764 | SRTP, DTLS-SRTP | No media encryption |
 | 8489 / 8445 / 8656 | STUN, ICE, TURN | No NAT traversal; local address discovery is a UDP-connect trick only |
@@ -159,14 +209,13 @@ consider public.
 
 Ranked by how soon a real deployment trips over them:
 
-1. **RFC 4733 receive side** — we can *send* digits but offer no
-   helper to decode incoming `telephone-event` packets; an IVR-style
-   consumer (or an AI agent listening for keypad input) currently has
-   to hand-roll the payload parsing this crate already understands on
-   the send path.
-2. **RFC 3263 SRV lookup** — accounts pointing at a domain with only
-   SRV records (no A on the bare domain) fail to resolve today.
-3. **RTCP receiver reports** — without them, neither side gets loss or
+1. **RTCP receiver reports** — without them, neither side gets loss or
    jitter feedback; fine on a LAN, blind over the open internet.
-4. **TLS transport (SIPS)** — credentials currently ride plaintext
+2. **TLS transport (SIPS)** — credentials currently ride plaintext
    except for the digest exchange itself.
+3. **422 retry + UPDATE refreshes (RFC 4028)** — a server that rejects
+   our 1800 s `Session-Expires` with `422` currently just gets no
+   timer; UPDATE would refresh without touching media.
+4. **SRV failover (RFC 3263)** — we order the candidates correctly but
+   only ever try the first; a dead primary should fall through to the
+   next target.
