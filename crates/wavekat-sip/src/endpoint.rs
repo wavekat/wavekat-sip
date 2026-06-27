@@ -50,11 +50,23 @@ impl SipEndpoint {
         account: &SipAccount,
         cancel: CancellationToken,
     ) -> Result<Arc<Self>, BoxError> {
+        Self::new_with_app(account, None, cancel).await
+    }
+
+    /// Like [`SipEndpoint::new`], but advertise `product` as the `User-Agent` on
+    /// every outbound request (e.g. `"my-app/1.2.3"`). `None` emits no header.
+    pub async fn new_with_app(
+        account: &SipAccount,
+        product: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<Arc<Self>, BoxError> {
         let local_ip = detect_local_ip(account)?;
         let bind_addr = SocketAddr::new(local_ip, 0);
         info!("Binding SIP transport to {bind_addr}");
 
-        let ua = Arc::new(Ua::bind(bind_addr, cancel.clone()).await?);
+        let ua = Arc::new(
+            Ua::bind_with_app(bind_addr, product.map(String::from), cancel.clone()).await?,
+        );
         let server = resolve_sip_server(account)
             .await?
             .ok_or("could not resolve SIP server address")?;

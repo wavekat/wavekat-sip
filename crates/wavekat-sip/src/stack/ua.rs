@@ -50,18 +50,38 @@ pub(crate) struct Ua {
     engine: EngineHandle,
     subscribe_tx: mpsc::Sender<Subscribe>,
     incoming: Mutex<mpsc::Receiver<Incoming>>,
+    /// Product token emitted as `User-Agent` on outbound requests, if set.
+    user_agent: Option<String>,
 }
 
 impl Ua {
     /// Bind a UDP socket and start the engine + router with default timers.
     pub(crate) async fn bind(local: SocketAddr, cancel: CancellationToken) -> io::Result<Self> {
-        Self::bind_with_timers(local, Timers::default(), cancel).await
+        Self::bind_full(local, Timers::default(), None, cancel).await
     }
 
     /// Bind with explicit base timers (tests shrink them).
     pub(crate) async fn bind_with_timers(
         local: SocketAddr,
         timers: Timers,
+        cancel: CancellationToken,
+    ) -> io::Result<Self> {
+        Self::bind_full(local, timers, None, cancel).await
+    }
+
+    /// Bind advertising `user_agent` as the `User-Agent` on outbound requests.
+    pub(crate) async fn bind_with_app(
+        local: SocketAddr,
+        user_agent: Option<String>,
+        cancel: CancellationToken,
+    ) -> io::Result<Self> {
+        Self::bind_full(local, Timers::default(), user_agent, cancel).await
+    }
+
+    async fn bind_full(
+        local: SocketAddr,
+        timers: Timers,
+        user_agent: Option<String>,
         cancel: CancellationToken,
     ) -> io::Result<Self> {
         let (engine, events) = engine::start_with_timers(local, timers, cancel).await?;
@@ -72,6 +92,7 @@ impl Ua {
             engine,
             subscribe_tx,
             incoming: Mutex::new(incoming_rx),
+            user_agent,
         })
     }
 
@@ -262,10 +283,31 @@ impl Ua {
         // Wait until the router has the subscription before we send, so a fast
         // reply can't arrive before we're listening.
         ack_rx.await.ok()?;
-        if !self.engine.start_client(request.clone(), peer).await {
+        let mut request = request.clone();
+        self.apply_user_agent(&mut request);
+        if !self.engine.start_client(request, peer).await {
             return None;
         }
         Some(rx)
+    }
+
+    /// Add our `User-Agent` to an outbound request if a product token is set and
+    /// the request doesn't already carry one. The header rides every client
+    /// transaction (INVITE / REGISTER / BYE / re-INVITE / INFO); it does not
+    /// affect the transaction key, which is keyed on Via + method.
+    fn apply_user_agent(&self, request: &mut Request) {
+        let Some(product) = &self.user_agent else {
+            return;
+        };
+        let has_ua = request
+            .headers
+            .iter()
+            .any(|h| matches!(h, Header::UserAgent(_)));
+        if !has_ua {
+            request
+                .headers
+                .push(Header::UserAgent(product.clone().into()));
+        }
     }
 
     /// Pump a transaction's events until its final response, or `None` on
@@ -503,6 +545,43 @@ mod tests {
             SipMessage::Response(r) => assert_eq!(r.status_code().code(), 200),
             _ => panic!("expected the 200"),
         }
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn user_agent_injected_only_when_configured() {
+        let cancel = CancellationToken::new();
+        let with_app = Ua::bind_with_app(
+            "127.0.0.1:0".parse().unwrap(),
+            Some("wavekat-test/9.9".into()),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        let plain = Ua::bind("127.0.0.1:0".parse().unwrap(), cancel.clone())
+            .await
+            .unwrap();
+
+        let mut req = build_invite(&call_config(), 1, with_app.local_addr());
+        with_app.apply_user_agent(&mut req);
+        assert!(
+            req.to_string().contains("User-Agent: wavekat-test/9.9"),
+            "configured product token must ride the request",
+        );
+        // Idempotent: a second pass does not duplicate the header.
+        with_app.apply_user_agent(&mut req);
+        assert_eq!(
+            req.to_string().matches("User-Agent:").count(),
+            1,
+            "User-Agent must not be duplicated",
+        );
+
+        let mut plain_req = build_invite(&call_config(), 1, plain.local_addr());
+        plain.apply_user_agent(&mut plain_req);
+        assert!(
+            !plain_req.to_string().contains("User-Agent"),
+            "no token configured → no header",
+        );
         cancel.cancel();
     }
 
