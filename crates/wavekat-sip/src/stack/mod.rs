@@ -36,6 +36,7 @@
 // `endpoint`/`caller`/`callee`/`registrar` are re-pointed at the engine.
 #![allow(dead_code)]
 
+pub(crate) mod auth;
 pub(crate) mod engine;
 pub(crate) mod transaction;
 pub(crate) mod transport;
