@@ -174,7 +174,21 @@ impl Dialog {
     pub(crate) fn new_request(&mut self, method: Method) -> Request {
         self.local_seq += 1;
         let seq = self.local_seq;
-        self.compose(method, seq)
+        self.compose(method, seq, Vec::new(), Vec::new())
+    }
+
+    /// Build the next in-dialog request carrying `extra_headers` (e.g. a
+    /// `Content-Type` or `Session-Expires`) and a `body` (e.g. an SDP re-offer
+    /// or a DTMF `INFO` payload). The `Content-Length` is set from `body`.
+    pub(crate) fn new_request_with(
+        &mut self,
+        method: Method,
+        extra_headers: Vec<Header>,
+        body: Vec<u8>,
+    ) -> Request {
+        self.local_seq += 1;
+        let seq = self.local_seq;
+        self.compose(method, seq, extra_headers, body)
     }
 
     /// Build the ACK for a 2xx answer to our INVITE (RFC 3261 §13.2.2.4).
@@ -183,11 +197,19 @@ impl Dialog {
     /// it reuses the INVITE's sequence number with method ACK, and is sent
     /// outside any transaction. It still rides the dialog route set and target.
     pub(crate) fn ack_2xx(&self, invite_cseq: u32) -> Request {
-        self.compose(Method::Ack, invite_cseq)
+        self.compose(Method::Ack, invite_cseq, Vec::new(), Vec::new())
     }
 
-    /// Shared request composer: Via (fresh branch) + target + tags + route set.
-    fn compose(&self, method: Method, seq: u32) -> Request {
+    /// Shared request composer: Via (fresh branch) + target + tags + route set,
+    /// then any `extra_headers`, a `Content-Length` derived from `body`, and the
+    /// `body` itself.
+    fn compose(
+        &self,
+        method: Method,
+        seq: u32,
+        extra_headers: Vec<Header>,
+        body: Vec<u8>,
+    ) -> Request {
         let branch = gen_branch();
 
         let mut headers = Headers::default();
@@ -228,16 +250,22 @@ impl Dialog {
             params: vec![],
         };
         headers.push(Header::Contact(contact.into()));
-        headers.push(Header::ContentLength(
-            rsip::headers::ContentLength::default(),
-        ));
+
+        // Caller-supplied headers (e.g. Content-Type, Session-Expires) precede
+        // the Content-Length so the latter stays adjacent to the body.
+        for header in extra_headers {
+            headers.push(header);
+        }
+        headers.push(Header::ContentLength(rsip::headers::ContentLength::from(
+            body.len() as u32,
+        )));
 
         Request {
             method,
             uri: self.remote_target.clone(),
             version: rsip::Version::V2,
             headers,
-            body: Vec::new(),
+            body,
         }
     }
 }
@@ -391,6 +419,37 @@ mod tests {
             .any(|h| matches!(h, Header::Route(_))));
         // And the CSeq keeps advancing.
         assert_eq!(reinvite.cseq_header().unwrap().typed().unwrap().seq, 316);
+    }
+
+    #[test]
+    fn new_request_with_attaches_body_headers_and_content_length() {
+        let mut dialog = Dialog::uac(&invite(), &ok_response(), local_contact()).unwrap();
+        let body = b"Signal=5\nDuration=160".to_vec();
+        let info = dialog.new_request_with(
+            Method::Info,
+            vec![Header::ContentType(rsip::headers::ContentType::new(
+                "application/dtmf-relay",
+            ))],
+            body.clone(),
+        );
+
+        assert_eq!(*info.method(), Method::Info);
+        assert_eq!(info.body, body);
+        // Content-Length reflects the body, not the default 0.
+        let len = info
+            .headers
+            .iter()
+            .find_map(|h| match h {
+                Header::ContentLength(c) => Some(c.value().to_string()),
+                _ => None,
+            })
+            .expect("Content-Length present");
+        assert_eq!(len, body.len().to_string());
+        // The caller's Content-Type rode along.
+        assert!(info.headers.iter().any(|h| matches!(
+            h,
+            Header::ContentType(ct) if ct.value() == "application/dtmf-relay"
+        )));
     }
 
     #[test]

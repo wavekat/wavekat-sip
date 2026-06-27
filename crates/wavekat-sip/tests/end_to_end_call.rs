@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use wavekat_sip::re_exports::Uri;
-use wavekat_sip::{Caller, SipAccount, SipEndpoint, Transport};
+use wavekat_sip::{Caller, DtmfDigit, SipAccount, SipEndpoint, Transport};
 
 fn account(server: &str, port: u16) -> SipAccount {
     SipAccount {
@@ -78,6 +78,16 @@ async fn dial_accept_hangup_over_loopback() {
         .await
         .expect("accept finishes within 10s")
         .expect("accept task did not panic");
+
+    // DTMF over SIP INFO: the press is sent in-dialog and the callee's router
+    // auto-answers 200 OK, which classifies as accepted.
+    let outcome = timeout(
+        Duration::from_secs(10),
+        call.send_dtmf_info(DtmfDigit::D5, 160),
+    )
+    .await
+    .expect("INFO completes within 10s");
+    assert!(outcome.is_accepted(), "INFO DTMF accepted, got {outcome:?}");
 
     // Hang up: BYE is sent and the callee's router auto-answers 200.
     timeout(Duration::from_secs(10), call.hangup())

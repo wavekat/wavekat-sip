@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 
-use rsip::{Method, Request, Response, SipMessage};
+use rsip::{Header, Method, Request, Response, SipMessage};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -192,6 +192,20 @@ impl Ua {
     ) -> Option<Response> {
         let mut rx = self.start_client(&request, peer).await?;
         self.await_final(&mut rx).await
+    }
+
+    /// Send an in-dialog `INFO` carrying `extra_headers` + `body` and return its
+    /// final response, or `None` on timeout. `INFO` is a non-INVITE request, so
+    /// no ACK follows its 2xx.
+    pub(crate) async fn info(
+        &self,
+        peer: SocketAddr,
+        dialog: &mut Dialog,
+        extra_headers: Vec<Header>,
+        body: Vec<u8>,
+    ) -> Option<Response> {
+        let request = dialog.new_request_with(Method::Info, extra_headers, body);
+        self.send_in_dialog(peer, request).await
     }
 
     /// Have a server transaction send `response` for the request keyed by `key`.

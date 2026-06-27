@@ -151,6 +151,7 @@
 pub mod account;
 pub mod callee;
 pub mod caller;
+pub mod dtmf_info;
 pub mod endpoint;
 pub mod registrar;
 pub mod resolve;
@@ -163,6 +164,7 @@ pub(crate) mod stack;
 pub use account::{SipAccount, Transport};
 pub use callee::IncomingCall;
 pub use caller::{Call, Caller};
+pub use dtmf_info::{build_info_body, content_type_header, InfoOutcome};
 pub use endpoint::SipEndpoint;
 pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use resolve::{order_candidates, resolve_sip_server, SrvRecord};

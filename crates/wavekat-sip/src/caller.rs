@@ -15,7 +15,9 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
 use crate::account::SipAccount;
+use crate::dtmf_info::{build_info_body, classify, content_type_header, InfoOutcome};
 use crate::endpoint::SipEndpoint;
+use crate::rtp::dtmf::DtmfDigit;
 use crate::sdp::{build_sdp, parse_sdp, RemoteMedia};
 use crate::stack::call::{CallConfig, CallOutcome};
 use crate::stack::dialog::Dialog;
@@ -56,6 +58,28 @@ impl Call {
             rtp_socket,
             local_rtp_addr,
         }
+    }
+
+    /// Send one DTMF press via SIP `INFO` (`application/dtmf-relay`).
+    ///
+    /// Use this only when the remote did not negotiate RFC 4733 — i.e.
+    /// [`RemoteMedia::dtmf_payload_type`] is `None`. When telephone-event is
+    /// available, prefer [`crate::send_dtmf_burst`] over RTP. A
+    /// [`InfoOutcome::UnsupportedMedia`] result means the remote rejects this
+    /// transport too; stop sending further presses on this dialog.
+    pub async fn send_dtmf_info(&mut self, digit: DtmfDigit, duration_ms: u32) -> InfoOutcome {
+        let body = build_info_body(digit, duration_ms).into_bytes();
+        let response = self
+            .endpoint
+            .ua()
+            .info(
+                self.peer,
+                &mut self.dialog,
+                vec![content_type_header()],
+                body,
+            )
+            .await;
+        classify(response)
     }
 
     /// Hang up by sending an in-dialog `BYE`. Returns once the peer 2xxs it
