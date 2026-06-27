@@ -1,15 +1,18 @@
 # RFC coverage
 
-> Status: living document · Last audited: 2026-06-07 (post-v0.0.14 main)
+> Status: living document · Last audited: 2026-06-27 (post rsipstack removal — see `docs/16`)
 
 What standards this crate's **public API** implements, which parts of
 each, and what is knowingly absent. The yardstick is the surface a
-consumer can actually reach through `wavekat_sip::*` — capabilities
-that exist in the underlying [`rsipstack`] but are not exposed here are
-listed under [Not exposed](#in-the-underlying-stack-but-not-exposed),
-not under "implemented".
+consumer can actually reach through `wavekat_sip::*`.
 
-[`rsipstack`]: https://crates.io/crates/rsipstack
+Since `docs/16`, the SIP transaction/dialog/transport machinery is a
+from-scratch in-house engine (internal `stack` module; see `docs/08`–`docs/16`).
+The only SIP crate dependency is [`rsip`], used for message types. There is no
+longer an "underlying stack" with extra latent capabilities — what the engine
+does is exactly what this document lists.
+
+[`rsip`]: https://crates.io/crates/rsip
 
 ## Implemented
 
@@ -17,21 +20,20 @@ not under "implemented".
 
 | Area | Coverage | Public surface |
 |------|----------|----------------|
-| §10 Registrations | REGISTER, digest-auth retry on 401/407, re-registration driven by the server-granted `Expires`, unregister (`Expires: 0`), permanent-vs-transient failure classification | `Registrar` |
-| §9 Cancelling | CANCEL for a pending outbound INVITE (idempotent once settled) | `PendingDial::cancel` |
-| §13.2 UAC INVITE | Outbound INVITE with SDP offer, early dialog states (`Calling` / `Early` / `Confirmed` / `Terminated`), digest credentials | `Caller::dial`, `PendingDial`, `AcceptedDial` |
-| §13.3 UAS INVITE | `100 Trying`, deferred accept/reject, `487` auto-reply to pre-answer CANCEL, non-2xx final rejects (`486`, `603`, …) | `Callee`, `PendingCall`, `AcceptedCall` |
-| §15 Terminating | BYE in both directions — local hangup via the dialog handle, remote BYE surfaced as `Terminated` on the state channel | `dialog.bye()`, `DialogStateReceiver` |
-| §12.2.2 In-dialog requests | Route inbound in-dialog transactions to their dialog; `481 Call/Transaction Does Not Exist` when nothing matches, `501 Not Implemented` for non-INVITE dialog kinds | `SipEndpoint::dispatch_in_dialog`, `DispatchOutcome` |
-| §20.41 User-Agent | Library product token plus optional consumer-prepended app token, most-significant-first per RFC 7231 §5.5.3 | `SipEndpoint::new_with_app` |
-| §8.1.1.4 Call-ID | Random-prefix Call-ID generation (suffix overridden from rsipstack's default) | `SipEndpoint::new` |
-| §18 Transports | UDP and TCP | `Transport` |
+| §10 Registrations | REGISTER, digest-auth retry on 401/407, re-registration on an interval, unregister (`Expires: 0`), outcome classification (registered / unauthorized / failed / timed out) | `Registrar` |
+| §13.2 UAC INVITE | Outbound INVITE with SDP offer, follows provisional responses to a final, answers one digest challenge, parses the SDP answer from the 2xx, sends the 2xx ACK | `Caller::dial`, `Call` |
+| §13.3 UAS INVITE | Automatic `100 Trying`, deferred accept (`200 OK` + SDP answer) or reject (non-2xx final, e.g. `486`/`603`) | `SipEndpoint::next_incoming_call`, `IncomingCall` |
+| §15 Terminating | BYE — local hangup via the call handle; an inbound in-dialog BYE is auto-answered `200 OK` by the endpoint router | `Call::hangup`, `SipEndpoint` |
+| §12 Dialogs | Dialog establishment with route-set capture/reuse (UAC reverses Record-Route, UAS keeps order), in-dialog request composition addressed to the route set | internal (`Call`) |
+| §12.2.2 In-dialog requests | Inbound in-dialog requests (BYE / OPTIONS / INFO / re-INVITE) are auto-answered `200 OK`; the 2xx ACK is absorbed | `SipEndpoint` router |
+| §8.1.1.4 Call-ID | Random Call-ID generation | `Caller`, `Registrar` |
+| §17 Transactions | Full RFC 3261 §17 client/server INVITE & non-INVITE state machines with T1/T2/T4 timers and UDP retransmission | internal (`stack::transaction`) |
 | §22 Authentication | Digest challenge/response as a client, on both REGISTER and INVITE | `Registrar`, `Caller` (credentials threaded internally) |
 
-Not covered from RFC 3261: acting as a proxy/registrar/redirect
-server, SIPS/TLS (§26.2), multicast (§18.1.1), `OPTIONS` self-handling
-(inbound OPTIONS outside a dialog is left to the consumer via the
-incoming-transaction stream).
+Not covered from RFC 3261: acting as a proxy/registrar/redirect server,
+SIPS/TLS (§26.2), multicast (§18.1.1), CANCEL of a pending outbound INVITE,
+the `User-Agent` header (§20.41), and surfacing inbound in-dialog request
+bodies to the consumer (in-dialog requests are auto-answered, not exposed).
 
 ### RFC 3264 — SDP offer/answer model (minimal subset)
 
@@ -108,19 +110,6 @@ Not covered: tones (§3), trunk/line events beyond DTMF, RFC 2198
 redundancy encoding. (RFC 2833 is the obsoleted predecessor — we
 implement the 4733 revision.)
 
-### SIP INFO method (RFC 6086 / ex-2976) — DTMF relay only
-
-Sending in-dialog `INFO` carrying `application/dtmf-relay`
-(`Signal=` / `Duration=`, the Cisco de-facto body — not itself an RFC
-format) on both client and server dialogs, with 2xx / 415 / other
-outcome classification — `send_dtmf_info_client`,
-`send_dtmf_info_server`, `InfoOutcome`.
-
-Not covered: the RFC 6086 Info Package negotiation framework
-(`Recv-Info`), and surfacing *inbound* INFO bodies to the consumer —
-an incoming INFO is absorbed by the dialog state machine via
-`dispatch_in_dialog` but its payload is not exposed.
-
 ### RFC 3263 — Locating SIP servers (SRV subset)
 
 - SRV lookup (`_sip._udp.` / `_sip._tcp.` per the account transport)
@@ -138,36 +127,6 @@ configured transport instead), `_sips._tcp` / TLS targets, and failover
 across multiple SRV targets on connection failure — only the first
 candidate is used today.
 
-### RFC 4028 — Session timers (partial)
-
-- `Session-Expires` / `Min-SE` / `Supported: timer` parsing and
-  building (manual, header-shape tolerant) — `SessionExpires`,
-  `Refresher`, `session_expires_in`, `min_se_in`, `supports_timer`.
-- Outbound INVITEs advertise `Supported: timer` +
-  `Session-Expires: 1800`; the negotiated result is surfaced as
-  `AcceptedDial::session_timer` (UAC, from the 2xx) and
-  `PendingCall::session_timer` / `AcceptedCall::session_timer` (UAS,
-  echoed into the 200 OK with `Require: timer` when the caller asked).
-- 90 s `Min-SE` floor (§4) — `MIN_SESSION_EXPIRES_SECS`.
-- `session_timer_loop` drives one confirmed dialog in either role:
-  refresher sends re-INVITE refreshes at interval/2 (repeating the
-  original SDP — a no-op offer per RFC 3264); non-refresher runs the
-  expiry watchdog and tears the call down with BYE if no refresh lands
-  in time — `SessionTimerOutcome`.
-
-Not covered: UPDATE-based refreshes (re-INVITE only), `422 Session
-Interval Too Small` retry, initiating timers as the UAS when the
-caller didn't offer them, and answering the *peer's* refresh
-re-INVITEs in-crate — the consumer answers those from its dialog-state
-pump and pings the loop's `peer_refreshed` notifier.
-
-### RFC 3581 — Symmetric response routing (`rport`)
-
-Client side only, inherited from the underlying stack: every request
-we send carries `;rport` in its Via, so responses come back to the
-source port. We do not implement the server-side behavior (we are not
-a proxy).
-
 ## Not implemented
 
 NAT traversal and media security, in particular, are fully delegated
@@ -176,46 +135,43 @@ typically a PBX/SBC on the same network or a trunk that latches):
 
 | RFC | What it is | Status |
 |-----|------------|--------|
+| 4028 | Session timers | Removed in `docs/16`; re-INVITEs are auto-answered but periodic refresh is not driven. Deferred to a follow-up on the engine. |
+| 6086 (ex-2976) | SIP INFO (DTMF relay) | Removed in `docs/16`; inbound INFO is auto-answered `200 OK` but not surfaced, and sending INFO is not exposed. Deferred. |
+| 3581 | Symmetric response routing (`rport`) | Not currently added to outgoing Via; responses route to the Via sent-by address. |
 | 3311 | UPDATE method | Not exposed |
 | 3326 | Reason header | Not emitted or parsed |
 | 3515 / 3891 / 3892 | REFER, Replaces, Referred-By (call transfer) | Not implemented |
 | 3428 | MESSAGE (pager-mode IM) | Not implemented |
-| 6665 (ex-3265) | SUBSCRIBE/NOTIFY event framework | Matching dialogs answered `501 Not Implemented` |
+| 6665 (ex-3265) | SUBSCRIBE/NOTIFY event framework | Not implemented |
 | 3856 / 3863 | Presence, PIDF | Not implemented |
 | 5626 / 5627 | Outbound connection reuse, GRUU | Not implemented |
 | 3711 / 5763 / 5764 | SRTP, DTLS-SRTP | No media encryption |
 | 8489 / 8445 / 8656 | STUN, ICE, TURN | No NAT traversal; local address discovery is a UDP-connect trick only |
 | 3605 / 5761 | RTCP attribute in SDP, RTP/RTCP mux | No RTCP at all |
 | 7587 et al. | Wideband codecs (Opus, …) | G.711 only by design (see scope in `CLAUDE.md`) |
+| 3262 | PRACK / 100rel | Provisional responses are not acknowledged reliably |
 | 7118 | SIP over WebSocket | Not exposed (`Transport` is UDP/TCP only) |
 
-## In the underlying stack but not exposed
+### Transports
 
-`rsipstack` ships these, but `wavekat-sip` does not surface them — a
-consumer holding only this crate's API cannot reach them:
-
-- **TLS and WebSocket transports** — `Transport` deliberately offers
-  `Udp | Tcp` only.
-- **RFC 3262 PRACK / 100rel** — provisional responses are surfaced as
-  dialog states but never acknowledged reliably.
-- **Proxy / registrar server roles** — this crate is a UA toolkit.
-
-If a consumer needs one of these, the path is to widen this crate's
-API (new `Transport` variant, etc.), not to reach into `rsipstack`
-directly — the `re_exports` module pins the only upstream types we
-consider public.
+The engine currently implements a **UDP** transport only. The `Transport`
+enum still carries a `Tcp` variant (and the transaction timers collapse their
+retransmission soak for a reliable transport), but a TCP transport
+implementation is not yet wired into the engine. TLS and WebSocket are out of
+scope.
 
 ## Known gaps worth closing first
 
 Ranked by how soon a real deployment trips over them:
 
-1. **RTCP receiver reports** — without them, neither side gets loss or
-   jitter feedback; fine on a LAN, blind over the open internet.
-2. **TLS transport (SIPS)** — credentials currently ride plaintext
-   except for the digest exchange itself.
-3. **422 retry + UPDATE refreshes (RFC 4028)** — a server that rejects
-   our 1800 s `Session-Expires` with `422` currently just gets no
-   timer; UPDATE would refresh without touching media.
-4. **SRV failover (RFC 3263)** — we order the candidates correctly but
-   only ever try the first; a dead primary should fall through to the
-   next target.
+1. **Session timers (RFC 4028)** — without driven refreshes, long calls can be
+   reaped by a server enforcing `Session-Expires`. Re-add on the engine.
+2. **`rport` (RFC 3581)** — needed for responses to come back through NAT/PAT;
+   add `;rport` to outgoing Via and honor it on responses.
+3. **TCP transport** — the `Transport::Tcp` variant is currently inert.
+4. **RTCP receiver reports** — without them, neither side gets loss or jitter
+   feedback; fine on a LAN, blind over the open internet.
+5. **TLS transport (SIPS)** — credentials currently ride plaintext except for
+   the digest exchange itself.
+6. **SRV failover (RFC 3263)** — we order the candidates correctly but only ever
+   try the first; a dead primary should fall through to the next target.
