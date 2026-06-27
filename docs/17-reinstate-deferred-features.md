@@ -1,6 +1,6 @@
 # 17 · Reinstate the deferred call features on the in-house engine
 
-> Status: In progress · Follows `docs/16` (the `rsipstack` cutover).
+> Status: Done · Follows `docs/16` (the `rsipstack` cutover).
 
 ## Why
 
@@ -183,9 +183,14 @@ external server is needed. All four gates (`fmt`, `clippy -D warnings`,
 - [x] Phase 2 — `User-Agent` header (`SipEndpoint::new_with_app`)
 - [x] Phase 3 — DTMF over SIP INFO (`Call::send_dtmf_info`)
 - [x] Phase 4 — hold / resume re-INVITE (`Call::set_hold` / `is_held`)
-- [x] Phase 5 — session timers (RFC 4028) — UAC-refresher path live;
-  `Call::session_timer()` + `Call::session_handle()` + `session_timer_loop`.
-  The **watchdog** (peer-refresh) path still needs Phase 6 to surface the
-  peer's refresh re-INVITE and ping the deadline.
-- [ ] Phase 6 — inbound in-dialog surfacing + CANCEL + provisional states
-  (the deep router/return-shape reshape; not yet started)
+- [x] Phase 5 — session timers (RFC 4028) — `Call::session_timer()` +
+  `Call::session_handle()` + `session_timer_loop`. The watchdog
+  (peer-refresh) path is completed by Phase 6 (the peer's refresh re-INVITE
+  is now surfaced so the consumer can answer it and reset the deadline).
+- [x] Phase 6 — inbound in-dialog surfacing + CANCEL + provisional states:
+  - `Call::inbound_requests()` → `InboundRequests`/`InboundRequest` opt-in
+    stream of peer re-INVITE / INFO (auto-answer remains the default).
+  - `Caller::dial_cancellable(target, cancel)` CANCELs a ringing INVITE
+    (RFC 3261 §9), resolving to `487`.
+  - `Caller::dial_with_progress(target, cancel, tx)` forwards provisional
+    statuses (e.g. `180 Ringing`).

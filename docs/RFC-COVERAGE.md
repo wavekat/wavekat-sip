@@ -21,22 +21,21 @@ does is exactly what this document lists.
 | Area | Coverage | Public surface |
 |------|----------|----------------|
 | §10 Registrations | REGISTER, digest-auth retry on 401/407, re-registration on an interval, unregister (`Expires: 0`), outcome classification (registered / unauthorized / failed / timed out) | `Registrar` |
-| §13.2 UAC INVITE | Outbound INVITE with SDP offer, follows provisional responses to a final, answers one digest challenge, parses the SDP answer from the 2xx, sends the 2xx ACK | `Caller::dial`, `Call` |
+| §13.2 UAC INVITE | Outbound INVITE with SDP offer, follows provisional responses to a final, answers one digest challenge, parses the SDP answer from the 2xx, sends the 2xx ACK; provisional statuses can be observed (`dial_with_progress`) | `Caller::dial`, `Call` |
+| §9 CANCEL | Cancel a still-ringing outbound INVITE (CANCEL after the first provisional; resolves `487 Request Terminated`) | `Caller::dial_cancellable` |
 | §13.3 UAS INVITE | Automatic `100 Trying`, deferred accept (`200 OK` + SDP answer) or reject (non-2xx final, e.g. `486`/`603`) | `SipEndpoint::next_incoming_call`, `IncomingCall` |
 | §14 Re-INVITE | Outbound in-dialog re-INVITE with SDP re-offer and the mandatory 2xx ACK, used for hold/resume and session refresh | `Call::set_hold`, `Call::session_handle` |
 | §15 Terminating | BYE — local hangup via the call handle; an inbound in-dialog BYE is auto-answered `200 OK` by the endpoint router | `Call::hangup`, `SipEndpoint` |
 | §12 Dialogs | Dialog establishment with route-set capture/reuse (UAC reverses Record-Route, UAS keeps order), in-dialog request composition addressed to the route set | internal (`Call`) |
-| §12.2.2 In-dialog requests | Outbound in-dialog re-INVITE / INFO carrying a body. Inbound in-dialog requests (BYE / OPTIONS / INFO / re-INVITE) are auto-answered `200 OK` and the 2xx ACK absorbed — they are not yet surfaced to the consumer | `Call`, `SipEndpoint` router |
+| §12.2.2 In-dialog requests | Outbound in-dialog re-INVITE / INFO carrying a body. Inbound re-INVITE / INFO are auto-answered `200 OK` by default, or surfaced to the owning `Call` when it opts in (to answer a session refresh / peer hold, or read INFO DTMF); BYE / OPTIONS stay auto-answered | `Call`, `Call::inbound_requests`, `SipEndpoint` router |
 | §8.1.1.4 Call-ID | Random Call-ID generation | `Caller`, `Registrar` |
 | §17 Transactions | Full RFC 3261 §17 client/server INVITE & non-INVITE state machines with T1/T2/T4 timers and UDP retransmission | internal (`stack::transaction`) |
 | §20.41 User-Agent | Optional product token emitted on every outbound request | `SipEndpoint::new_with_app` |
 | §22 Authentication | Digest challenge/response as a client, on both REGISTER and INVITE | `Registrar`, `Caller` (credentials threaded internally) |
 
 Not covered from RFC 3261: acting as a proxy/registrar/redirect server,
-SIPS/TLS (§26.2), multicast (§18.1.1), CANCEL of a pending outbound INVITE,
-and surfacing inbound in-dialog request bodies to the consumer (in-dialog
-requests are auto-answered, not exposed). The latter two, plus provisional
-(`180 Ringing`) observation, are tracked as the remaining work in `docs/17`.
+SIPS/TLS (§26.2), and multicast (§18.1.1). Provisional responses are
+observed but not acknowledged reliably (PRACK / 100rel is RFC 3262, below).
 
 ### RFC 3264 — SDP offer/answer model (minimal subset)
 
@@ -149,9 +148,9 @@ candidate is used today.
   BYE watchdog at `interval − min(32 s, interval/3)`. Surfaced via
   `Call::session_timer()` + `Call::session_handle()`.
 
-Caveat: the **watchdog** path resets on a peer refresh only once the peer's
-refresh re-INVITE is surfaced to the consumer (the remaining `docs/17`
-work); the UAC-refresher path is fully functional today.
+Both roles work: the watchdog resets on the peer's refresh re-INVITE,
+which the consumer receives via `Call::inbound_requests` (answer it with a
+fresh SDP + echoed `Session-Expires`, then ping the loop's `Notify`).
 
 ### RFC 6086 (ex-2976) — SIP INFO (DTMF relay)
 
@@ -197,16 +196,12 @@ scope.
 
 Ranked by how soon a real deployment trips over them:
 
-1. **Inbound in-dialog surfacing + CANCEL + provisional states** — the
-   remaining `docs/17` work: surface a peer's refresh re-INVITE / inbound
-   INFO to the consumer (which also completes the RFC 4028 watchdog path),
-   CANCEL a ringing outbound INVITE, and observe `180 Ringing`.
-2. **`rport` (RFC 3581)** — needed for responses to come back through NAT/PAT;
+1. **`rport` (RFC 3581)** — needed for responses to come back through NAT/PAT;
    add `;rport` to outgoing Via and honor it on responses.
-3. **TCP transport** — the `Transport::Tcp` variant is currently inert.
-4. **RTCP receiver reports** — without them, neither side gets loss or jitter
+2. **TCP transport** — the `Transport::Tcp` variant is currently inert.
+3. **RTCP receiver reports** — without them, neither side gets loss or jitter
    feedback; fine on a LAN, blind over the open internet.
-5. **TLS transport (SIPS)** — credentials currently ride plaintext except for
+4. **TLS transport (SIPS)** — credentials currently ride plaintext except for
    the digest exchange itself.
-6. **SRV failover (RFC 3263)** — we order the candidates correctly but only ever
+5. **SRV failover (RFC 3263)** — we order the candidates correctly but only ever
    try the first; a dead primary should fall through to the next target.
