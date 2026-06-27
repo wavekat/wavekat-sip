@@ -34,3 +34,4 @@ Two kinds of documents live here:
 | [14-stack-call-flow.md](14-stack-call-flow.md) | `stack` engine Phase 6: outbound INVITE call flow (place / answer / ACK / BYE) |
 | [15-stack-ua-router.md](15-stack-ua-router.md) | `stack` engine Phase 7: UA router so one engine serves register + many calls |
 | [16-drop-rsipstack.md](16-drop-rsipstack.md) | `stack` engine Phase 8 (final): re-point the public wrappers onto the engine and remove the `rsipstack` dependency |
+| [17-reinstate-deferred-features.md](17-reinstate-deferred-features.md) | Re-add the call features deferred by the cutover (re-INVITE seam, User-Agent, DTMF INFO, hold/resume, session timers, inbound surfacing + CANCEL) on the engine |
