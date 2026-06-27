@@ -16,6 +16,7 @@ use tracing::{debug, info};
 use crate::caller::Call;
 use crate::endpoint::SipEndpoint;
 use crate::sdp::{build_sdp, RemoteMedia};
+use crate::session_timer::{negotiate_uas, require_timer_header, supported_timer_header};
 use crate::stack::dialog::Dialog;
 use crate::stack::response::{build_response, ResponseBody};
 use crate::stack::transaction::{gen_tag, TransactionKey};
@@ -68,7 +69,11 @@ impl IncomingCall {
         )
         .try_into()?;
 
-        let response = build_response(
+        // RFC 4028: if the caller asked for a session timer, honor it and echo
+        // the agreed interval (plus Require: timer when the peer supports it).
+        let uas_timer = negotiate_uas(&self.request.headers);
+
+        let mut response = build_response(
             &self.request,
             StatusCode::OK,
             Some(&to_tag),
@@ -79,6 +84,14 @@ impl IncomingCall {
             }),
         )
         .ok_or("could not build 200 OK")?;
+
+        if let Some(uas) = &uas_timer {
+            response.headers.push(supported_timer_header());
+            response.headers.push(uas.echo.header());
+            if uas.require_timer {
+                response.headers.push(require_timer_header());
+            }
+        }
 
         if !self.endpoint.ua().answer(self.key, response).await {
             return Err("engine stopped before the 200 OK was sent".into());
@@ -92,6 +105,7 @@ impl IncomingCall {
             self.endpoint.clone(),
             dialog,
             self.peer,
+            uas_timer.map(|u| u.timer),
             self.remote_media,
             Arc::new(rtp_socket),
             local_rtp_addr,

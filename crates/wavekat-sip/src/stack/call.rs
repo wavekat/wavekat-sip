@@ -27,6 +27,9 @@ pub(crate) struct CallConfig {
     pub call_id: String,
     /// SDP offer carried in the INVITE body (empty for a late offer).
     pub sdp: Vec<u8>,
+    /// Extra headers added to the INVITE (e.g. `Supported: timer` and
+    /// `Session-Expires` for RFC 4028).
+    pub extra_headers: Vec<Header>,
     pub username: String,
     pub password: String,
 }
@@ -102,6 +105,9 @@ pub(crate) fn build_invite(cfg: &CallConfig, cseq: u32, local_addr: SocketAddr) 
         }
         .into(),
     ));
+    for header in &cfg.extra_headers {
+        headers.push(header.clone());
+    }
     if !cfg.sdp.is_empty() {
         headers.push(Header::ContentType(rsip::headers::ContentType::new(
             "application/sdp",
@@ -141,6 +147,7 @@ mod tests {
             from_tag: "alicetag".into(),
             call_id: "call-xyz".into(),
             sdp: b"v=0\r\n".to_vec(),
+            extra_headers: Vec::new(),
             username: "alice".into(),
             password: "secret".into(),
         }
@@ -156,6 +163,14 @@ mod tests {
             .headers
             .iter()
             .any(|h| matches!(h, Header::ContentType(_))));
+    }
+
+    #[test]
+    fn build_invite_carries_extra_headers() {
+        let mut cfg = config();
+        cfg.extra_headers = vec![Header::Supported("timer".into())];
+        let invite = build_invite(&cfg, 1, "127.0.0.1:5060".parse().unwrap());
+        assert!(invite.to_string().contains("Supported: timer"));
     }
 
     #[test]

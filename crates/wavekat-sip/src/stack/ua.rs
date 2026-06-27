@@ -408,6 +408,7 @@ mod tests {
             from_tag: "alicetag".into(),
             call_id: "call-xyz".into(),
             sdp: b"v=0\r\n".to_vec(),
+            extra_headers: Vec::new(),
             username: "alice".into(),
             password: "secret".into(),
         }

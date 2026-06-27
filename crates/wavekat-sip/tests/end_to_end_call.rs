@@ -73,11 +73,31 @@ async fn dial_accept_hangup_over_loopback() {
     assert!(call.remote_media.port > 0);
     assert_eq!(call.remote_media.payload_type, 0); // PCMU
 
+    // RFC 4028: the caller advertised Supported: timer + Session-Expires, the
+    // callee echoed it, so the caller negotiated a timer and (peer refresher
+    // unset → us) takes the refresher role.
+    let caller_timer = call
+        .session_timer()
+        .expect("caller negotiated a session timer");
+    assert_eq!(caller_timer.interval_secs, 1800);
+    assert!(caller_timer.we_are_refresher, "caller should refresh");
+
     // The callee side finished accepting.
-    let _callee_call = timeout(Duration::from_secs(10), accepted)
+    let callee_call = timeout(Duration::from_secs(10), accepted)
         .await
         .expect("accept finishes within 10s")
         .expect("accept task did not panic");
+
+    // The callee negotiated the same interval but, as the answerer of a timer
+    // the caller supports, is the watchdog (peer/UAC refreshes).
+    let callee_timer = callee_call
+        .session_timer()
+        .expect("callee negotiated a session timer");
+    assert_eq!(callee_timer.interval_secs, 1800);
+    assert!(
+        !callee_timer.we_are_refresher,
+        "callee should watch, not refresh"
+    );
 
     // DTMF over SIP INFO: the press is sent in-dialog and the callee's router
     // auto-answers 200 OK, which classifies as accepted.

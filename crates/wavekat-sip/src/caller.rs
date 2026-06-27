@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use rsip::{Header, Uri};
 use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::account::SipAccount;
@@ -19,6 +20,10 @@ use crate::dtmf_info::{build_info_body, classify, content_type_header, InfoOutco
 use crate::endpoint::SipEndpoint;
 use crate::rtp::dtmf::DtmfDigit;
 use crate::sdp::{build_sdp, build_sdp_with, parse_sdp, MediaDirection, RemoteMedia};
+use crate::session_timer::{
+    negotiate_uac, supported_timer_header, SessionDialogOps, SessionExpires, SessionTimer,
+    DEFAULT_SESSION_EXPIRES_SECS,
+};
 use crate::stack::call::{CallConfig, CallOutcome};
 use crate::stack::dialog::Dialog;
 use crate::stack::transaction::gen_tag;
@@ -31,12 +36,17 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// [`crate::IncomingCall::accept`] (inbound), so call control is uniform.
 pub struct Call {
     endpoint: Arc<SipEndpoint>,
-    dialog: Dialog,
+    /// Shared so a background session-timer loop ([`Call::session_handle`]) can
+    /// send refresh re-INVITEs / BYE while the call owner drives audio. The
+    /// mutex serializes the dialog's CSeq across both.
+    dialog: Arc<Mutex<Dialog>>,
     peer: SocketAddr,
     /// `true` once we have put the peer on hold via a `sendonly` re-INVITE.
     held: bool,
     /// SDP `o=` version; bumped on every re-offer (RFC 3264 §5).
     sdp_version: u32,
+    /// The RFC 4028 session timer negotiated at call setup, if any.
+    session_timer: Option<SessionTimer>,
     /// Where the remote endpoint expects RTP (from the negotiated SDP).
     pub remote_media: RemoteMedia,
     /// Local RTP socket; share via `Arc` to send and receive concurrently.
@@ -50,17 +60,19 @@ impl Call {
         endpoint: Arc<SipEndpoint>,
         dialog: Dialog,
         peer: SocketAddr,
+        session_timer: Option<SessionTimer>,
         remote_media: RemoteMedia,
         rtp_socket: Arc<UdpSocket>,
         local_rtp_addr: SocketAddr,
     ) -> Self {
         Self {
             endpoint,
-            dialog,
+            dialog: Arc::new(Mutex::new(dialog)),
             peer,
             held: false,
             // The initial offer/answer was o= version 0.
             sdp_version: 0,
+            session_timer,
             remote_media,
             rtp_socket,
             local_rtp_addr,
@@ -89,12 +101,14 @@ impl Call {
             self.sdp_version,
         );
         let headers = vec![Header::ContentType("application/sdp".into())];
-        match self
-            .endpoint
-            .ua()
-            .reinvite(self.peer, &mut self.dialog, headers, offer)
-            .await
-        {
+        let response = {
+            let mut dialog = self.dialog.lock().await;
+            self.endpoint
+                .ua()
+                .reinvite(self.peer, &mut dialog, headers, offer)
+                .await
+        };
+        match response {
             Some(r) if (200..300).contains(&r.status_code.code()) => {
                 self.held = on;
                 info!(on, "hold state updated via re-INVITE");
@@ -111,6 +125,25 @@ impl Call {
         self.held
     }
 
+    /// The RFC 4028 session timer negotiated when the call was set up, or
+    /// `None` if neither side asked for one. Drive it with
+    /// [`crate::session_timer_loop`] against [`Call::session_handle`].
+    pub fn session_timer(&self) -> Option<SessionTimer> {
+        self.session_timer
+    }
+
+    /// A cloneable handle that sends refresh re-INVITEs / BYE on this call's
+    /// dialog, for running [`crate::session_timer_loop`] in a background task
+    /// alongside the audio path. Shares the dialog with the `Call`, so their
+    /// in-dialog requests serialize correctly.
+    pub fn session_handle(&self) -> CallSession {
+        CallSession {
+            endpoint: self.endpoint.clone(),
+            dialog: self.dialog.clone(),
+            peer: self.peer,
+        }
+    }
+
     /// Send one DTMF press via SIP `INFO` (`application/dtmf-relay`).
     ///
     /// Use this only when the remote did not negotiate RFC 4733 — i.e.
@@ -120,24 +153,65 @@ impl Call {
     /// transport too; stop sending further presses on this dialog.
     pub async fn send_dtmf_info(&mut self, digit: DtmfDigit, duration_ms: u32) -> InfoOutcome {
         let body = build_info_body(digit, duration_ms).into_bytes();
-        let response = self
-            .endpoint
-            .ua()
-            .info(
-                self.peer,
-                &mut self.dialog,
-                vec![content_type_header()],
-                body,
-            )
-            .await;
+        let response = {
+            let mut dialog = self.dialog.lock().await;
+            self.endpoint
+                .ua()
+                .info(self.peer, &mut dialog, vec![content_type_header()], body)
+                .await
+        };
         classify(response)
     }
 
     /// Hang up by sending an in-dialog `BYE`. Returns once the peer 2xxs it
     /// (or the transaction gives up).
     pub async fn hangup(&mut self) -> Result<(), BoxError> {
-        if self.endpoint.ua().hangup(self.peer, &mut self.dialog).await {
+        let acked = {
+            let mut dialog = self.dialog.lock().await;
+            self.endpoint.ua().hangup(self.peer, &mut dialog).await
+        };
+        if acked {
             info!("call hung up (BYE acknowledged)");
+            Ok(())
+        } else {
+            Err("BYE was not acknowledged".into())
+        }
+    }
+}
+
+/// A cloneable session-control handle over a [`Call`]'s dialog.
+///
+/// Produced by [`Call::session_handle`] and consumed by
+/// [`crate::session_timer_loop`]: it implements [`SessionDialogOps`] so the
+/// loop can send refresh re-INVITEs and the tear-down BYE on the shared dialog.
+#[derive(Clone)]
+pub struct CallSession {
+    endpoint: Arc<SipEndpoint>,
+    dialog: Arc<Mutex<Dialog>>,
+    peer: SocketAddr,
+}
+
+impl SessionDialogOps for CallSession {
+    async fn refresh(
+        &self,
+        mut headers: Vec<Header>,
+        body: Option<Vec<u8>>,
+    ) -> Result<Option<rsip::Response>, BoxError> {
+        let body = body.unwrap_or_default();
+        if !body.is_empty() {
+            headers.push(Header::ContentType("application/sdp".into()));
+        }
+        let mut dialog = self.dialog.lock().await;
+        Ok(self
+            .endpoint
+            .ua()
+            .reinvite(self.peer, &mut dialog, headers, body)
+            .await)
+    }
+
+    async fn send_bye(&self) -> Result<(), BoxError> {
+        let mut dialog = self.dialog.lock().await;
+        if self.endpoint.ua().hangup(self.peer, &mut dialog).await {
             Ok(())
         } else {
             Err("BYE was not acknowledged".into())
@@ -181,6 +255,8 @@ impl Caller {
         )
         .try_into()?;
 
+        // Advertise RFC 4028 session-timer support so the answerer can pin a
+        // refresh interval in its 2xx (negotiated below).
         let cfg = CallConfig {
             target,
             from,
@@ -188,6 +264,14 @@ impl Caller {
             from_tag: gen_tag(),
             call_id: format!("{}@wavekat.com", gen_tag()),
             sdp: offer,
+            extra_headers: vec![
+                supported_timer_header(),
+                SessionExpires {
+                    interval_secs: DEFAULT_SESSION_EXPIRES_SECS,
+                    refresher: None,
+                }
+                .header(),
+            ],
             username: self.account.auth_username().to_string(),
             password: self.account.password.clone(),
         };
@@ -200,16 +284,19 @@ impl Caller {
         {
             CallOutcome::Answered { dialog, response } => {
                 let remote_media = parse_sdp(&response.body)?;
+                let session_timer = negotiate_uac(&response.headers);
                 info!(
                     remote_addr = %remote_media.addr,
                     remote_port = remote_media.port,
                     payload_type = remote_media.payload_type,
+                    ?session_timer,
                     "call answered; parsed SDP answer",
                 );
                 Ok(Call::new(
                     self.endpoint.clone(),
                     *dialog,
                     self.endpoint.server(),
+                    session_timer,
                     remote_media,
                     Arc::new(rtp_socket),
                     local_rtp_addr,

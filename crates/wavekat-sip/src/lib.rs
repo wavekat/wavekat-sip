@@ -157,13 +157,14 @@ pub mod registrar;
 pub mod resolve;
 pub mod rtp;
 pub mod sdp;
+pub mod session_timer;
 // Internal clean-room SIP engine (see `docs/08-own-sip-stack.md`). Entirely
 // `pub(crate)`: it never appears in this crate's public API.
 pub(crate) mod stack;
 
 pub use account::{SipAccount, Transport};
 pub use callee::IncomingCall;
-pub use caller::{Call, Caller};
+pub use caller::{Call, CallSession, Caller};
 pub use dtmf_info::{build_info_body, content_type_header, InfoOutcome};
 pub use endpoint::SipEndpoint;
 pub use registrar::{Registrar, RegistrarDiagnostics};
@@ -175,6 +176,12 @@ pub use rtp::dtmf::{
 pub use rtp::dtmf_recv::{parse_event_payload, DtmfEvent, DtmfEventPayload, DtmfReceiver};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
 pub use sdp::{build_sdp, build_sdp_with, parse_sdp, MediaDirection, RemoteMedia, DTMF_DEFAULT_PT};
+pub use session_timer::{
+    min_se_in, negotiate_uac, negotiate_uas, require_timer_header, session_expires_in,
+    session_timer_loop, supported_timer_header, supports_timer, Refresher, SessionDialogOps,
+    SessionExpires, SessionTimer, SessionTimerOutcome, UasSessionTimer,
+    DEFAULT_SESSION_EXPIRES_SECS, MIN_SESSION_EXPIRES_SECS,
+};
 
 /// Re-exports of the [`rsip`] message types that appear in our public API.
 /// Pinning them here lets consumers depend only on `wavekat-sip`.
