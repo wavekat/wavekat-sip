@@ -173,6 +173,21 @@ impl Dialog {
     /// adds any body (e.g. SDP for a re-INVITE) and content headers.
     pub(crate) fn new_request(&mut self, method: Method) -> Request {
         self.local_seq += 1;
+        let seq = self.local_seq;
+        self.compose(method, seq)
+    }
+
+    /// Build the ACK for a 2xx answer to our INVITE (RFC 3261 §13.2.2.4).
+    ///
+    /// Unlike other in-dialog requests this is **not** a new transaction-CSeq:
+    /// it reuses the INVITE's sequence number with method ACK, and is sent
+    /// outside any transaction. It still rides the dialog route set and target.
+    pub(crate) fn ack_2xx(&self, invite_cseq: u32) -> Request {
+        self.compose(Method::Ack, invite_cseq)
+    }
+
+    /// Shared request composer: Via (fresh branch) + target + tags + route set.
+    fn compose(&self, method: Method, seq: u32) -> Request {
         let branch = gen_branch();
 
         let mut headers = Headers::default();
@@ -198,13 +213,7 @@ impl Dialog {
         headers.push(Header::CallId(rsip::headers::CallId::new(
             self.call_id.clone(),
         )));
-        headers.push(Header::CSeq(
-            rsip::typed::CSeq {
-                seq: self.local_seq,
-                method,
-            }
-            .into(),
-        ));
+        headers.push(Header::CSeq(rsip::typed::CSeq { seq, method }.into()));
 
         // Replay the stored route set — this is the bug fix: it is reused on
         // *every* in-dialog request, never recomputed from a Contact.

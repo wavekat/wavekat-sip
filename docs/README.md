@@ -31,3 +31,4 @@ Two kinds of documents live here:
 | [11-stack-auth.md](11-stack-auth.md) | `stack` engine Phase 3: digest authentication challenge→retry orchestration |
 | [12-stack-dialog.md](12-stack-dialog.md) | `stack` engine Phase 4: RFC 3261 §12 dialogs + route-set reuse (the bug fix) |
 | [13-stack-register-flow.md](13-stack-register-flow.md) | `stack` engine Phase 5: REGISTER-with-digest, the first composed end-to-end flow |
+| [14-stack-call-flow.md](14-stack-call-flow.md) | `stack` engine Phase 6: outbound INVITE call flow (place / answer / ACK / BYE) |
