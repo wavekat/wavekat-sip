@@ -80,13 +80,45 @@ pub async fn reoffer_media<D: SessionDialogOps>(
         .ok_or("re-INVITE not sent: dialog is no longer confirmed")?;
 
     if resp.status_code != StatusCode::OK {
-        return Err(format!("re-INVITE for media change rejected: {}", resp.status_code).into());
+        return Err(format!(
+            "re-INVITE for media change rejected: {}{}",
+            resp.status_code,
+            rejection_detail(&resp.headers),
+        )
+        .into());
     }
 
     if resp.body.is_empty() {
         return Ok(None);
     }
     parse_sdp(&resp.body).map(Some).map_err(Into::into)
+}
+
+/// Pull the human-meaningful "why" out of a non-2xx re-INVITE response
+/// so a rejection logs something a person can act on instead of a bare
+/// status code. SIP servers that refuse a media change usually say why
+/// in a `Warning` header (RFC 3261 §20.43, e.g. `399 sbc "Codec
+/// negotiation failed"`) or a `Reason` header (RFC 3326); we surface
+/// whichever are present, formatted as ` (Warning: …; Reason: …)`, or an
+/// empty string when the response carries neither.
+fn rejection_detail(headers: &rsip::Headers) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for header in headers.iter() {
+        match header {
+            // The typed `Warning` Display already renders as
+            // `Warning: <code> <agent> "<text>"`, so don't re-prefix it.
+            Header::Warning(w) => parts.push(w.to_string()),
+            Header::Other(name, value) if name.eq_ignore_ascii_case("Reason") => {
+                parts.push(format!("Reason: {value}"))
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join("; "))
+    }
 }
 
 /// Advance a call-scoped `o=` version counter and return the value to
@@ -343,6 +375,37 @@ mod tests {
     fn hold_direction_maps_held_to_sendonly() {
         assert_eq!(hold_direction(true), MediaDirection::SendOnly);
         assert_eq!(hold_direction(false), MediaDirection::SendRecv);
+    }
+
+    #[test]
+    fn rejection_detail_surfaces_warning_and_reason() {
+        use rsip::headers::{UntypedHeader, Warning};
+
+        // No diagnostic headers → no trailing detail (the bare status
+        // code already carries everything we know).
+        assert_eq!(rejection_detail(&Headers::default()), "");
+
+        // A Warning header (RFC 3261 §20.43) is the usual "why" an SBC
+        // attaches to a refused media change.
+        let mut warned = Headers::default();
+        warned.push(Header::Warning(Warning::new(
+            "399 sbc \"Codec negotiation failed\"",
+        )));
+        assert_eq!(
+            rejection_detail(&warned),
+            " (Warning: 399 sbc \"Codec negotiation failed\")"
+        );
+
+        // Warning + Reason (RFC 3326) are joined, in header order.
+        let mut both = warned.clone();
+        both.push(Header::Other(
+            "Reason".into(),
+            "SIP;cause=500;text=\"internal\"".into(),
+        ));
+        assert_eq!(
+            rejection_detail(&both),
+            " (Warning: 399 sbc \"Codec negotiation failed\"; Reason: SIP;cause=500;text=\"internal\")"
+        );
     }
 
     #[test]
