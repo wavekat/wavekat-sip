@@ -68,6 +68,15 @@ impl Reliability {
     }
 }
 
+impl From<crate::account::Transport> for Reliability {
+    fn from(transport: crate::account::Transport) -> Self {
+        match transport {
+            crate::account::Transport::Udp => Reliability::Unreliable,
+            crate::account::Transport::Tcp => Reliability::Reliable,
+        }
+    }
+}
+
 /// The RFC 3261 §17 base timer values (T1/T2/T4) from which every transaction
 /// timer is derived. Defaults are the RFC's recommended values; tests can
 /// shrink them to keep wall-clock assertions fast, and the transport runner
@@ -307,6 +316,51 @@ pub(crate) fn build_non_2xx_ack(invite: &Request, response: &Response) -> Option
         headers,
         body: Vec::new(),
     })
+}
+
+/// A live transaction of any of the four RFC 3261 §17 kinds, so the engine
+/// can hold them in one table and dispatch events without knowing the kind.
+// The variant names mirror the RFC's four machine names (client/server ×
+// INVITE/non-INVITE); the shared "Invite" suffix is intentional and clearer
+// than any rename.
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum Transaction {
+    ClientInvite(client_invite::ClientInvite),
+    ClientNonInvite(client_non_invite::ClientNonInvite),
+    ServerInvite(server_invite::ServerInvite),
+    ServerNonInvite(server_non_invite::ServerNonInvite),
+}
+
+impl Transaction {
+    /// Feed a received response. Only client transactions react; server
+    /// transactions never receive responses, so they return no actions.
+    pub(crate) fn on_response(&mut self, resp: &Response) -> Vec<TxAction> {
+        match self {
+            Transaction::ClientInvite(t) => t.on_response(resp),
+            Transaction::ClientNonInvite(t) => t.on_response(resp),
+            Transaction::ServerInvite(_) | Transaction::ServerNonInvite(_) => Vec::new(),
+        }
+    }
+
+    /// Feed a received request (a retransmission, or the ACK for a non-2xx).
+    /// Only server transactions react.
+    pub(crate) fn on_request(&mut self, req: &Request) -> Vec<TxAction> {
+        match self {
+            Transaction::ServerInvite(t) => t.on_request(req),
+            Transaction::ServerNonInvite(t) => t.on_request(req),
+            Transaction::ClientInvite(_) | Transaction::ClientNonInvite(_) => Vec::new(),
+        }
+    }
+
+    /// Feed a fired timer.
+    pub(crate) fn on_timer(&mut self, id: TimerId) -> Vec<TxAction> {
+        match self {
+            Transaction::ClientInvite(t) => t.on_timer(id),
+            Transaction::ClientNonInvite(t) => t.on_timer(id),
+            Transaction::ServerInvite(t) => t.on_timer(id),
+            Transaction::ServerNonInvite(t) => t.on_timer(id),
+        }
+    }
 }
 
 #[cfg(test)]
