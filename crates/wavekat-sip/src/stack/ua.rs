@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 
-use rsip::{Header, Method, Request, Response, SipMessage};
+use rsip::{Header, Method, Request, Response, SipMessage, StatusCode};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -149,20 +149,22 @@ impl Ua {
         peer: SocketAddr,
         first_cseq: u32,
     ) -> CallOutcome {
-        self.call_cancellable(cfg, peer, first_cseq, &CancellationToken::new())
+        self.call_cancellable(cfg, peer, first_cseq, &CancellationToken::new(), None)
             .await
     }
 
     /// Like [`Ua::call`], but `cancel` aborts a still-ringing INVITE with a
     /// `CANCEL` (RFC 3261 §9): once a provisional has arrived, firing the token
     /// sends the CANCEL and the call resolves `Rejected(487 Request
-    /// Terminated)`.
+    /// Terminated)`. Each provisional status (e.g. `180 Ringing`) is forwarded
+    /// to `progress` when present.
     pub(crate) async fn call_cancellable(
         &self,
         cfg: &CallConfig,
         peer: SocketAddr,
         first_cseq: u32,
         cancel: &CancellationToken,
+        progress: Option<&mpsc::Sender<StatusCode>>,
     ) -> CallOutcome {
         let mut request = build_invite(cfg, first_cseq, self.local_addr());
         let mut challenged = false;
@@ -171,7 +173,7 @@ impl Ua {
                 return CallOutcome::EngineStopped;
             };
             match self
-                .await_final_cancellable(&mut rx, peer, &request, cancel)
+                .await_final_cancellable(&mut rx, peer, &request, cancel, progress)
                 .await
             {
                 Some(response) => {
@@ -355,6 +357,7 @@ impl Ua {
         peer: SocketAddr,
         invite: &Request,
         cancel: &CancellationToken,
+        progress: Option<&mpsc::Sender<StatusCode>>,
     ) -> Option<Response> {
         let mut cancel_requested = false;
         let mut cancel_sent = false;
@@ -365,6 +368,9 @@ impl Ua {
                     Some(Event::Response { response, .. }) => {
                         if response.status_code().code() >= 200 {
                             return Some(response);
+                        }
+                        if let Some(tx) = progress {
+                            let _ = tx.send(response.status_code().clone()).await;
                         }
                         provisional_seen = true;
                         if cancel_requested && !cancel_sent {
@@ -784,18 +790,30 @@ mod tests {
         });
 
         // Request cancellation up front; the engine defers the CANCEL until the
-        // 180 arrives (RFC 3261 §9.1).
+        // 180 arrives (RFC 3261 §9.1). Observe provisionals on `progress`.
         let dial_cancel = CancellationToken::new();
         dial_cancel.cancel();
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
         let outcome = timeout(
             Duration::from_secs(3),
-            ua.call_cancellable(&call_config(), peer_addr, 1, &dial_cancel),
+            ua.call_cancellable(
+                &call_config(),
+                peer_addr,
+                1,
+                &dial_cancel,
+                Some(&progress_tx),
+            ),
         )
         .await
         .unwrap();
         assert!(
             matches!(outcome, CallOutcome::Rejected(s) if s.code() == 487),
             "cancel-while-ringing resolves to 487 Request Terminated",
+        );
+        assert_eq!(
+            progress_rx.recv().await.map(|s| s.code()),
+            Some(180),
+            "the 180 Ringing was observed on the progress channel",
         );
 
         server.await.unwrap();

@@ -288,7 +288,8 @@ impl Caller {
     /// single `401`/`407` challenge. Returns the [`Call`] on a 2xx, or an error
     /// if the call was rejected, timed out, or had no usable SDP answer.
     pub async fn dial(&self, target: Uri) -> Result<Call, BoxError> {
-        self.dial_inner(target, &CancellationToken::new()).await
+        self.dial_inner(target, &CancellationToken::new(), None)
+            .await
     }
 
     /// Like [`Caller::dial`], but `cancel` aborts a still-ringing call with a
@@ -301,10 +302,28 @@ impl Caller {
         target: Uri,
         cancel: &CancellationToken,
     ) -> Result<Call, BoxError> {
-        self.dial_inner(target, cancel).await
+        self.dial_inner(target, cancel, None).await
     }
 
-    async fn dial_inner(&self, target: Uri, cancel: &CancellationToken) -> Result<Call, BoxError> {
+    /// Like [`Caller::dial_cancellable`], and additionally forwards each
+    /// provisional response status (e.g. [`rsip::StatusCode::Ringing`]) to
+    /// `progress` as it arrives — for a "ringing" UI. The channel closes when
+    /// the call reaches a final response.
+    pub async fn dial_with_progress(
+        &self,
+        target: Uri,
+        cancel: &CancellationToken,
+        progress: mpsc::Sender<rsip::StatusCode>,
+    ) -> Result<Call, BoxError> {
+        self.dial_inner(target, cancel, Some(progress)).await
+    }
+
+    async fn dial_inner(
+        &self,
+        target: Uri,
+        cancel: &CancellationToken,
+        progress: Option<mpsc::Sender<rsip::StatusCode>>,
+    ) -> Result<Call, BoxError> {
         let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
         let local_rtp_addr = rtp_socket.local_addr()?;
         let local_ip = self.endpoint.local_ip();
@@ -346,7 +365,7 @@ impl Caller {
         match self
             .endpoint
             .ua()
-            .call_cancellable(&cfg, self.endpoint.server(), 1, cancel)
+            .call_cancellable(&cfg, self.endpoint.server(), 1, cancel, progress.as_ref())
             .await
         {
             CallOutcome::Answered { dialog, response } => {
