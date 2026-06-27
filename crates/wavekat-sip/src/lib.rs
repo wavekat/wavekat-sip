@@ -174,7 +174,7 @@ pub use rtp::dtmf::{
 };
 pub use rtp::dtmf_recv::{parse_event_payload, DtmfEvent, DtmfEventPayload, DtmfReceiver};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
-pub use sdp::{build_sdp, parse_sdp, RemoteMedia, DTMF_DEFAULT_PT};
+pub use sdp::{build_sdp, build_sdp_with, parse_sdp, MediaDirection, RemoteMedia, DTMF_DEFAULT_PT};
 
 /// Re-exports of the [`rsip`] message types that appear in our public API.
 /// Pinning them here lets consumers depend only on `wavekat-sip`.

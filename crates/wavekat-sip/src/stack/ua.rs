@@ -194,6 +194,33 @@ impl Ua {
         self.await_final(&mut rx).await
     }
 
+    /// Send an in-dialog re-INVITE carrying `extra_headers` + `body` (typically
+    /// an SDP re-offer) and return its final response, or `None` on timeout.
+    ///
+    /// A re-INVITE is an INVITE transaction, so on a 2xx the TU **must** send
+    /// the ACK (RFC 3261 §13.2.2.4) — done here, out of transaction, reusing the
+    /// re-INVITE's CSeq. Non-2xx finals are returned as-is (their ACK is handled
+    /// by the transaction itself).
+    pub(crate) async fn reinvite(
+        &self,
+        peer: SocketAddr,
+        dialog: &mut Dialog,
+        extra_headers: Vec<Header>,
+        body: Vec<u8>,
+    ) -> Option<Response> {
+        let request = dialog.new_request_with(Method::Invite, extra_headers, body);
+        let cseq = cseq_of(&request);
+        let mut rx = self.start_client(&request, peer).await?;
+        let response = self.await_final(&mut rx).await?;
+        if (200..300).contains(&response.status_code().code()) {
+            let ack = dialog.ack_2xx(cseq);
+            self.engine
+                .send_out_of_dialog(SipMessage::Request(ack), peer)
+                .await;
+        }
+        Some(response)
+    }
+
     /// Send an in-dialog `INFO` carrying `extra_headers` + `body` and return its
     /// final response, or `None` on timeout. `INFO` is a non-INVITE request, so
     /// no ACK follows its 2xx.
@@ -476,6 +503,76 @@ mod tests {
             SipMessage::Response(r) => assert_eq!(r.status_code().code(), 200),
             _ => panic!("expected the 200"),
         }
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn reinvite_acks_the_2xx() {
+        let cancel = CancellationToken::new();
+        let ua = Ua::bind_with_timers(
+            "127.0.0.1:0".parse().unwrap(),
+            fast_timers(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Initial INVITE → 200 → ACK.
+            let (m, src) = peer.recv().await.unwrap();
+            let SipMessage::Request(r) = m else { panic!() };
+            assert_eq!(*r.method(), Method::Invite);
+            let h = echo(&r);
+            let ok = format!("SIP/2.0 200 OK\r\n{h}To: <sip:bob@example.com>;tag=b\r\nContact: <sip:bob@{peer_addr}>\r\nContent-Length: 0\r\n\r\n");
+            peer.send_to(&SipMessage::try_from(ok.as_bytes()).unwrap(), src)
+                .await
+                .unwrap();
+            let (m, _) = peer.recv().await.unwrap();
+            assert!(matches!(m, SipMessage::Request(a) if *a.method() == Method::Ack));
+
+            // Re-INVITE → 200, then the engine MUST send the ACK.
+            let (m, src) = peer.recv().await.unwrap();
+            let SipMessage::Request(r) = m else { panic!() };
+            assert_eq!(*r.method(), Method::Invite, "re-INVITE is an INVITE");
+            // Its CSeq advanced past the initial INVITE.
+            assert!(cseq_of(&r) > 1, "re-INVITE CSeq should advance");
+            let h = echo(&r);
+            let ok = format!("SIP/2.0 200 OK\r\n{h}To: <sip:bob@example.com>;tag=b\r\nContact: <sip:bob@{peer_addr}>\r\nContent-Length: 0\r\n\r\n");
+            peer.send_to(&SipMessage::try_from(ok.as_bytes()).unwrap(), src)
+                .await
+                .unwrap();
+            let (m, _) = peer.recv().await.unwrap();
+            assert!(
+                matches!(m, SipMessage::Request(a) if *a.method() == Method::Ack),
+                "engine must ACK the re-INVITE 2xx",
+            );
+        });
+
+        let outcome = timeout(
+            Duration::from_secs(3),
+            ua.call(&call_config(), peer_addr, 1),
+        )
+        .await
+        .unwrap();
+        let CallOutcome::Answered { dialog, .. } = outcome else {
+            panic!("call should be answered");
+        };
+        let mut dialog = *dialog;
+
+        let response = timeout(
+            Duration::from_secs(3),
+            ua.reinvite(peer_addr, &mut dialog, Vec::new(), b"v=0\r\n".to_vec()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.unwrap().status_code().code(), 200);
+
+        server.await.unwrap();
         cancel.cancel();
     }
 }

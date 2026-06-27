@@ -89,6 +89,19 @@ async fn dial_accept_hangup_over_loopback() {
     .expect("INFO completes within 10s");
     assert!(outcome.is_accepted(), "INFO DTMF accepted, got {outcome:?}");
 
+    // Hold then resume: each is an in-dialog re-INVITE the callee's router
+    // auto-answers 200, so the local hold state flips on success.
+    timeout(Duration::from_secs(10), call.set_hold(true))
+        .await
+        .expect("hold re-INVITE completes within 10s")
+        .expect("hold accepted");
+    assert!(call.is_held(), "call should be on hold");
+    timeout(Duration::from_secs(10), call.set_hold(false))
+        .await
+        .expect("resume re-INVITE completes within 10s")
+        .expect("resume accepted");
+    assert!(!call.is_held(), "call should be resumed");
+
     // Hang up: BYE is sent and the callee's router auto-answers 200.
     timeout(Duration::from_secs(10), call.hangup())
         .await

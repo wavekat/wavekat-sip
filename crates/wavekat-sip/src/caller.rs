@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use rsip::Uri;
+use rsip::{Header, Uri};
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
@@ -18,7 +18,7 @@ use crate::account::SipAccount;
 use crate::dtmf_info::{build_info_body, classify, content_type_header, InfoOutcome};
 use crate::endpoint::SipEndpoint;
 use crate::rtp::dtmf::DtmfDigit;
-use crate::sdp::{build_sdp, parse_sdp, RemoteMedia};
+use crate::sdp::{build_sdp, build_sdp_with, parse_sdp, MediaDirection, RemoteMedia};
 use crate::stack::call::{CallConfig, CallOutcome};
 use crate::stack::dialog::Dialog;
 use crate::stack::transaction::gen_tag;
@@ -33,6 +33,10 @@ pub struct Call {
     endpoint: Arc<SipEndpoint>,
     dialog: Dialog,
     peer: SocketAddr,
+    /// `true` once we have put the peer on hold via a `sendonly` re-INVITE.
+    held: bool,
+    /// SDP `o=` version; bumped on every re-offer (RFC 3264 §5).
+    sdp_version: u32,
     /// Where the remote endpoint expects RTP (from the negotiated SDP).
     pub remote_media: RemoteMedia,
     /// Local RTP socket; share via `Arc` to send and receive concurrently.
@@ -54,10 +58,57 @@ impl Call {
             endpoint,
             dialog,
             peer,
+            held: false,
+            // The initial offer/answer was o= version 0.
+            sdp_version: 0,
             remote_media,
             rtp_socket,
             local_rtp_addr,
         }
+    }
+
+    /// Put the peer on hold (`on = true`, `a=sendonly`) or resume the call
+    /// (`on = false`, `a=sendrecv`) by sending an in-dialog re-INVITE with a
+    /// fresh SDP re-offer (RFC 3264 §8.4).
+    ///
+    /// The local hold state only flips once the peer accepts the re-INVITE with
+    /// a 2xx; a non-2xx final surfaces the server's reason and leaves the call
+    /// unchanged. The `o=` version is bumped for each re-offer regardless, as
+    /// RFC 3264 requires.
+    pub async fn set_hold(&mut self, on: bool) -> Result<(), BoxError> {
+        let direction = if on {
+            MediaDirection::SendOnly
+        } else {
+            MediaDirection::SendRecv
+        };
+        self.sdp_version += 1;
+        let offer = build_sdp_with(
+            self.endpoint.local_ip(),
+            self.local_rtp_addr.port(),
+            direction,
+            self.sdp_version,
+        );
+        let headers = vec![Header::ContentType("application/sdp".into())];
+        match self
+            .endpoint
+            .ua()
+            .reinvite(self.peer, &mut self.dialog, headers, offer)
+            .await
+        {
+            Some(r) if (200..300).contains(&r.status_code.code()) => {
+                self.held = on;
+                info!(on, "hold state updated via re-INVITE");
+                Ok(())
+            }
+            Some(r) => Err(format!("re-INVITE rejected: {}", r.status_code).into()),
+            None => Err("re-INVITE timed out with no final response".into()),
+        }
+    }
+
+    /// `true` if the call is currently on hold (we sent a `sendonly` re-INVITE
+    /// the peer accepted).
+    pub fn is_held(&self) -> bool {
+        self.held
     }
 
     /// Send one DTMF press via SIP `INFO` (`application/dtmf-relay`).
