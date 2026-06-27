@@ -1,7 +1,7 @@
 //! Shared SIP endpoint: a bound UDP transport + the clean-room engine, with
 //! inbound requests routed to new calls or auto-answered in-dialog.
 //!
-//! `SipEndpoint` owns the [`Ua`](crate::stack::ua::Ua) (engine + router) and a
+//! `SipEndpoint` owns the `Ua` (engine + router) and a
 //! background task that drains inbound requests:
 //!
 //! - a brand-new `INVITE` (no `To` tag) becomes a [`crate::IncomingCall`] on
