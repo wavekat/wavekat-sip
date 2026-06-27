@@ -275,6 +275,15 @@ pub(crate) fn gen_branch() -> String {
     format!("{MAGIC_COOKIE}{n:x}{seed:x}")
 }
 
+/// Generate a unique dialog tag (`From`/`To` tag). Like [`gen_branch`] but
+/// without the transaction magic cookie — a tag is just an opaque token.
+pub(crate) fn gen_tag() -> String {
+    use std::hash::BuildHasher;
+    let n = BRANCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let seed = std::collections::hash_map::RandomState::new().hash_one(n);
+    format!("wk{n:x}{seed:x}")
+}
+
 /// Build the ACK for a non-2xx final response, per RFC 3261 §17.1.1.3.
 ///
 /// This ACK is part of the client INVITE *transaction* (unlike the ACK for a

@@ -146,7 +146,10 @@ impl Ua {
                         self.engine
                             .send_out_of_dialog(SipMessage::Request(ack), peer)
                             .await;
-                        return CallOutcome::Answered(Box::new(dialog));
+                        return CallOutcome::Answered {
+                            dialog: Box::new(dialog),
+                            response: Box::new(response),
+                        };
                     }
                     if (code == 401 || code == 407) && !challenged {
                         match auth::build_retry(&request, &response, cfg.creds_for_retry()) {
@@ -399,7 +402,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(call, CallOutcome::Answered(_)));
+        assert!(matches!(call, CallOutcome::Answered { .. }));
 
         server.await.unwrap();
         cancel.cancel();

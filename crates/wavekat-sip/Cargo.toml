@@ -13,8 +13,9 @@ categories = ["network-programming", "multimedia::audio"]
 build = "build.rs"
 
 [dependencies]
+# Only `rsip` (SIP message types) is used; the transaction/dialog/transport
+# engine is built in-house under `src/stack/` (see docs/08-own-sip-stack.md).
 rsip = "0.4"
-rsipstack = "0.4"
 tokio = { version = "1", features = ["macros", "rt", "net", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
@@ -22,9 +23,6 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 hostname = "0.4"
 # DNS SRV lookups for RFC 3263 server location (src/resolve.rs).
-# Already in our tree via rsipstack's default `srv_lookup` feature
-# (same version, same default features), so this adds no new
-# transitive deps.
 hickory-resolver = "0.25"
 
 [dev-dependencies]

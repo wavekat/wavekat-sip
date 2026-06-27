@@ -47,9 +47,12 @@ impl CallConfig {
 
 /// The result of placing a call.
 pub(crate) enum CallOutcome {
-    /// The callee answered; the confirmed dialog is ready for media + BYE.
-    /// Boxed because a `Dialog` is much larger than the other variants.
-    Answered(Box<Dialog>),
+    /// The callee answered; the confirmed dialog plus the 2xx response (whose
+    /// body carries the SDP answer). Boxed because both are large.
+    Answered {
+        dialog: Box<Dialog>,
+        response: Box<rsip::Response>,
+    },
     /// The callee (or proxy) rejected the call with this final status.
     Rejected(StatusCode),
     /// Credentials were rejected.
