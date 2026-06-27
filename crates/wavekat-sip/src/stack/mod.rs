@@ -39,5 +39,6 @@
 pub(crate) mod auth;
 pub(crate) mod dialog;
 pub(crate) mod engine;
+pub(crate) mod registration;
 pub(crate) mod transaction;
 pub(crate) mod transport;
