@@ -179,9 +179,13 @@ external server is needed. All four gates (`fmt`, `clippy -D warnings`,
 
 ## Status checklist
 
-- [ ] Phase 1 — in-dialog re-INVITE seam (ACK the 2xx)
-- [ ] Phase 2 — `User-Agent` header
-- [ ] Phase 3 — DTMF over SIP INFO
-- [ ] Phase 4 — hold / resume re-INVITE
-- [ ] Phase 5 — session timers (RFC 4028)
+- [x] Phase 1 — in-dialog re-INVITE seam (ACK the 2xx) — landed with Phase 3/4
+- [x] Phase 2 — `User-Agent` header (`SipEndpoint::new_with_app`)
+- [x] Phase 3 — DTMF over SIP INFO (`Call::send_dtmf_info`)
+- [x] Phase 4 — hold / resume re-INVITE (`Call::set_hold` / `is_held`)
+- [x] Phase 5 — session timers (RFC 4028) — UAC-refresher path live;
+  `Call::session_timer()` + `Call::session_handle()` + `session_timer_loop`.
+  The **watchdog** (peer-refresh) path still needs Phase 6 to surface the
+  peer's refresh re-INVITE and ping the deadline.
 - [ ] Phase 6 — inbound in-dialog surfacing + CANCEL + provisional states
+  (the deep router/return-shape reshape; not yet started)

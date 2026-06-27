@@ -1,6 +1,6 @@
 # RFC coverage
 
-> Status: living document · Last audited: 2026-06-27 (post rsipstack removal — see `docs/16`)
+> Status: living document · Last audited: 2026-06-28 (deferred features reinstated — see `docs/17`)
 
 What standards this crate's **public API** implements, which parts of
 each, and what is knowingly absent. The yardstick is the surface a
@@ -23,17 +23,20 @@ does is exactly what this document lists.
 | §10 Registrations | REGISTER, digest-auth retry on 401/407, re-registration on an interval, unregister (`Expires: 0`), outcome classification (registered / unauthorized / failed / timed out) | `Registrar` |
 | §13.2 UAC INVITE | Outbound INVITE with SDP offer, follows provisional responses to a final, answers one digest challenge, parses the SDP answer from the 2xx, sends the 2xx ACK | `Caller::dial`, `Call` |
 | §13.3 UAS INVITE | Automatic `100 Trying`, deferred accept (`200 OK` + SDP answer) or reject (non-2xx final, e.g. `486`/`603`) | `SipEndpoint::next_incoming_call`, `IncomingCall` |
+| §14 Re-INVITE | Outbound in-dialog re-INVITE with SDP re-offer and the mandatory 2xx ACK, used for hold/resume and session refresh | `Call::set_hold`, `Call::session_handle` |
 | §15 Terminating | BYE — local hangup via the call handle; an inbound in-dialog BYE is auto-answered `200 OK` by the endpoint router | `Call::hangup`, `SipEndpoint` |
 | §12 Dialogs | Dialog establishment with route-set capture/reuse (UAC reverses Record-Route, UAS keeps order), in-dialog request composition addressed to the route set | internal (`Call`) |
-| §12.2.2 In-dialog requests | Inbound in-dialog requests (BYE / OPTIONS / INFO / re-INVITE) are auto-answered `200 OK`; the 2xx ACK is absorbed | `SipEndpoint` router |
+| §12.2.2 In-dialog requests | Outbound in-dialog re-INVITE / INFO carrying a body. Inbound in-dialog requests (BYE / OPTIONS / INFO / re-INVITE) are auto-answered `200 OK` and the 2xx ACK absorbed — they are not yet surfaced to the consumer | `Call`, `SipEndpoint` router |
 | §8.1.1.4 Call-ID | Random Call-ID generation | `Caller`, `Registrar` |
 | §17 Transactions | Full RFC 3261 §17 client/server INVITE & non-INVITE state machines with T1/T2/T4 timers and UDP retransmission | internal (`stack::transaction`) |
+| §20.41 User-Agent | Optional product token emitted on every outbound request | `SipEndpoint::new_with_app` |
 | §22 Authentication | Digest challenge/response as a client, on both REGISTER and INVITE | `Registrar`, `Caller` (credentials threaded internally) |
 
 Not covered from RFC 3261: acting as a proxy/registrar/redirect server,
 SIPS/TLS (§26.2), multicast (§18.1.1), CANCEL of a pending outbound INVITE,
-the `User-Agent` header (§20.41), and surfacing inbound in-dialog request
-bodies to the consumer (in-dialog requests are auto-answered, not exposed).
+and surfacing inbound in-dialog request bodies to the consumer (in-dialog
+requests are auto-answered, not exposed). The latter two, plus provisional
+(`180 Ringing`) observation, are tracked as the remaining work in `docs/17`.
 
 ### RFC 3264 — SDP offer/answer model (minimal subset)
 
@@ -44,9 +47,14 @@ Single `m=audio` line, one round of offer/answer:
 - Offer parsed from the inbound INVITE, answer generated in the 200 OK
   — UAS direction.
 
-No re-INVITE renegotiation of media, no hold (`a=sendonly` /
-`a=inactive` transitions), no multiple media descriptions, no
-rejected-stream (`port 0`) handling.
+Hold/resume **is** supported: `Call::set_hold` sends a re-INVITE with an
+`a=sendonly`/`a=sendrecv` re-offer and a bumped `o=` version (§5),
+`build_sdp_with` exposing the direction + version. Still absent: multiple
+media descriptions, `a=inactive` two-way hold as a first-class call state
+(the `MediaDirection::Inactive` variant exists but `set_hold` only toggles
+sendonly/sendrecv), and rejected-stream (`port 0`) handling. Inbound
+re-INVITE re-offers are auto-answered `200 OK` without a renegotiated SDP
+answer body — see the gap noted in `docs/17`.
 
 ### RFC 8866 (ex-4566) — SDP (minimal subset)
 
@@ -127,6 +135,33 @@ configured transport instead), `_sips._tcp` / TLS targets, and failover
 across multiple SRV targets on connection failure — only the first
 candidate is used today.
 
+### RFC 4028 — Session timers
+
+- Header logic: `Session-Expires` (with `;refresher=uac|uas`) and `Min-SE`
+  parse/build, `Supported`/`Require: timer` — `SessionExpires`,
+  `min_se_in`, `supports_timer`.
+- Negotiation: `negotiate_uac` (from the 2xx) and `negotiate_uas` (from the
+  INVITE, echoing the agreed interval + `Require: timer` in the 200). The
+  outbound INVITE advertises `Supported: timer` + a 30-minute
+  `Session-Expires` by default.
+- Runtime: `session_timer_loop` drives the §10 schedule — the refresher
+  sends a refresh re-INVITE every `interval/2`; the non-refresher runs a
+  BYE watchdog at `interval − min(32 s, interval/3)`. Surfaced via
+  `Call::session_timer()` + `Call::session_handle()`.
+
+Caveat: the **watchdog** path resets on a peer refresh only once the peer's
+refresh re-INVITE is surfaced to the consumer (the remaining `docs/17`
+work); the UAC-refresher path is fully functional today.
+
+### RFC 6086 (ex-2976) — SIP INFO (DTMF relay)
+
+Outbound `INFO` with the Cisco `application/dtmf-relay` body
+(`Signal=…\nDuration=…`) as a DTMF fallback when the remote did not
+negotiate RFC 4733 `telephone-event` — `Call::send_dtmf_info`,
+`build_info_body`, `InfoOutcome` (incl. the `415 Unsupported Media Type`
+stop signal). Inbound `INFO` is still auto-answered `200 OK` and not yet
+surfaced (see `docs/17`).
+
 ## Not implemented
 
 NAT traversal and media security, in particular, are fully delegated
@@ -135,8 +170,6 @@ typically a PBX/SBC on the same network or a trunk that latches):
 
 | RFC | What it is | Status |
 |-----|------------|--------|
-| 4028 | Session timers | Removed in `docs/16`; re-INVITEs are auto-answered but periodic refresh is not driven. Deferred to a follow-up on the engine. |
-| 6086 (ex-2976) | SIP INFO (DTMF relay) | Removed in `docs/16`; inbound INFO is auto-answered `200 OK` but not surfaced, and sending INFO is not exposed. Deferred. |
 | 3581 | Symmetric response routing (`rport`) | Not currently added to outgoing Via; responses route to the Via sent-by address. |
 | 3311 | UPDATE method | Not exposed |
 | 3326 | Reason header | Not emitted or parsed |
@@ -164,8 +197,10 @@ scope.
 
 Ranked by how soon a real deployment trips over them:
 
-1. **Session timers (RFC 4028)** — without driven refreshes, long calls can be
-   reaped by a server enforcing `Session-Expires`. Re-add on the engine.
+1. **Inbound in-dialog surfacing + CANCEL + provisional states** — the
+   remaining `docs/17` work: surface a peer's refresh re-INVITE / inbound
+   INFO to the consumer (which also completes the RFC 4028 watchdog path),
+   CANCEL a ringing outbound INVITE, and observe `180 Ringing`.
 2. **`rport` (RFC 3581)** — needed for responses to come back through NAT/PAT;
    add `;rport` to outgoing Via and honor it on responses.
 3. **TCP transport** — the `Transport::Tcp` variant is currently inert.
