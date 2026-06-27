@@ -16,6 +16,8 @@
 //! music) is the consumer's audio concern.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use rsip::{Header, StatusCode};
 use rsipstack::dialog::client_dialog::ClientInviteDialog;
@@ -40,6 +42,15 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// exposes it as `local_rtp_addr`); re-advertising it unchanged keeps the
 /// remote sending to the same socket.
 ///
+/// `session_version` is the RFC 3264 §8 `o=` line version for this
+/// re-offer — it **must increase** on each successive re-offer within the
+/// dialog (the initial offer/answer was `0`, so pass `1`, `2`, … here).
+/// A static version is the classic hold→resume interop failure: a carrier
+/// SBC accepts the hold but rejects the resume with `500` because the
+/// body changed while the version did not. [`HoldHandle`] keeps the
+/// counter so callers don't have to; reach for this primitive directly
+/// only if you own the monotonicity yourself.
+///
 /// Returns:
 /// - `Ok(Some(media))` — the peer answered `200 OK` with an SDP body,
 ///   re-parsed here (its direction reflects what the peer agreed to,
@@ -53,8 +64,14 @@ pub async fn reoffer_media<D: SessionDialogOps>(
     dialog: &D,
     local_rtp_addr: SocketAddr,
     direction: MediaDirection,
+    session_version: u64,
 ) -> Result<Option<RemoteMedia>, BoxError> {
-    let body = build_sdp_with_direction(local_rtp_addr.ip(), local_rtp_addr.port(), direction);
+    let body = build_sdp_with_direction(
+        local_rtp_addr.ip(),
+        local_rtp_addr.port(),
+        direction,
+        session_version,
+    );
     let headers = vec![Header::ContentType("application/sdp".into())];
 
     let resp = dialog
@@ -70,6 +87,15 @@ pub async fn reoffer_media<D: SessionDialogOps>(
         return Ok(None);
     }
     parse_sdp(&resp.body).map(Some).map_err(Into::into)
+}
+
+/// Advance a call-scoped `o=` version counter and return the value to
+/// stamp on the next re-offer. The counter holds the *last used* version
+/// (seeded to `0` for the initial offer/answer), so this returns `1` on
+/// the first call, `2` on the next, … — a strictly increasing series, as
+/// RFC 3264 §8 requires across re-offers within one dialog.
+fn next_session_version(counter: &AtomicU64) -> u64 {
+    counter.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 /// The media direction to re-offer for a hold (`true`) or resume
@@ -96,10 +122,20 @@ pub fn hold_direction(held: bool) -> MediaDirection {
 ///
 /// Obtain one from [`AcceptedCall::hold_handle`](crate::AcceptedCall::hold_handle)
 /// or [`AcceptedDial::hold_handle`](crate::AcceptedDial::hold_handle).
+///
+/// The shared `session_version` counter is what makes successive
+/// hold/resume re-offers RFC 3264 §8-compliant: every handle minted for
+/// one call clones the *same* `Arc<AtomicU64>`, so a hold (version 1) and
+/// the resume that follows it (version 2) advance one monotonic series
+/// even though each request snapshots a fresh handle. A per-handle
+/// counter would reset to the same value each time and reintroduce the
+/// static-version bug, so this Arc is deliberately call-scoped.
 #[derive(Clone)]
 pub struct HoldHandle {
     dialog: HoldDialog,
     local_rtp_addr: SocketAddr,
+    /// Call-scoped monotonic `o=` version source (initial SDP was `0`).
+    session_version: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -110,29 +146,57 @@ enum HoldDialog {
 
 impl HoldHandle {
     /// Build a handle for an inbound (server-side) call's dialog.
-    pub fn for_server(dialog: ServerInviteDialog, local_rtp_addr: SocketAddr) -> Self {
+    ///
+    /// `session_version` is the call-scoped monotonic `o=` version
+    /// counter (the [`AcceptedCall`](crate::AcceptedCall) owns it, seeded
+    /// to `0` to match its initial SDP answer); all handles minted for
+    /// one call must share the same `Arc` so re-offer versions advance
+    /// across requests rather than resetting.
+    pub fn for_server(
+        dialog: ServerInviteDialog,
+        local_rtp_addr: SocketAddr,
+        session_version: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             dialog: HoldDialog::Server(dialog),
             local_rtp_addr,
+            session_version,
         }
     }
 
-    /// Build a handle for an outbound (client-side) call's dialog.
-    pub fn for_client(dialog: ClientInviteDialog, local_rtp_addr: SocketAddr) -> Self {
+    /// Build a handle for an outbound (client-side) call's dialog. See
+    /// [`Self::for_server`] for the `session_version` contract.
+    pub fn for_client(
+        dialog: ClientInviteDialog,
+        local_rtp_addr: SocketAddr,
+        session_version: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             dialog: HoldDialog::Client(dialog),
             local_rtp_addr,
+            session_version,
         }
     }
 
     /// Place the call on hold (`held = true`, re-offer `sendonly`) or
     /// resume it (`held = false`, re-offer `sendrecv`). Same return-value
     /// contract as [`reoffer_media`].
+    ///
+    /// Each call bumps the shared `o=` version first, so the offer
+    /// carries a strictly higher RFC 3264 §8 version than the previous
+    /// one (initial SDP was `0`, so the first re-offer is `1`).
     pub async fn set_hold(&self, held: bool) -> Result<Option<RemoteMedia>, BoxError> {
         let direction = hold_direction(held);
+        // 1, 2, 3, … across this call's hold/resume requests (the initial
+        // offer/answer occupied 0).
+        let version = next_session_version(&self.session_version);
         match &self.dialog {
-            HoldDialog::Server(d) => reoffer_media(d, self.local_rtp_addr, direction).await,
-            HoldDialog::Client(d) => reoffer_media(d, self.local_rtp_addr, direction).await,
+            HoldDialog::Server(d) => {
+                reoffer_media(d, self.local_rtp_addr, direction, version).await
+            }
+            HoldDialog::Client(d) => {
+                reoffer_media(d, self.local_rtp_addr, direction, version).await
+            }
         }
     }
 }
@@ -205,10 +269,11 @@ mod tests {
             Ipv4Addr::new(203, 0, 113, 9).into(),
             8000,
             MediaDirection::RecvOnly,
+            1,
         );
         let dialog = MockDialog::new(Ok(Some(response(200, answer))));
 
-        let media = reoffer_media(&dialog, addr(), MediaDirection::SendOnly)
+        let media = reoffer_media(&dialog, addr(), MediaDirection::SendOnly, 1)
             .await
             .unwrap()
             .expect("answer had SDP");
@@ -217,6 +282,8 @@ mod tests {
         let offered = dialog.last_body();
         assert!(offered.contains("a=sendonly\r\n"));
         assert!(offered.contains("m=audio 40000 RTP/AVP 0 8 101\r\n"));
+        // …with the re-offer's `o=` version (1, one past the initial 0)…
+        assert!(offered.contains("o=wavekat 0 1 IN IP4 10.0.0.7\r\n"));
         // …and read the peer's recvonly answer back.
         assert_eq!(media.direction, MediaDirection::RecvOnly);
         assert_eq!(media.port, 8000);
@@ -228,20 +295,25 @@ mod tests {
             Ipv4Addr::new(203, 0, 113, 9).into(),
             8000,
             MediaDirection::SendRecv,
+            2,
         );
         let dialog = MockDialog::new(Ok(Some(response(200, answer))));
 
-        reoffer_media(&dialog, addr(), MediaDirection::SendRecv)
+        reoffer_media(&dialog, addr(), MediaDirection::SendRecv, 2)
             .await
             .unwrap();
-        assert!(dialog.last_body().contains("a=sendrecv\r\n"));
+        let offered = dialog.last_body();
+        assert!(offered.contains("a=sendrecv\r\n"));
+        // A resume after one hold carries version 2 — strictly greater
+        // than the hold's 1, as RFC 3264 §8 requires.
+        assert!(offered.contains("o=wavekat 0 2 IN IP4 10.0.0.7\r\n"));
     }
 
     #[tokio::test]
     async fn empty_2xx_body_is_ok_none() {
         // A bare 200 OK (no SDP) still confirms the hold; media stands.
         let dialog = MockDialog::new(Ok(Some(response(200, Vec::new()))));
-        let out = reoffer_media(&dialog, addr(), MediaDirection::SendOnly)
+        let out = reoffer_media(&dialog, addr(), MediaDirection::SendOnly, 1)
             .await
             .unwrap();
         assert_eq!(out, None);
@@ -251,7 +323,7 @@ mod tests {
     async fn non_2xx_is_error() {
         // 488 Not Acceptable Here — the peer refused the media change.
         let dialog = MockDialog::new(Ok(Some(response(488, Vec::new()))));
-        let err = reoffer_media(&dialog, addr(), MediaDirection::SendOnly)
+        let err = reoffer_media(&dialog, addr(), MediaDirection::SendOnly, 1)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("488"));
@@ -261,7 +333,7 @@ mod tests {
     async fn unconfirmed_dialog_is_error() {
         // refresh() returns None when the dialog is no longer confirmed.
         let dialog = MockDialog::new(Ok(None));
-        let err = reoffer_media(&dialog, addr(), MediaDirection::SendOnly)
+        let err = reoffer_media(&dialog, addr(), MediaDirection::SendOnly, 1)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no longer confirmed"));
@@ -271,5 +343,15 @@ mod tests {
     fn hold_direction_maps_held_to_sendonly() {
         assert_eq!(hold_direction(true), MediaDirection::SendOnly);
         assert_eq!(hold_direction(false), MediaDirection::SendRecv);
+    }
+
+    #[test]
+    fn session_version_increases_across_reoffers() {
+        // Regression: a hold then a resume must carry strictly increasing
+        // `o=` versions (1, then 2) one past the initial answer's 0. The
+        // earlier static-version offer made carrier SBCs 500 the resume.
+        let counter = AtomicU64::new(0);
+        let versions: Vec<u64> = (0..4).map(|_| next_session_version(&counter)).collect();
+        assert_eq!(versions, vec![1, 2, 3, 4]);
     }
 }

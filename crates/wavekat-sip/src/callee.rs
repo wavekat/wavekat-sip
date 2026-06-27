@@ -42,6 +42,7 @@
 //! [`ClientInviteDialog`]: rsipstack::dialog::client_dialog::ClientInviteDialog
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use rsip::{Header, StatusCode};
@@ -80,6 +81,12 @@ pub struct AcceptedCall {
     /// [`crate::session_timer_loop`] with this; `None` means no timer
     /// was negotiated and none should run.
     pub session_timer: Option<SessionTimer>,
+    /// Monotonic RFC 3264 §8 `o=` version counter for this call,
+    /// seeded to `0` to match the initial SDP answer. Every
+    /// [`hold_handle`](Self::hold_handle) clones it so successive
+    /// hold/resume re-offers advance one increasing series (see
+    /// [`HoldHandle`](crate::hold::HoldHandle)).
+    session_version: Arc<AtomicU64>,
 }
 
 impl AcceptedCall {
@@ -94,12 +101,10 @@ impl AcceptedCall {
     /// return-value contract (`Ok(None)` on an SDP-less 2xx, `Err` on a
     /// rejected re-INVITE or a no-longer-confirmed dialog).
     pub async fn set_hold(&self, held: bool) -> Result<Option<RemoteMedia>, BoxError> {
-        crate::hold::reoffer_media(
-            &self.dialog,
-            self.local_rtp_addr,
-            crate::hold::hold_direction(held),
-        )
-        .await
+        // Route through the shared handle so the `o=` version counter
+        // advances whether the caller holds via `set_hold` or a snapshot
+        // `hold_handle` — one monotonic series per call.
+        self.hold_handle().set_hold(held).await
     }
 
     /// A cheap, cloneable [`HoldHandle`](crate::hold::HoldHandle) for this
@@ -107,7 +112,11 @@ impl AcceptedCall {
     /// the call, since the re-INVITE is a full SIP transaction that should
     /// not be awaited under a contended lock.
     pub fn hold_handle(&self) -> crate::hold::HoldHandle {
-        crate::hold::HoldHandle::for_server(self.dialog.clone(), self.local_rtp_addr)
+        crate::hold::HoldHandle::for_server(
+            self.dialog.clone(),
+            self.local_rtp_addr,
+            self.session_version.clone(),
+        )
     }
 }
 
@@ -168,6 +177,8 @@ impl PendingCall {
             local_rtp_addr,
             state_rx: self.state_rx,
             session_timer: self.session_timer.map(|uas| uas.timer),
+            // Initial SDP answer above used version 0; re-offers start at 1.
+            session_version: Arc::new(AtomicU64::new(0)),
         })
     }
 

@@ -82,24 +82,38 @@ impl MediaDirection {
 /// preferred audio choice.
 ///
 /// Equivalent to [`build_sdp_with_direction`] with
-/// [`MediaDirection::SendRecv`]; use that to re-offer a stream on hold.
+/// [`MediaDirection::SendRecv`] at session version `0`; use that to
+/// re-offer a stream on hold.
 pub fn build_sdp(local_ip: IpAddr, rtp_port: u16) -> Vec<u8> {
-    build_sdp_with_direction(local_ip, rtp_port, MediaDirection::SendRecv)
+    build_sdp_with_direction(local_ip, rtp_port, MediaDirection::SendRecv, 0)
 }
 
 /// Build the same minimal G.711 + telephone-event SDP as [`build_sdp`],
-/// but with an explicit RFC 3264 media direction. Used to re-offer a
-/// confirmed call's media on hold (`SendOnly` / `Inactive`) or to resume
-/// it (`SendRecv`) inside a re-INVITE.
+/// but with an explicit RFC 3264 media direction and `o=` line session
+/// version. Used to re-offer a confirmed call's media on hold
+/// (`SendOnly` / `Inactive`) or to resume it (`SendRecv`) inside a
+/// re-INVITE.
+///
+/// `session_version` is the third field of the `o=` line. RFC 3264 §8
+/// requires it to **increment by one on each re-offer that changes the
+/// session** while the session id (the second `o=` field) stays fixed
+/// for the dialog's life. A static version is the classic hold/resume
+/// interop bug: some carrier SBCs accept the first re-offer but reject
+/// the second one whose body changed yet whose version did not, surfaced
+/// as a `500 Server Internal Error` on resume. So the consumer must feed
+/// a monotonic counter here, not a constant — the initial offer/answer
+/// uses `0` (see [`build_sdp`]), the first re-offer `1`, the next `2`,
+/// and so on.
 pub fn build_sdp_with_direction(
     local_ip: IpAddr,
     rtp_port: u16,
     direction: MediaDirection,
+    session_version: u64,
 ) -> Vec<u8> {
     let dir = direction.attr();
     format!(
         "v=0\r\n\
-         o=wavekat 0 0 IN IP4 {local_ip}\r\n\
+         o=wavekat 0 {session_version} IN IP4 {local_ip}\r\n\
          s=wavekat-sip\r\n\
          c=IN IP4 {local_ip}\r\n\
          t=0 0\r\n\
@@ -364,16 +378,47 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         // Held offer: same media, a=sendonly instead of a=sendrecv. The
         // port and codecs are unchanged so the remote keeps its leg up.
-        let held = String::from_utf8(build_sdp_with_direction(ip, 5004, MediaDirection::SendOnly))
-            .unwrap();
+        let held = String::from_utf8(build_sdp_with_direction(
+            ip,
+            5004,
+            MediaDirection::SendOnly,
+            1,
+        ))
+        .unwrap();
         assert!(held.contains("m=audio 5004 RTP/AVP 0 8 101\r\n"));
         assert!(held.contains("a=sendonly\r\n"));
         assert!(!held.contains("a=sendrecv"));
 
-        let inactive =
-            String::from_utf8(build_sdp_with_direction(ip, 5004, MediaDirection::Inactive))
-                .unwrap();
+        let inactive = String::from_utf8(build_sdp_with_direction(
+            ip,
+            5004,
+            MediaDirection::Inactive,
+            1,
+        ))
+        .unwrap();
         assert!(inactive.contains("a=inactive\r\n"));
+    }
+
+    #[test]
+    fn build_sdp_origin_version_tracks_session_version() {
+        // RFC 3264 §8: the `o=` line keeps a fixed session id but its
+        // version increments per re-offer. A static version is the
+        // hold→resume interop bug (some SBCs 500 the second re-offer).
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        // Initial offer/answer baseline.
+        let initial = String::from_utf8(build_sdp(ip, 5004)).unwrap();
+        assert!(initial.contains("o=wavekat 0 0 IN IP4 10.0.0.1\r\n"));
+        // Successive re-offers carry the same id, an incrementing version.
+        for version in [1u64, 2, 7] {
+            let sdp = String::from_utf8(build_sdp_with_direction(
+                ip,
+                5004,
+                MediaDirection::SendRecv,
+                version,
+            ))
+            .unwrap();
+            assert!(sdp.contains(&format!("o=wavekat 0 {version} IN IP4 10.0.0.1\r\n")));
+        }
     }
 
     #[test]
@@ -385,7 +430,7 @@ mod tests {
             MediaDirection::RecvOnly,
             MediaDirection::Inactive,
         ] {
-            let sdp = build_sdp_with_direction(ip, 8000, dir);
+            let sdp = build_sdp_with_direction(ip, 8000, dir, 1);
             assert_eq!(parse_sdp(&sdp).unwrap().direction, dir);
         }
     }

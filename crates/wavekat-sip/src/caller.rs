@@ -31,6 +31,7 @@
 //! `local_rtp_addr` triple is the raw plumbing; route frames anywhere.
 
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use rsipstack::dialog::authenticate::Credential;
@@ -76,6 +77,12 @@ pub struct AcceptedDial {
     /// keep the session refreshed / watched; `None` means the remote
     /// declined session timers and no timer should run.
     pub session_timer: Option<SessionTimer>,
+    /// Monotonic RFC 3264 §8 `o=` version counter for this call,
+    /// seeded to `0` to match the initial SDP offer. Every
+    /// [`hold_handle`](Self::hold_handle) clones it so successive
+    /// hold/resume re-offers advance one increasing series (see
+    /// [`HoldHandle`](crate::hold::HoldHandle)).
+    session_version: Arc<AtomicU64>,
 }
 
 impl AcceptedDial {
@@ -85,19 +92,21 @@ impl AcceptedDial {
     /// `a=sendonly` / `a=sendrecv` re-offer (RFC 3264). See
     /// [`crate::reoffer_media`] for the return-value contract.
     pub async fn set_hold(&self, held: bool) -> Result<Option<RemoteMedia>, BoxError> {
-        crate::hold::reoffer_media(
-            &self.dialog,
-            self.local_rtp_addr,
-            crate::hold::hold_direction(held),
-        )
-        .await
+        // Route through the shared handle so the `o=` version counter
+        // advances whether the caller holds via `set_hold` or a snapshot
+        // `hold_handle` — one monotonic series per call.
+        self.hold_handle().set_hold(held).await
     }
 
     /// A cheap, cloneable [`HoldHandle`](crate::hold::HoldHandle) for this
     /// call — the UAC-side mirror of
     /// [`AcceptedCall::hold_handle`](crate::AcceptedCall::hold_handle).
     pub fn hold_handle(&self) -> crate::hold::HoldHandle {
-        crate::hold::HoldHandle::for_client(self.dialog.clone(), self.local_rtp_addr)
+        crate::hold::HoldHandle::for_client(
+            self.dialog.clone(),
+            self.local_rtp_addr,
+            self.session_version.clone(),
+        )
     }
 }
 
@@ -175,6 +184,8 @@ impl PendingDial {
             local_rtp_addr: self.local_rtp_addr,
             state_rx: self.state_rx,
             session_timer,
+            // Initial SDP offer used version 0; re-offers start at 1.
+            session_version: Arc::new(AtomicU64::new(0)),
         })
     }
 }
