@@ -16,7 +16,8 @@
 //!   re-registration ([`Registrar`]), shared transport + dialog layer
 //!   ([`SipEndpoint`]).
 //! - **SDP** — minimal G.711 (PCMU + PCMA) offer/answer with round-trip
-//!   parsing ([`build_sdp`], [`parse_sdp`]).
+//!   parsing ([`build_sdp`], [`parse_sdp`]) and RFC 3264 media direction
+//!   for call hold ([`MediaDirection`], [`reoffer_media`]).
 //! - **RTP** — header parser ([`RtpHeader`]), a debug-friendly receive
 //!   loop ([`receive_rtp`]) suitable for transcription, recording, or
 //!   smoke-testing inbound media, and a codec-agnostic send loop
@@ -136,7 +137,8 @@
 //! | [`resolve`]     | RFC 3263 (subset) server location: SRV + A/AAAA fallback.      |
 //! | [`callee`]      | Inbound INVITE accept/reject helper.                           |
 //! | [`caller`]      | Outbound INVITE / dial-cancel helper.                          |
-//! | [`sdp`]         | Minimal G.711 offer/answer build + parse.                      |
+//! | [`sdp`]         | Minimal G.711 offer/answer build + parse, with direction (hold). |
+//! | [`hold`]        | Call hold / resume via `a=sendonly`/`sendrecv` re-INVITE (RFC 3264). |
 //! | [`rtp`]         | RTP header parser, debug receive loop, codec-agnostic send loop. |
 //! | [`session_timer`] | RFC 4028 session timers — refresh re-INVITEs + expiry watchdog. |
 //!
@@ -156,6 +158,7 @@ pub mod callee;
 pub mod caller;
 pub mod dtmf_info;
 pub mod endpoint;
+pub mod hold;
 pub mod registrar;
 pub mod resolve;
 pub mod rtp;
@@ -170,6 +173,7 @@ pub use dtmf_info::{
     InfoOutcome, CONTENT_TYPE,
 };
 pub use endpoint::{DispatchOutcome, SipEndpoint};
+pub use hold::{hold_direction, reoffer_media, HoldHandle};
 pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use resolve::{order_candidates, resolve_sip_server, SrvRecord};
 pub use rtp::dtmf::{
@@ -178,7 +182,9 @@ pub use rtp::dtmf::{
 };
 pub use rtp::dtmf_recv::{parse_event_payload, DtmfEvent, DtmfEventPayload, DtmfReceiver};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
-pub use sdp::{build_sdp, parse_sdp, RemoteMedia, DTMF_DEFAULT_PT};
+pub use sdp::{
+    build_sdp, build_sdp_with_direction, parse_sdp, MediaDirection, RemoteMedia, DTMF_DEFAULT_PT,
+};
 pub use session_timer::{
     min_se_in, negotiate_uac, negotiate_uas, require_timer_header, session_expires_in,
     session_timer_loop, supported_timer_header, supports_timer, Refresher, SessionDialogOps,

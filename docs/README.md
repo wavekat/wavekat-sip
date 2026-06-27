@@ -25,3 +25,4 @@ Two kinds of documents live here:
 | [05-dtmf-receive.md](05-dtmf-receive.md) | DTMF receiving: decoding incoming telephone-event packets |
 | [06-srv-lookup.md](06-srv-lookup.md) | RFC 3263 SRV-based server location |
 | [07-session-timers.md](07-session-timers.md) | RFC 4028 session timers |
+| [08-call-hold.md](08-call-hold.md) | RFC 3264 call hold / resume via directional re-INVITE |

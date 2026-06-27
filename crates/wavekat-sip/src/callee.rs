@@ -82,6 +82,35 @@ pub struct AcceptedCall {
     pub session_timer: Option<SessionTimer>,
 }
 
+impl AcceptedCall {
+    /// Put this answered call on hold (`held = true`) or resume it
+    /// (`held = false`) by re-INVITEing the remote with a re-offer
+    /// carrying `a=sendonly` / `a=sendrecv` (RFC 3264). The far end is
+    /// formally told it's on hold and may play music-on-hold; what to
+    /// feed the RTP stream while held (silence, music) is the consumer's
+    /// audio concern.
+    ///
+    /// Thin convenience over [`crate::reoffer_media`]; see it for the
+    /// return-value contract (`Ok(None)` on an SDP-less 2xx, `Err` on a
+    /// rejected re-INVITE or a no-longer-confirmed dialog).
+    pub async fn set_hold(&self, held: bool) -> Result<Option<RemoteMedia>, BoxError> {
+        crate::hold::reoffer_media(
+            &self.dialog,
+            self.local_rtp_addr,
+            crate::hold::hold_direction(held),
+        )
+        .await
+    }
+
+    /// A cheap, cloneable [`HoldHandle`](crate::hold::HoldHandle) for this
+    /// call — use it to hold / resume after releasing whatever lock guards
+    /// the call, since the re-INVITE is a full SIP transaction that should
+    /// not be awaited under a contended lock.
+    pub fn hold_handle(&self) -> crate::hold::HoldHandle {
+        crate::hold::HoldHandle::for_server(self.dialog.clone(), self.local_rtp_addr)
+    }
+}
+
 /// An inbound INVITE that has been hooked into the dialog layer — the
 /// transaction handler is running (`100 Trying` sent, a pre-answer
 /// `CANCEL` will be auto-replied with `487`) but no final response has

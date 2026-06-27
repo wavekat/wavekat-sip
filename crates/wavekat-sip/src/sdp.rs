@@ -10,15 +10,93 @@ use std::net::IpAddr;
 /// boring and predictable.
 pub const DTMF_DEFAULT_PT: u8 = 101;
 
-/// Build a minimal SDP body for bidirectional G.711 audio with RFC 4733
-/// telephone-event (DTMF) advertised at payload type 101.
+/// RFC 3264 media-direction attribute on an `m=audio` stream.
+///
+/// Carried as the `a=<dir>` line in an SDP offer/answer. The default
+/// `SendRecv` is a normal two-way call; the others express call-hold
+/// transitions: an endpoint puts a stream on hold by re-offering it as
+/// `SendOnly` (it will keep sending — typically silence or music — but
+/// asks the peer to stop), `RecvOnly` (it wants to keep receiving but
+/// stop sending), or `Inactive` (both directions paused). Resuming
+/// re-offers `SendRecv`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaDirection {
+    /// `a=sendrecv` — normal two-way media (RFC 3264 default when the
+    /// attribute is absent).
+    #[default]
+    SendRecv,
+    /// `a=sendonly` — we send, we ask the peer not to. The conventional
+    /// "call on hold" offer.
+    SendOnly,
+    /// `a=recvonly` — we receive, we won't send.
+    RecvOnly,
+    /// `a=inactive` — neither direction; both ends paused.
+    Inactive,
+}
+
+impl MediaDirection {
+    /// The SDP attribute token (`sendrecv` / `sendonly` / `recvonly` /
+    /// `inactive`) — the text after `a=` on the wire.
+    pub fn attr(self) -> &'static str {
+        match self {
+            Self::SendRecv => "sendrecv",
+            Self::SendOnly => "sendonly",
+            Self::RecvOnly => "recvonly",
+            Self::Inactive => "inactive",
+        }
+    }
+
+    /// Parse a direction attribute token. Returns `None` for anything
+    /// that isn't one of the four RFC 3264 tokens.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "sendrecv" => Some(Self::SendRecv),
+            "sendonly" => Some(Self::SendOnly),
+            "recvonly" => Some(Self::RecvOnly),
+            "inactive" => Some(Self::Inactive),
+            _ => None,
+        }
+    }
+
+    /// The direction this end should answer with when the peer *offers*
+    /// `self` (RFC 3264 §6.1): `sendonly`/`recvonly` mirror, the
+    /// symmetric directions echo. Useful for answering a peer-initiated
+    /// hold re-INVITE.
+    pub fn responding(self) -> Self {
+        match self {
+            Self::SendRecv => Self::SendRecv,
+            Self::SendOnly => Self::RecvOnly,
+            Self::RecvOnly => Self::SendOnly,
+            Self::Inactive => Self::Inactive,
+        }
+    }
+}
+
+/// Build a minimal SDP body for bidirectional (`a=sendrecv`) G.711 audio
+/// with RFC 4733 telephone-event (DTMF) advertised at payload type 101.
 ///
 /// Suitable as both the offer (sent in an outbound INVITE) and the answer
 /// (sent in a 200 OK to an inbound INVITE). The G.711 codecs stay
 /// listed first so the remote still selects PCMU/PCMA as the audio
 /// codec; the 101 entry adds DTMF support without changing the
 /// preferred audio choice.
+///
+/// Equivalent to [`build_sdp_with_direction`] with
+/// [`MediaDirection::SendRecv`]; use that to re-offer a stream on hold.
 pub fn build_sdp(local_ip: IpAddr, rtp_port: u16) -> Vec<u8> {
+    build_sdp_with_direction(local_ip, rtp_port, MediaDirection::SendRecv)
+}
+
+/// Build the same minimal G.711 + telephone-event SDP as [`build_sdp`],
+/// but with an explicit RFC 3264 media direction. Used to re-offer a
+/// confirmed call's media on hold (`SendOnly` / `Inactive`) or to resume
+/// it (`SendRecv`) inside a re-INVITE.
+pub fn build_sdp_with_direction(
+    local_ip: IpAddr,
+    rtp_port: u16,
+    direction: MediaDirection,
+) -> Vec<u8> {
+    let dir = direction.attr();
     format!(
         "v=0\r\n\
          o=wavekat 0 0 IN IP4 {local_ip}\r\n\
@@ -30,7 +108,7 @@ pub fn build_sdp(local_ip: IpAddr, rtp_port: u16) -> Vec<u8> {
          a=rtpmap:8 PCMA/8000\r\n\
          a=rtpmap:{DTMF_DEFAULT_PT} telephone-event/8000\r\n\
          a=fmtp:{DTMF_DEFAULT_PT} 0-15\r\n\
-         a=sendrecv\r\n"
+         a={dir}\r\n"
     )
     .into_bytes()
 }
@@ -49,6 +127,12 @@ pub struct RemoteMedia {
     /// it — consumers should fall back to SIP INFO for DTMF in that
     /// case.
     pub dtmf_payload_type: Option<u8>,
+    /// RFC 3264 direction the remote declared for this stream
+    /// (`a=sendrecv` / `sendonly` / `recvonly` / `inactive`). Defaults
+    /// to [`MediaDirection::SendRecv`] when no `a=` direction line is
+    /// present, per RFC 3264. Lets a consumer detect a peer-initiated
+    /// hold (the peer offers `SendOnly`/`Inactive`).
+    pub direction: MediaDirection,
 }
 
 /// Parse the connection address, audio port, preferred codec, and
@@ -61,9 +145,16 @@ pub fn parse_sdp(sdp_bytes: &[u8]) -> Result<RemoteMedia, String> {
     let mut audio_pts: Vec<u8> = Vec::new();
     // PTs whose rtpmap names them as `telephone-event/8000`.
     let mut dtmf_candidate_pts: Vec<u8> = Vec::new();
+    // RFC 3264 direction; absent `a=` line means SendRecv (the default).
+    let mut direction = MediaDirection::SendRecv;
 
     for line in sdp.lines() {
         let line = line.trim();
+
+        // a=sendrecv / a=sendonly / a=recvonly / a=inactive
+        if let Some(dir) = line.strip_prefix("a=").and_then(MediaDirection::parse) {
+            direction = dir;
+        }
 
         // c=IN IP4 10.0.0.1
         if line.starts_with("c=IN IP4 ") || line.starts_with("c=IN IP6 ") {
@@ -119,6 +210,7 @@ pub fn parse_sdp(sdp_bytes: &[u8]) -> Result<RemoteMedia, String> {
             port,
             payload_type: pt,
             dtmf_payload_type,
+            direction,
         }),
         (None, _, _) => Err("No connection address (c=) in SDP".to_string()),
         (_, None, _) => Err("No audio media line (m=audio) in SDP".to_string()),
@@ -256,5 +348,76 @@ mod tests {
         let sdp = &[0xFF, 0xFE, 0xFD];
         let err = parse_sdp(sdp).unwrap_err();
         assert!(err.contains("UTF-8"));
+    }
+
+    #[test]
+    fn build_sdp_defaults_to_sendrecv() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let text = String::from_utf8(build_sdp(ip, 5004)).unwrap();
+        assert!(text.contains("a=sendrecv\r\n"));
+        // The plain builder must not emit a hold direction.
+        assert!(!text.contains("a=sendonly"));
+    }
+
+    #[test]
+    fn build_sdp_with_direction_emits_hold_attribute() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        // Held offer: same media, a=sendonly instead of a=sendrecv. The
+        // port and codecs are unchanged so the remote keeps its leg up.
+        let held = String::from_utf8(build_sdp_with_direction(ip, 5004, MediaDirection::SendOnly))
+            .unwrap();
+        assert!(held.contains("m=audio 5004 RTP/AVP 0 8 101\r\n"));
+        assert!(held.contains("a=sendonly\r\n"));
+        assert!(!held.contains("a=sendrecv"));
+
+        let inactive =
+            String::from_utf8(build_sdp_with_direction(ip, 5004, MediaDirection::Inactive))
+                .unwrap();
+        assert!(inactive.contains("a=inactive\r\n"));
+    }
+
+    #[test]
+    fn parse_sdp_reads_direction_and_round_trips() {
+        let ip = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 5));
+        for dir in [
+            MediaDirection::SendRecv,
+            MediaDirection::SendOnly,
+            MediaDirection::RecvOnly,
+            MediaDirection::Inactive,
+        ] {
+            let sdp = build_sdp_with_direction(ip, 8000, dir);
+            assert_eq!(parse_sdp(&sdp).unwrap().direction, dir);
+        }
+    }
+
+    #[test]
+    fn parse_sdp_absent_direction_defaults_to_sendrecv() {
+        // RFC 3264 §5.1: a media stream with no direction attribute is
+        // sendrecv. Our minimal offers always carry one, but a peer's
+        // answer might omit it.
+        let sdp = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 0\r\n";
+        assert_eq!(parse_sdp(sdp).unwrap().direction, MediaDirection::SendRecv);
+    }
+
+    #[test]
+    fn media_direction_responding_mirrors_hold() {
+        // Answering a peer's hold: their sendonly is our recvonly, and
+        // vice versa; the symmetric directions echo unchanged.
+        assert_eq!(
+            MediaDirection::SendOnly.responding(),
+            MediaDirection::RecvOnly
+        );
+        assert_eq!(
+            MediaDirection::RecvOnly.responding(),
+            MediaDirection::SendOnly
+        );
+        assert_eq!(
+            MediaDirection::SendRecv.responding(),
+            MediaDirection::SendRecv
+        );
+        assert_eq!(
+            MediaDirection::Inactive.responding(),
+            MediaDirection::Inactive
+        );
     }
 }

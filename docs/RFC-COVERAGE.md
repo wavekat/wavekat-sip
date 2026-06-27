@@ -1,6 +1,6 @@
 # RFC coverage
 
-> Status: living document · Last audited: 2026-06-07 (post-v0.0.14 main)
+> Status: living document · Last audited: 2026-06-27 (post-v0.0.15 main)
 
 What standards this crate's **public API** implements, which parts of
 each, and what is knowingly absent. The yardstick is the surface a
@@ -35,22 +35,38 @@ incoming-transaction stream).
 
 ### RFC 3264 — SDP offer/answer model (minimal subset)
 
-Single `m=audio` line, one round of offer/answer:
+Single `m=audio` line, initial offer/answer plus a directional re-offer
+for call hold:
 
 - Offer generated at `dial` time (`build_sdp`), answer parsed from the
   2xx (`parse_sdp`) — UAC direction.
 - Offer parsed from the inbound INVITE, answer generated in the 200 OK
   — UAS direction.
+- **Hold/resume re-INVITE** — re-offer the stream with an explicit
+  direction attribute (`a=sendonly` to hold, `a=sendrecv` to resume,
+  `a=inactive` for a both-ways pause) and parse the answer back.
+  `build_sdp_with_direction`, `MediaDirection`, `reoffer_media`,
+  `AcceptedCall::set_hold` / `AcceptedDial::set_hold`. The parsed
+  direction is exposed on `RemoteMedia::direction`, and
+  `MediaDirection::responding` gives the attribute to answer a
+  peer-initiated hold with.
 
-No re-INVITE renegotiation of media, no hold (`a=sendonly` /
-`a=inactive` transitions), no multiple media descriptions, no
+The hold re-offer keeps the same connection address, port, and codecs —
+only the direction moves. What plays on the RTP stream while held
+(silence, music-on-hold) is the consumer's audio concern, not signaling.
+
+Not covered: *answering* a peer-initiated hold re-INVITE is left to the
+consumer (the inbound re-INVITE surfaces on the dialog state stream;
+this crate supplies the parsed direction and the `responding()` helper
+but does not auto-answer). No multiple media descriptions, no
 rejected-stream (`port 0`) handling.
 
 ### RFC 8866 (ex-4566) — SDP (minimal subset)
 
 `build_sdp` emits and `parse_sdp` reads exactly the subset telephony
 G.711 interop needs: `v=`, `o=`, `s=`, `c=` (IN IP4/IP6), `t=`,
-`m=audio … RTP/AVP …`, `a=rtpmap`, `a=fmtp`, `a=sendrecv`. Everything
+`m=audio … RTP/AVP …`, `a=rtpmap`, `a=fmtp`, and a direction attribute
+(`a=sendrecv` / `a=sendonly` / `a=recvonly` / `a=inactive`). Everything
 else in SDP is ignored on parse and never emitted.
 
 ### RFC 3550 — RTP (partial, no RTCP)

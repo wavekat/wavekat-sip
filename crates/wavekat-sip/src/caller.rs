@@ -78,6 +78,29 @@ pub struct AcceptedDial {
     pub session_timer: Option<SessionTimer>,
 }
 
+impl AcceptedDial {
+    /// Put this outbound call on hold (`held = true`) or resume it
+    /// (`held = false`) — the UAC-side mirror of
+    /// [`crate::AcceptedCall::set_hold`], re-INVITEing the remote with a
+    /// `a=sendonly` / `a=sendrecv` re-offer (RFC 3264). See
+    /// [`crate::reoffer_media`] for the return-value contract.
+    pub async fn set_hold(&self, held: bool) -> Result<Option<RemoteMedia>, BoxError> {
+        crate::hold::reoffer_media(
+            &self.dialog,
+            self.local_rtp_addr,
+            crate::hold::hold_direction(held),
+        )
+        .await
+    }
+
+    /// A cheap, cloneable [`HoldHandle`](crate::hold::HoldHandle) for this
+    /// call — the UAC-side mirror of
+    /// [`AcceptedCall::hold_handle`](crate::AcceptedCall::hold_handle).
+    pub fn hold_handle(&self) -> crate::hold::HoldHandle {
+        crate::hold::HoldHandle::for_client(self.dialog.clone(), self.local_rtp_addr)
+    }
+}
+
 /// An outbound INVITE on the wire whose final response has not arrived.
 ///
 /// Pump `state_rx` while the UI shows "Dialing…" / "Ringing…":
