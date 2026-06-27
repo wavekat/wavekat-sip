@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::auth;
-use super::call::{build_invite, cseq_of, CallConfig, CallOutcome};
+use super::call::{build_cancel, build_invite, cseq_of, CallConfig, CallOutcome};
 use super::dialog::Dialog;
 use super::engine::{self, EngineHandle, Event};
 use super::registration::{build_register, granted_expires, RegisterConfig, RegisterOutcome};
@@ -149,13 +149,31 @@ impl Ua {
         peer: SocketAddr,
         first_cseq: u32,
     ) -> CallOutcome {
+        self.call_cancellable(cfg, peer, first_cseq, &CancellationToken::new())
+            .await
+    }
+
+    /// Like [`Ua::call`], but `cancel` aborts a still-ringing INVITE with a
+    /// `CANCEL` (RFC 3261 §9): once a provisional has arrived, firing the token
+    /// sends the CANCEL and the call resolves `Rejected(487 Request
+    /// Terminated)`.
+    pub(crate) async fn call_cancellable(
+        &self,
+        cfg: &CallConfig,
+        peer: SocketAddr,
+        first_cseq: u32,
+        cancel: &CancellationToken,
+    ) -> CallOutcome {
         let mut request = build_invite(cfg, first_cseq, self.local_addr());
         let mut challenged = false;
         loop {
             let Some(mut rx) = self.start_client(&request, peer).await else {
                 return CallOutcome::EngineStopped;
             };
-            match self.await_final(&mut rx).await {
+            match self
+                .await_final_cancellable(&mut rx, peer, &request, cancel)
+                .await
+            {
                 Some(response) => {
                     let code = response.status_code().code();
                     if (200..300).contains(&code) {
@@ -325,6 +343,57 @@ impl Ua {
             }
         }
         None
+    }
+
+    /// Like [`Ua::await_final`], but also watches `cancel`: once a provisional
+    /// has arrived, firing the token sends a `CANCEL` for `invite` (RFC 3261
+    /// §9.1 forbids CANCEL before the first provisional). The INVITE's final
+    /// response — a `487` after a successful CANCEL — is still returned.
+    async fn await_final_cancellable(
+        &self,
+        rx: &mut mpsc::Receiver<Event>,
+        peer: SocketAddr,
+        invite: &Request,
+        cancel: &CancellationToken,
+    ) -> Option<Response> {
+        let mut cancel_requested = false;
+        let mut cancel_sent = false;
+        let mut provisional_seen = false;
+        loop {
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Some(Event::Response { response, .. }) => {
+                        if response.status_code().code() >= 200 {
+                            return Some(response);
+                        }
+                        provisional_seen = true;
+                        if cancel_requested && !cancel_sent {
+                            self.send_cancel(invite, peer).await;
+                            cancel_sent = true;
+                        }
+                    }
+                    Some(Event::TimedOut { .. }) => return None,
+                    Some(_) => continue,
+                    None => return None,
+                },
+                _ = cancel.cancelled(), if !cancel_requested => {
+                    cancel_requested = true;
+                    if provisional_seen && !cancel_sent {
+                        self.send_cancel(invite, peer).await;
+                        cancel_sent = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fire a `CANCEL` for an in-flight INVITE as its own (non-INVITE)
+    /// transaction; we don't wait on its 2xx — the cancelled INVITE's `487` is
+    /// what resolves the call.
+    async fn send_cancel(&self, invite: &Request, peer: SocketAddr) {
+        if let Some(request) = build_cancel(invite) {
+            self.engine.start_client(request, peer).await;
+        }
     }
 }
 
@@ -654,5 +723,82 @@ mod tests {
 
         server.await.unwrap();
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn cancel_after_ringing_terminates_call() {
+        let shutdown = CancellationToken::new();
+        let ua = Ua::bind_with_timers(
+            "127.0.0.1:0".parse().unwrap(),
+            fast_timers(),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut invite_echo: Option<String> = None;
+            let mut sent_ringing = false;
+            loop {
+                let (m, src) = peer.recv().await.unwrap();
+                let SipMessage::Request(r) = m else { continue };
+                match r.method() {
+                    // Ring once; tolerate INVITE retransmissions.
+                    Method::Invite if !sent_ringing => {
+                        let h = echo(&r);
+                        invite_echo = Some(h.clone());
+                        let ringing = format!("SIP/2.0 180 Ringing\r\n{h}To: <sip:bob@example.com>;tag=b\r\nContent-Length: 0\r\n\r\n");
+                        peer.send_to(&SipMessage::try_from(ringing.as_bytes()).unwrap(), src)
+                            .await
+                            .unwrap();
+                        sent_ringing = true;
+                    }
+                    Method::Invite => {}
+                    Method::Cancel => {
+                        // 200 to the CANCEL, then 487 to the INVITE, then ACK.
+                        let ch = echo(&r);
+                        let ok = format!("SIP/2.0 200 OK\r\n{ch}To: <sip:bob@example.com>;tag=b\r\nContent-Length: 0\r\n\r\n");
+                        peer.send_to(&SipMessage::try_from(ok.as_bytes()).unwrap(), src)
+                            .await
+                            .unwrap();
+                        let h = invite_echo.clone().unwrap();
+                        let term = format!("SIP/2.0 487 Request Terminated\r\n{h}To: <sip:bob@example.com>;tag=b\r\nContent-Length: 0\r\n\r\n");
+                        peer.send_to(&SipMessage::try_from(term.as_bytes()).unwrap(), src)
+                            .await
+                            .unwrap();
+                        let (m, _) = peer.recv().await.unwrap();
+                        assert!(
+                            matches!(m, SipMessage::Request(a) if *a.method() == Method::Ack),
+                            "engine ACKs the 487",
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Request cancellation up front; the engine defers the CANCEL until the
+        // 180 arrives (RFC 3261 §9.1).
+        let dial_cancel = CancellationToken::new();
+        dial_cancel.cancel();
+        let outcome = timeout(
+            Duration::from_secs(3),
+            ua.call_cancellable(&call_config(), peer_addr, 1, &dial_cancel),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, CallOutcome::Rejected(s) if s.code() == 487),
+            "cancel-while-ringing resolves to 487 Request Terminated",
+        );
+
+        server.await.unwrap();
+        shutdown.cancel();
     }
 }

@@ -126,6 +126,45 @@ pub(crate) fn build_invite(cfg: &CallConfig, cseq: u32, local_addr: SocketAddr) 
     }
 }
 
+/// Build the `CANCEL` for an in-flight INVITE (RFC 3261 §9.1).
+///
+/// CANCEL matches the INVITE hop-by-hop, so it copies the INVITE's **top Via**
+/// (same branch), Request-URI, `From`, `To` (no tag added), and `Call-ID`, with
+/// the same `CSeq` number but method `CANCEL`. Returns `None` if the INVITE is
+/// missing a header CANCEL must echo.
+pub(crate) fn build_cancel(invite: &Request) -> Option<Request> {
+    let via = invite.via_header().ok()?.clone();
+    let from = invite.from_header().ok()?.clone();
+    let to = invite.to_header().ok()?.clone();
+    let call_id = invite.call_id_header().ok()?.clone();
+    let seq = cseq_of(invite);
+
+    let mut headers = Headers::default();
+    headers.push(Header::Via(via));
+    headers.push(Header::MaxForwards(rsip::headers::MaxForwards::default()));
+    headers.push(Header::From(from));
+    headers.push(Header::To(to));
+    headers.push(Header::CallId(call_id));
+    headers.push(Header::CSeq(
+        rsip::typed::CSeq {
+            seq,
+            method: Method::Cancel,
+        }
+        .into(),
+    ));
+    headers.push(Header::ContentLength(
+        rsip::headers::ContentLength::default(),
+    ));
+
+    Some(Request {
+        method: Method::Cancel,
+        uri: invite.uri.clone(),
+        version: rsip::Version::V2,
+        headers,
+        body: Vec::new(),
+    })
+}
+
 pub(crate) fn cseq_of(request: &Request) -> u32 {
     request
         .cseq_header()
@@ -171,6 +210,38 @@ mod tests {
         cfg.extra_headers = vec![Header::Supported("timer".into())];
         let invite = build_invite(&cfg, 1, "127.0.0.1:5060".parse().unwrap());
         assert!(invite.to_string().contains("Supported: timer"));
+    }
+
+    #[test]
+    fn build_cancel_matches_invite_branch_and_cseq() {
+        let cfg = config();
+        let invite = build_invite(&cfg, 4, "127.0.0.1:5060".parse().unwrap());
+        let cancel = build_cancel(&invite).expect("cancel built");
+
+        assert_eq!(*cancel.method(), Method::Cancel);
+        // Same Request-URI and same top Via branch as the INVITE (hop-by-hop).
+        assert_eq!(cancel.uri, invite.uri);
+        let inv_branch = invite
+            .via_header()
+            .unwrap()
+            .typed()
+            .unwrap()
+            .branch()
+            .unwrap()
+            .to_string();
+        let can_branch = cancel
+            .via_header()
+            .unwrap()
+            .typed()
+            .unwrap()
+            .branch()
+            .unwrap()
+            .to_string();
+        assert_eq!(can_branch, inv_branch, "CANCEL reuses the INVITE branch");
+        // Same CSeq number, method CANCEL.
+        let cseq = cancel.cseq_header().unwrap().typed().unwrap();
+        assert_eq!(cseq.seq, 4);
+        assert_eq!(cseq.method, Method::Cancel);
     }
 
     #[test]

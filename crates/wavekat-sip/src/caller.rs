@@ -13,6 +13,7 @@ use std::sync::Arc;
 use rsip::{Header, Uri};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::account::SipAccount;
@@ -287,6 +288,23 @@ impl Caller {
     /// single `401`/`407` challenge. Returns the [`Call`] on a 2xx, or an error
     /// if the call was rejected, timed out, or had no usable SDP answer.
     pub async fn dial(&self, target: Uri) -> Result<Call, BoxError> {
+        self.dial_inner(target, &CancellationToken::new()).await
+    }
+
+    /// Like [`Caller::dial`], but `cancel` aborts a still-ringing call with a
+    /// `CANCEL` (RFC 3261 §9). Firing the token once a provisional has arrived
+    /// tears the pending INVITE down; the returned error then reflects the
+    /// `487 Request Terminated`. Use `cancel.is_cancelled()` to tell a
+    /// cancellation apart from a callee rejection.
+    pub async fn dial_cancellable(
+        &self,
+        target: Uri,
+        cancel: &CancellationToken,
+    ) -> Result<Call, BoxError> {
+        self.dial_inner(target, cancel).await
+    }
+
+    async fn dial_inner(&self, target: Uri, cancel: &CancellationToken) -> Result<Call, BoxError> {
         let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
         let local_rtp_addr = rtp_socket.local_addr()?;
         let local_ip = self.endpoint.local_ip();
@@ -328,7 +346,7 @@ impl Caller {
         match self
             .endpoint
             .ua()
-            .call(&cfg, self.endpoint.server(), 1)
+            .call_cancellable(&cfg, self.endpoint.server(), 1, cancel)
             .await
         {
             CallOutcome::Answered { dialog, response } => {
