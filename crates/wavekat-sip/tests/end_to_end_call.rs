@@ -130,3 +130,88 @@ async fn dial_accept_hangup_over_loopback() {
 
     cancel.cancel();
 }
+
+/// When a `Call` opts in via `inbound_requests`, the endpoint stops
+/// auto-answering that dialog's re-INVITE / INFO and surfaces them instead — so
+/// the *only* way the peer gets a 200 is the consumer answering. This drives
+/// the callee-initiated direction: the callee sends INFO + a hold re-INVITE,
+/// the caller's stream receives both and answers them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opted_in_call_receives_inbound_in_dialog_requests() {
+    use std::sync::{Arc, Mutex};
+    use wavekat_sip::re_exports::Method;
+
+    let cancel = CancellationToken::new();
+
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    let callee_port = callee.local_addr().port();
+
+    let caller_account = account("127.0.0.1", callee_port);
+    let caller_ep = SipEndpoint::new(&caller_account, cancel.clone())
+        .await
+        .expect("bind caller");
+
+    let callee_for_task = callee.clone();
+    let accepted = tokio::spawn(async move {
+        let incoming = callee_for_task
+            .next_incoming_call()
+            .await
+            .expect("inbound call arrives");
+        incoming.accept().await.expect("accept inbound call")
+    });
+
+    let caller = Caller::new(caller_account, caller_ep.clone());
+    let target: Uri = "sip:1001@127.0.0.1".try_into().unwrap();
+    let call = timeout(Duration::from_secs(10), caller.dial(target))
+        .await
+        .expect("dial completes within 10s")
+        .expect("call is answered");
+
+    let mut callee_call = timeout(Duration::from_secs(10), accepted)
+        .await
+        .expect("accept finishes within 10s")
+        .expect("accept task did not panic");
+
+    // Caller opts in and answers every inbound in-dialog request, recording the
+    // methods it saw.
+    let mut inbound = call.inbound_requests();
+    let seen = Arc::new(Mutex::new(Vec::<Method>::new()));
+    let seen_in_task = seen.clone();
+    let responder = tokio::spawn(async move {
+        while let Some(req) = inbound.recv().await {
+            seen_in_task.lock().unwrap().push(*req.method());
+            req.ok().await;
+        }
+    });
+
+    // Callee sends INFO to the caller; it must be answered by the responder.
+    let outcome = timeout(
+        Duration::from_secs(10),
+        callee_call.send_dtmf_info(DtmfDigit::D7, 120),
+    )
+    .await
+    .expect("INFO completes within 10s");
+    assert!(outcome.is_accepted(), "surfaced INFO answered: {outcome:?}");
+
+    // Callee holds the caller via a re-INVITE; the responder answers that too.
+    timeout(Duration::from_secs(10), callee_call.set_hold(true))
+        .await
+        .expect("hold re-INVITE completes within 10s")
+        .expect("surfaced re-INVITE answered");
+
+    let methods = seen.lock().unwrap().clone();
+    assert!(
+        methods.contains(&Method::Info),
+        "caller's stream saw the INFO: {methods:?}"
+    );
+    assert!(
+        methods.contains(&Method::Invite),
+        "caller's stream saw the re-INVITE: {methods:?}"
+    );
+
+    responder.abort();
+    cancel.cancel();
+}

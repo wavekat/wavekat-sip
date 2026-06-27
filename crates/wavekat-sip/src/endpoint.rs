@@ -10,8 +10,9 @@
 //!   auto-answered `200 OK`;
 //! - the `ACK` for a 2xx is absorbed.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use rsip::headers::ToTypedHeader;
 use rsip::message::HeadersExt;
@@ -22,13 +23,19 @@ use tracing::{debug, info, warn};
 
 use crate::account::{SipAccount, Transport};
 use crate::callee::IncomingCall;
+use crate::inbound::InboundRequest;
 use crate::resolve::resolve_sip_server;
 use crate::sdp::parse_sdp;
+use crate::stack::dialog::DialogId;
 use crate::stack::response::build_response;
 use crate::stack::transaction::gen_tag;
 use crate::stack::ua::{Incoming, Ua};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Dialogs whose owning [`crate::Call`] has opted in to handle inbound
+/// in-dialog requests itself, mapped to the channel that delivers them.
+type DialogRegistry = Arc<StdMutex<HashMap<DialogId, mpsc::Sender<InboundRequest>>>>;
 
 /// A bound SIP endpoint: the engine, plus inbound-call routing.
 pub struct SipEndpoint {
@@ -39,6 +46,8 @@ pub struct SipEndpoint {
     transport: Transport,
     cancel: CancellationToken,
     incoming_calls: Mutex<mpsc::Receiver<Incoming>>,
+    /// Calls that have opted in to receive their dialog's re-INVITE / INFO.
+    dialogs: DialogRegistry,
 }
 
 impl SipEndpoint {
@@ -73,6 +82,7 @@ impl SipEndpoint {
         info!(%server, "resolved SIP server");
 
         let (calls_tx, calls_rx) = mpsc::channel(16);
+        let dialogs: DialogRegistry = Arc::new(StdMutex::new(HashMap::new()));
         let endpoint = Arc::new(Self {
             ua: ua.clone(),
             account: account.clone(),
@@ -81,16 +91,37 @@ impl SipEndpoint {
             transport: account.transport,
             cancel,
             incoming_calls: Mutex::new(calls_rx),
+            dialogs: dialogs.clone(),
         });
 
-        // Inbound router: new INVITE → calls stream; in-dialog → auto-answer.
+        // Inbound router: new INVITE → calls stream; in-dialog re-INVITE / INFO
+        // → the owning Call if it opted in, else auto-answer.
         tokio::spawn(async move {
             while let Some(inc) = ua.next_incoming().await {
-                route_inbound(&ua, inc, &calls_tx).await;
+                route_inbound(&ua, &dialogs, inc, &calls_tx).await;
             }
         });
 
         Ok(endpoint)
+    }
+
+    /// Register `id` to receive its dialog's inbound re-INVITE / INFO requests.
+    /// Returns the channel they arrive on; until this is called (and while it
+    /// stays registered) those requests are auto-answered `200 OK` instead.
+    pub(crate) fn register_dialog(&self, id: DialogId) -> mpsc::Receiver<InboundRequest> {
+        let (tx, rx) = mpsc::channel(16);
+        if let Ok(mut map) = self.dialogs.lock() {
+            map.insert(id, tx);
+        }
+        rx
+    }
+
+    /// Stop routing `id`'s inbound requests to a Call; they revert to being
+    /// auto-answered.
+    pub(crate) fn unregister_dialog(&self, id: &DialogId) {
+        if let Ok(mut map) = self.dialogs.lock() {
+            map.remove(id);
+        }
     }
 
     /// Local IP this endpoint is bound to.
@@ -146,8 +177,13 @@ impl SipEndpoint {
     }
 }
 
-/// Route one inbound request: new call, in-dialog auto-answer, or drop.
-async fn route_inbound(ua: &Ua, inc: Incoming, calls_tx: &mpsc::Sender<Incoming>) {
+/// Route one inbound request: new call, surface to a Call, auto-answer, or drop.
+async fn route_inbound(
+    ua: &Arc<Ua>,
+    dialogs: &DialogRegistry,
+    inc: Incoming,
+    calls_tx: &mpsc::Sender<Incoming>,
+) {
     let has_to_tag = inc
         .request
         .to_header()
@@ -163,15 +199,34 @@ async fn route_inbound(ua: &Ua, inc: Incoming, calls_tx: &mpsc::Sender<Incoming>
         }
         // The ACK for a 2xx we sent: it confirms our dialog; nothing to reply.
         Method::Ack => debug!("absorbing 2xx ACK"),
-        // Any other in-dialog request (BYE / OPTIONS / INFO / re-INVITE):
-        // acknowledge it so the peer's transaction completes.
-        _ => {
-            if let Some(response) =
-                build_response(&inc.request, StatusCode::OK, Some(&gen_tag()), None, None)
-            {
-                let _ = ua.answer(inc.key, response).await;
+        // In-dialog re-INVITE or INFO: hand to the owning Call if it opted in
+        // to handle these (e.g. answer a session refresh, read INFO DTMF),
+        // otherwise auto-answer so the peer's transaction still completes.
+        Method::Invite | Method::Info => {
+            let sender = DialogId::from_request(&inc.request)
+                .and_then(|id| dialogs.lock().ok().and_then(|map| map.get(&id).cloned()));
+            match sender {
+                Some(sender) => {
+                    let req = InboundRequest::new(ua.clone(), inc.key, inc.request);
+                    if sender.send(req).await.is_err() {
+                        warn!("in-dialog request dropped: Call no longer listening");
+                    }
+                }
+                None => auto_answer_200(ua, inc).await,
             }
         }
+        // Any other in-dialog request (BYE / OPTIONS / …): auto-answer so the
+        // peer's transaction completes.
+        _ => auto_answer_200(ua, inc).await,
+    }
+}
+
+/// Auto-answer an inbound in-dialog request `200 OK` (no body).
+async fn auto_answer_200(ua: &Ua, inc: Incoming) {
+    if let Some(response) =
+        build_response(&inc.request, StatusCode::OK, Some(&gen_tag()), None, None)
+    {
+        let _ = ua.answer(inc.key, response).await;
     }
 }
 

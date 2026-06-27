@@ -12,12 +12,13 @@ use std::sync::Arc;
 
 use rsip::{Header, Uri};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info};
 
 use crate::account::SipAccount;
 use crate::dtmf_info::{build_info_body, classify, content_type_header, InfoOutcome};
 use crate::endpoint::SipEndpoint;
+use crate::inbound::InboundRequest;
 use crate::rtp::dtmf::DtmfDigit;
 use crate::sdp::{build_sdp, build_sdp_with, parse_sdp, MediaDirection, RemoteMedia};
 use crate::session_timer::{
@@ -25,7 +26,7 @@ use crate::session_timer::{
     DEFAULT_SESSION_EXPIRES_SECS,
 };
 use crate::stack::call::{CallConfig, CallOutcome};
-use crate::stack::dialog::Dialog;
+use crate::stack::dialog::{Dialog, DialogId};
 use crate::stack::transaction::gen_tag;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -40,6 +41,8 @@ pub struct Call {
     /// send refresh re-INVITEs / BYE while the call owner drives audio. The
     /// mutex serializes the dialog's CSeq across both.
     dialog: Arc<Mutex<Dialog>>,
+    /// This dialog's identity, used to register for inbound in-dialog requests.
+    dialog_id: DialogId,
     peer: SocketAddr,
     /// `true` once we have put the peer on hold via a `sendonly` re-INVITE.
     held: bool,
@@ -65,9 +68,11 @@ impl Call {
         rtp_socket: Arc<UdpSocket>,
         local_rtp_addr: SocketAddr,
     ) -> Self {
+        let dialog_id = dialog.id();
         Self {
             endpoint,
             dialog: Arc::new(Mutex::new(dialog)),
+            dialog_id,
             peer,
             held: false,
             // The initial offer/answer was o= version 0.
@@ -144,6 +149,25 @@ impl Call {
         }
     }
 
+    /// Opt in to handle this call's inbound in-dialog requests — the peer's
+    /// re-`INVITE`s (e.g. an RFC 4028 session refresh, or a peer-initiated
+    /// hold) and `INFO`s (e.g. SIP-INFO DTMF) — instead of having the endpoint
+    /// auto-answer them `200 OK`.
+    ///
+    /// Returns a stream; each [`InboundRequest`] must be answered (with
+    /// [`InboundRequest::respond`] / [`InboundRequest::ok`]). While the returned
+    /// [`InboundRequests`] is alive, those requests route here; drop it to
+    /// revert to auto-answering. `BYE` / `OPTIONS` are always auto-answered.
+    /// Call this once per [`Call`].
+    pub fn inbound_requests(&self) -> InboundRequests {
+        let rx = self.endpoint.register_dialog(self.dialog_id.clone());
+        InboundRequests {
+            endpoint: self.endpoint.clone(),
+            dialog_id: self.dialog_id.clone(),
+            rx,
+        }
+    }
+
     /// Send one DTMF press via SIP `INFO` (`application/dtmf-relay`).
     ///
     /// Use this only when the remote did not negotiate RFC 4733 — i.e.
@@ -176,6 +200,31 @@ impl Call {
         } else {
             Err("BYE was not acknowledged".into())
         }
+    }
+}
+
+/// A stream of a [`Call`]'s inbound in-dialog requests (peer re-`INVITE` /
+/// `INFO`), produced by [`Call::inbound_requests`].
+///
+/// Dropping it unregisters the dialog, so its inbound requests revert to being
+/// auto-answered `200 OK` by the endpoint.
+pub struct InboundRequests {
+    endpoint: Arc<SipEndpoint>,
+    dialog_id: DialogId,
+    rx: mpsc::Receiver<InboundRequest>,
+}
+
+impl InboundRequests {
+    /// Await the next inbound request, or `None` once the call's endpoint shuts
+    /// down or this stream is being torn down.
+    pub async fn recv(&mut self) -> Option<InboundRequest> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for InboundRequests {
+    fn drop(&mut self) {
+        self.endpoint.unregister_dialog(&self.dialog_id);
     }
 }
 
