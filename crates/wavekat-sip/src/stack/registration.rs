@@ -1,21 +1,17 @@
-//! REGISTER flow on the engine — RFC 3261 §10.
+//! REGISTER request builder + result types — RFC 3261 §10.
 //!
-//! This is the first *composed* flow on the clean-room stack: it drives a
-//! non-INVITE client transaction ([`transaction`](super::transaction)) over
-//! the UDP [`engine`](super::engine), and answers a `401`/`407` challenge with
-//! the digest [`auth`](super::auth) orchestration. It is the logic the
-//! migrated `Registrar` will sit on; here it is exercised end-to-end against a
-//! loopback fake registrar.
+//! Pure composition: `build_register` assembles the request and the
+//! `RegisterConfig`/`RegisterOutcome` types describe the inputs and result.
+//! The driving (send, await, answer a challenge over the shared engine) lives
+//! in [`ua`](super::ua); the digest math is [`auth`](super::auth).
 
 use std::net::SocketAddr;
 
 use rsip::headers::UntypedHeader;
 use rsip::message::HeadersExt;
 use rsip::{Header, Headers, Method, Request, StatusCode, Uri};
-use tokio::sync::mpsc;
 
-use super::auth::{self, Credentials};
-use super::engine::{EngineHandle, Event};
+use super::auth::Credentials;
 use super::transaction::gen_branch;
 
 /// Everything needed to compose a REGISTER and answer a challenge.
@@ -42,6 +38,11 @@ impl RegisterConfig {
             username: &self.username,
             password: &self.password,
         }
+    }
+
+    /// Credentials for answering a challenge (used by the `ua` router).
+    pub(crate) fn creds_for_retry(&self) -> Credentials<'_> {
+        self.creds()
     }
 }
 
@@ -114,78 +115,15 @@ pub(crate) fn build_register(cfg: &RegisterConfig, cseq: u32, local_addr: Socket
     }
 }
 
-/// Drive one registration to completion: send REGISTER, answer a single
-/// `401`/`407` challenge, and report the outcome.
-///
-/// `events` must be the engine's event stream; this flow assumes it is the
-/// only one in flight (the migrated endpoint adds per-transaction routing).
-pub(crate) async fn drive_register(
-    engine: &EngineHandle,
-    peer: SocketAddr,
-    events: &mut mpsc::Receiver<Event>,
-    cfg: &RegisterConfig,
-    first_cseq: u32,
-) -> RegisterOutcome {
-    let mut request = build_register(cfg, first_cseq, engine.local_addr());
-    if !engine.start_client(request.clone(), peer).await {
-        return RegisterOutcome::EngineStopped;
-    }
-    let mut challenged = false;
-
-    loop {
-        let Some(event) = events.recv().await else {
-            return RegisterOutcome::EngineStopped;
-        };
-        match event {
-            Event::Response { response, .. } => {
-                let code = response.status_code().code();
-                if (200..300).contains(&code) {
-                    return RegisterOutcome::Registered {
-                        expires: granted_expires(&response).unwrap_or(cfg.expires),
-                    };
-                }
-                if code == 401 || code == 407 {
-                    if challenged {
-                        // A second challenge means our credentials were rejected.
-                        return RegisterOutcome::Unauthorized;
-                    }
-                    challenged = true;
-                    match auth::build_retry(&request, &response, cfg.creds()) {
-                        Some(retry) => {
-                            request = retry;
-                            if !engine.start_client(request.clone(), peer).await {
-                                return RegisterOutcome::EngineStopped;
-                            }
-                        }
-                        None => return RegisterOutcome::Unauthorized,
-                    }
-                    continue;
-                }
-                return RegisterOutcome::Failed(response.status_code().clone());
-            }
-            Event::TimedOut { .. } => return RegisterOutcome::TimedOut,
-            // Terminated arrives after the final response is delivered; ignore.
-            _ => continue,
-        }
-    }
-}
-
 /// The lifetime the server granted, from the response `Expires` header.
-fn granted_expires(response: &rsip::Response) -> Option<u32> {
+pub(crate) fn granted_expires(response: &rsip::Response) -> Option<u32> {
     response.expires_header()?.seconds().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stack::engine;
-    use crate::stack::transaction::Timers;
-    use crate::stack::transport::UdpTransport;
     use rsip::headers::ToTypedHeader;
-    use rsip::SipMessage;
-    use std::time::Duration;
-    use tokio::time::timeout;
-    use tokio_util::sync::CancellationToken;
 
     fn config() -> RegisterConfig {
         RegisterConfig {
@@ -198,132 +136,6 @@ mod tests {
             username: "alice".into(),
             password: "secret".into(),
         }
-    }
-
-    fn fast_timers() -> Timers {
-        Timers {
-            t1: Duration::from_millis(1),
-            t2: Duration::from_millis(4),
-            t4: Duration::from_millis(5),
-        }
-    }
-
-    /// Reply to a received REGISTER: 401 challenge if it has no Authorization,
-    /// else 200 OK. Returns the granted Expires used in the 200.
-    fn reply(register: &Request, has_auth: bool) -> String {
-        let via = register.via_header().unwrap().to_string();
-        let from = register.from_header().unwrap().to_string();
-        let to = register.to_header().unwrap().to_string();
-        let call_id = register.call_id_header().unwrap().to_string();
-        let cseq = register.cseq_header().unwrap().to_string();
-        if has_auth {
-            format!(
-                "SIP/2.0 200 OK\r\n{via}\r\n{from}\r\n{to};tag=srv\r\n{call_id}\r\n{cseq}\r\n\
-                 Expires: 60\r\nContent-Length: 0\r\n\r\n"
-            )
-        } else {
-            format!(
-                "SIP/2.0 401 Unauthorized\r\n{via}\r\n{from}\r\n{to};tag=srv\r\n{call_id}\r\n{cseq}\r\n\
-                 WWW-Authenticate: Digest realm=\"example.com\", nonce=\"abc123\", qop=\"auth\"\r\n\
-                 Content-Length: 0\r\n\r\n"
-            )
-        }
-    }
-
-    #[tokio::test]
-    async fn register_succeeds_after_digest_challenge() {
-        let cancel = CancellationToken::new();
-        let (handle, mut events) = engine::start_with_timers(
-            "127.0.0.1:0".parse().unwrap(),
-            fast_timers(),
-            cancel.clone(),
-        )
-        .await
-        .unwrap();
-
-        let registrar = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let registrar_addr = registrar.local_addr().unwrap();
-
-        // Fake registrar: challenge the first REGISTER, accept the second.
-        let server = tokio::spawn(async move {
-            // First REGISTER → 401.
-            let (msg, src) = registrar.recv().await.unwrap();
-            let SipMessage::Request(req1) = msg else {
-                panic!("expected REGISTER")
-            };
-            assert!(req1.authorization_header().is_none());
-            let resp: SipMessage = rsip::Response::try_from(reply(&req1, false).as_bytes())
-                .unwrap()
-                .into();
-            registrar.send_to(&resp, src).await.unwrap();
-
-            // Second REGISTER (now authorized) → 200.
-            let (msg, src) = registrar.recv().await.unwrap();
-            let SipMessage::Request(req2) = msg else {
-                panic!("expected REGISTER")
-            };
-            assert!(req2.authorization_header().is_some());
-            let resp: SipMessage = rsip::Response::try_from(reply(&req2, true).as_bytes())
-                .unwrap()
-                .into();
-            registrar.send_to(&resp, src).await.unwrap();
-        });
-
-        let cfg = config();
-        let outcome = timeout(
-            Duration::from_secs(3),
-            drive_register(&handle, registrar_addr, &mut events, &cfg, 1),
-        )
-        .await
-        .expect("register completes");
-
-        assert_eq!(outcome, RegisterOutcome::Registered { expires: 60 });
-        server.await.unwrap();
-        cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn rejected_credentials_yield_unauthorized() {
-        let cancel = CancellationToken::new();
-        let (handle, mut events) = engine::start_with_timers(
-            "127.0.0.1:0".parse().unwrap(),
-            fast_timers(),
-            cancel.clone(),
-        )
-        .await
-        .unwrap();
-        let registrar = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let registrar_addr = registrar.local_addr().unwrap();
-
-        // Always challenge — credentials never accepted.
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (msg, src) = registrar.recv().await.unwrap();
-                let SipMessage::Request(req) = msg else {
-                    panic!("expected REGISTER")
-                };
-                let resp: SipMessage = rsip::Response::try_from(reply(&req, false).as_bytes())
-                    .unwrap()
-                    .into();
-                registrar.send_to(&resp, src).await.unwrap();
-            }
-        });
-
-        let cfg = config();
-        let outcome = timeout(
-            Duration::from_secs(3),
-            drive_register(&handle, registrar_addr, &mut events, &cfg, 1),
-        )
-        .await
-        .expect("register completes");
-
-        assert_eq!(outcome, RegisterOutcome::Unauthorized);
-        server.await.unwrap();
-        cancel.cancel();
     }
 
     #[test]
@@ -344,5 +156,14 @@ mod tests {
             "alicetag"
         );
         assert_eq!(req.expires_header().unwrap().seconds().unwrap(), 60);
+    }
+
+    #[test]
+    fn granted_expires_reads_the_header() {
+        let raw = "SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-x\r\n\
+             From: <sip:a@b>;tag=a\r\nTo: <sip:a@b>;tag=s\r\nCall-ID: c\r\nCSeq: 1 REGISTER\r\n\
+             Expires: 120\r\nContent-Length: 0\r\n\r\n";
+        let resp = rsip::Response::try_from(raw.as_bytes()).unwrap();
+        assert_eq!(granted_expires(&resp), Some(120));
     }
 }

@@ -80,6 +80,20 @@ pub(crate) enum Event {
     Terminated { key: TransactionKey },
 }
 
+impl Event {
+    /// The transaction key this event belongs to, for routing. `None` only for
+    /// [`Event::UnmatchedRequest`], which has no owning transaction.
+    pub(crate) fn key(&self) -> Option<&TransactionKey> {
+        match self {
+            Event::IncomingRequest { key, .. }
+            | Event::Response { key, .. }
+            | Event::TimedOut { key }
+            | Event::Terminated { key } => Some(key),
+            Event::UnmatchedRequest { .. } => None,
+        }
+    }
+}
+
 /// Handle the TU uses to drive a running engine.
 pub(crate) struct EngineHandle {
     cmd_tx: mpsc::Sender<Command>,
