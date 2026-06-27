@@ -25,3 +25,4 @@ Two kinds of documents live here:
 | [05-dtmf-receive.md](05-dtmf-receive.md) | DTMF receiving: decoding incoming telephone-event packets |
 | [06-srv-lookup.md](06-srv-lookup.md) | RFC 3263 SRV-based server location |
 | [07-session-timers.md](07-session-timers.md) | RFC 4028 session timers |
+| [08-own-sip-stack.md](08-own-sip-stack.md) | Clean-room SIP transaction/dialog/transport engine as an internal `stack` module |
