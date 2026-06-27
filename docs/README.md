@@ -29,3 +29,4 @@ Two kinds of documents live here:
 | [09-stack-transactions.md](09-stack-transactions.md) | `stack` engine Phase 1: the RFC 3261 §17 transaction state machines (sans-IO) |
 | [10-stack-transport-engine.md](10-stack-transport-engine.md) | `stack` engine Phase 2: UDP transport + the async runner that drives the §17 machines |
 | [11-stack-auth.md](11-stack-auth.md) | `stack` engine Phase 3: digest authentication challenge→retry orchestration |
+| [12-stack-dialog.md](12-stack-dialog.md) | `stack` engine Phase 4: RFC 3261 §12 dialogs + route-set reuse (the bug fix) |
