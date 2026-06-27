@@ -161,6 +161,9 @@ pub mod resolve;
 pub mod rtp;
 pub mod sdp;
 pub mod session_timer;
+// Internal clean-room SIP engine (see `docs/08-own-sip-stack.md`). Entirely
+// `pub(crate)`: it never appears in this crate's public API.
+pub(crate) mod stack;
 
 pub use account::{SipAccount, Transport};
 pub use callee::{AcceptedCall, Callee, PendingCall};
