@@ -123,6 +123,15 @@ async fn caller_dial_confirms_with_remote_media() {
         0,
         "local_rtp_addr should be bound"
     );
+    // Regression: the advertised RTP address must be Alice's real local IP,
+    // not the `0.0.0.0` wildcard the socket binds to. Hold/resume re-offers
+    // reuse this address, and `c=0.0.0.0` is the legacy RFC 2543 hold signal
+    // — a peer reading it stops sending media even on a `sendrecv` resume.
+    assert_eq!(
+        accepted.local_rtp_addr.ip(),
+        caller_ep.local_ip(),
+        "local_rtp_addr must advertise the real local IP, not 0.0.0.0"
+    );
 
     // Alice (UAC) hangs up. The BYE comes from the UAC, so both sides
     // see Terminated(UacBye). (Symmetry with UacCancel in

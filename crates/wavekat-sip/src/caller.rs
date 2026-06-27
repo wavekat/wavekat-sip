@@ -224,9 +224,13 @@ impl Caller {
         destination: Option<SipAddr>,
     ) -> Result<PendingDial, BoxError> {
         let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let local_rtp_addr = rtp_socket.local_addr()?;
-        let rtp_port = local_rtp_addr.port();
+        let rtp_port = rtp_socket.local_addr()?.port();
         let local_ip = self.endpoint.local_ip();
+        // Advertise the real local IP, not the `0.0.0.0` wildcard bind — the
+        // address is reused for hold/resume re-offers, and `c=0.0.0.0` reads
+        // as legacy RFC 2543 hold and stops the peer's media. See
+        // `AcceptedCall::accept` for the full rationale.
+        let local_rtp_addr = SocketAddr::new(local_ip, rtp_port);
         info!(local_ip = %local_ip, rtp_port, "bound RTP socket for outbound dial");
 
         let offer = build_sdp(local_ip, rtp_port);

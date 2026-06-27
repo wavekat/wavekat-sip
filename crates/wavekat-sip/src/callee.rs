@@ -159,8 +159,14 @@ impl PendingCall {
     /// `accept` if they want to fail fast.
     pub async fn accept(self) -> Result<AcceptedCall, BoxError> {
         let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let local_rtp_addr = rtp_socket.local_addr()?;
-        let rtp_port = local_rtp_addr.port();
+        let rtp_port = rtp_socket.local_addr()?.port();
+        // Advertise the real local IP, not the `0.0.0.0` wildcard the socket
+        // is bound to. This address is reused for every later re-offer
+        // (hold/resume, session refresh) — and `c=0.0.0.0` is the legacy
+        // RFC 2543 hold signal, so a re-offer carrying it makes the peer stop
+        // sending media even on a `sendrecv` resume. Matches the connection
+        // address used in the initial SDP answer below.
+        let local_rtp_addr = SocketAddr::new(self.local_ip, rtp_port);
         info!(local_ip = %self.local_ip, rtp_port, "bound RTP socket");
 
         let sdp_answer = build_sdp(self.local_ip, rtp_port);
