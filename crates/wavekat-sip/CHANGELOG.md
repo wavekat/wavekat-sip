@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/wavekat/wavekat-sip/compare/v0.1.0...v0.1.1) - 2026-06-28
+
+### Added
+
+- blind call transfer via REFER (RFC 3515) ([#45](https://github.com/wavekat/wavekat-sip/pull/45))
+
 ### Added
 
 - blind call transfer (RFC 3515): `Call::blind_transfer` sends an in-dialog

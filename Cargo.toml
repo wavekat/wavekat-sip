@@ -6,6 +6,6 @@ resolver = "2"
 # Now on the 0.1.x line: a 0.1.x bump signals an API-breaking release,
 # 0.1.(x+1) a compatible one. Downstream consumers pin us via
 # [patch.crates-io] to a specific 0.1.x.
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
