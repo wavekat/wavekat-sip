@@ -294,10 +294,11 @@ async fn route_inbound(
         }
         // The ACK for a 2xx we sent: it confirms our dialog; nothing to reply.
         Method::Ack => debug!("absorbing 2xx ACK"),
-        // In-dialog re-INVITE or INFO: hand to the owning Call if it opted in
-        // to handle these (e.g. answer a session refresh, read INFO DTMF),
-        // otherwise auto-answer so the peer's transaction still completes.
-        Method::Invite | Method::Info => {
+        // In-dialog re-INVITE / INFO / REFER / NOTIFY: hand to the owning Call
+        // if it opted in to handle these (answer a session refresh, read INFO
+        // DTMF, accept/reject an inbound REFER, follow a transfer's NOTIFY
+        // sipfrag), otherwise auto-answer so the peer's transaction completes.
+        Method::Invite | Method::Info | Method::Refer | Method::Notify => {
             let sender = DialogId::from_request(&inc.request).and_then(|id| {
                 routing
                     .dialogs

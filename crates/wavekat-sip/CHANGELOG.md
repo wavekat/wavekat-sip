@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- blind call transfer (RFC 3515): `Call::blind_transfer` sends an in-dialog
+  `REFER` with `Refer-To`; transfer-progress `NOTIFY`s (a `message/sipfrag`
+  status line) arrive on `Call::inbound_requests` and are parsed with
+  `parse_sipfrag_status` / `is_final_sipfrag`. Inbound `REFER` / `NOTIFY` now
+  route to the owning `Call` instead of being auto-answered.
+
 ## [0.1.0](https://github.com/wavekat/wavekat-sip/compare/v0.0.15...v0.1.0) - 2026-06-28
 
 ### Added

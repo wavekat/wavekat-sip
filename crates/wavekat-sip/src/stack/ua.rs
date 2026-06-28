@@ -276,6 +276,21 @@ impl Ua {
         self.send_in_dialog(peer, request).await
     }
 
+    /// Send an in-dialog `REFER` (RFC 3515) carrying `extra_headers` (the
+    /// `Refer-To`, optionally `Referred-By`) and return its final response, or
+    /// `None` on timeout. `REFER` is a non-INVITE request, so no ACK follows its
+    /// `202 Accepted`; the transfer's progress arrives later as in-dialog
+    /// `NOTIFY`s on the same dialog.
+    pub(crate) async fn refer(
+        &self,
+        peer: SocketAddr,
+        dialog: &mut Dialog,
+        extra_headers: Vec<Header>,
+    ) -> Option<Response> {
+        let request = dialog.new_request_with(Method::Refer, extra_headers, Vec::new());
+        self.send_in_dialog(peer, request).await
+    }
+
     /// Have a server transaction send `response` for the request keyed by `key`.
     pub(crate) async fn answer(&self, key: TransactionKey, response: Response) -> bool {
         self.engine.send_response(key, response).await
@@ -726,6 +741,76 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.unwrap().status_code().code(), 200);
+
+        server.await.unwrap();
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn refer_sends_in_dialog_and_returns_202() {
+        let cancel = CancellationToken::new();
+        let ua = Ua::bind_with_timers(
+            "127.0.0.1:0".parse().unwrap(),
+            fast_timers(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Initial INVITE → 200 → ACK.
+            let (m, src) = peer.recv().await.unwrap();
+            let SipMessage::Request(r) = m else { panic!() };
+            assert_eq!(*r.method(), Method::Invite);
+            let h = echo(&r);
+            let ok = format!("SIP/2.0 200 OK\r\n{h}To: <sip:bob@example.com>;tag=b\r\nContact: <sip:bob@{peer_addr}>\r\nContent-Length: 0\r\n\r\n");
+            peer.send_to(&SipMessage::try_from(ok.as_bytes()).unwrap(), src)
+                .await
+                .unwrap();
+            let (m, _) = peer.recv().await.unwrap();
+            assert!(matches!(m, SipMessage::Request(a) if *a.method() == Method::Ack));
+
+            // REFER → 202 Accepted; it carries the Refer-To and is non-INVITE
+            // (no ACK follows).
+            let (m, src) = peer.recv().await.unwrap();
+            let SipMessage::Request(r) = m else { panic!() };
+            assert_eq!(*r.method(), Method::Refer, "expected an in-dialog REFER");
+            assert!(
+                r.to_string().contains("Refer-To: <sip:carol@example.com>"),
+                "REFER must carry the Refer-To target:\n{r}",
+            );
+            let h = echo(&r);
+            let accepted = format!("SIP/2.0 202 Accepted\r\n{h}To: <sip:bob@example.com>;tag=b\r\nContent-Length: 0\r\n\r\n");
+            peer.send_to(&SipMessage::try_from(accepted.as_bytes()).unwrap(), src)
+                .await
+                .unwrap();
+        });
+
+        let outcome = timeout(
+            Duration::from_secs(3),
+            ua.call(&call_config(), peer_addr, 1),
+        )
+        .await
+        .unwrap();
+        let CallOutcome::Answered { dialog, .. } = outcome else {
+            panic!("call should be answered");
+        };
+        let mut dialog = *dialog;
+
+        let refer_to =
+            crate::refer::refer_to_header(&Uri::try_from("sip:carol@example.com").unwrap());
+        let response = timeout(
+            Duration::from_secs(3),
+            ua.refer(peer_addr, &mut dialog, vec![refer_to]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.unwrap().status_code().code(), 202);
 
         server.await.unwrap();
         cancel.cancel();
