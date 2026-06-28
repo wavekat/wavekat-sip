@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use rsip::SipMessage;
 use tokio::net::UdpSocket;
-use tracing::trace;
+use tracing::{debug, trace};
 
 use super::transaction::Reliability;
 
@@ -59,21 +59,38 @@ impl UdpTransport {
     /// Send one SIP message to `dst`.
     pub(crate) async fn send_to(&self, msg: &SipMessage, dst: SocketAddr) -> io::Result<()> {
         let bytes = serialize(msg);
+        debug!(
+            %dst,
+            bytes = bytes.len(),
+            "\n>>> SEND to {dst} >>>\n{}",
+            String::from_utf8_lossy(&bytes).trim_end(),
+        );
         self.socket.send_to(&bytes, dst).await?;
         Ok(())
     }
 
     /// Receive the next parseable SIP message and its source address.
     ///
-    /// Malformed datagrams are dropped (logged at trace) and reception
-    /// continues, so a single bad packet cannot stall the engine.
+    /// Malformed datagrams are dropped (logged at debug — a peer message that
+    /// fails to parse is exactly the kind of thing we want visible when
+    /// debugging) and reception continues, so a single bad packet cannot stall
+    /// the engine.
     pub(crate) async fn recv(&self) -> io::Result<(SipMessage, SocketAddr)> {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             let (n, src) = self.socket.recv_from(&mut buf).await?;
+            debug!(
+                %src,
+                bytes = n,
+                "\n<<< RECV from {src} <<<\n{}",
+                String::from_utf8_lossy(&buf[..n]).trim_end(),
+            );
             match parse(&buf[..n]) {
                 Some(msg) => return Ok((msg, src)),
-                None => trace!(%src, bytes = n, "dropping unparseable datagram"),
+                None => {
+                    trace!(%src, bytes = n, "dropping unparseable datagram");
+                    debug!(%src, bytes = n, "^ datagram above was unparseable; dropped");
+                }
             }
         }
     }

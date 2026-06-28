@@ -320,15 +320,38 @@ async fn route_inbound(
         Method::Bye => {
             let dialog_id = DialogId::from_request(&inc.request);
             auto_answer_200(ua, inc.key, &inc.request).await;
-            if let Some(token) = dialog_id.and_then(|id| {
+            let token = dialog_id.as_ref().and_then(|id| {
                 routing
                     .terminations
                     .lock()
                     .ok()
-                    .and_then(|map| map.get(&id).cloned())
-            }) {
-                debug!("peer BYE — firing call termination");
-                token.cancel();
+                    .and_then(|map| map.get(id).cloned())
+            });
+            match token {
+                Some(token) => {
+                    info!(?dialog_id, "peer BYE — firing call termination");
+                    token.cancel();
+                }
+                // A BYE we 200'd but couldn't tie to a live Call: the dialog
+                // identity on the wire didn't match any registered termination,
+                // so the owning Call never learns the peer hung up and its
+                // consumer is left believing the call is still up. Log loudly —
+                // this is the silent "stuck on the call screen after the far end
+                // hangs up" failure, and the keys are what we need to see why the
+                // match missed (e.g. a gateway tagging the BYE differently).
+                None => {
+                    let known: Vec<DialogId> = routing
+                        .terminations
+                        .lock()
+                        .ok()
+                        .map(|map| map.keys().cloned().collect())
+                        .unwrap_or_default();
+                    warn!(
+                        ?dialog_id,
+                        registered = ?known,
+                        "peer BYE matched no live dialog — call will not tear down from this BYE"
+                    );
+                }
             }
         }
         // The peer cancelled a still-ringing inbound INVITE (RFC 3261 §9.2):
