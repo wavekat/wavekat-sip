@@ -481,6 +481,30 @@ mod tests {
     }
 
     #[test]
+    fn cancel_invite_target_matches_the_invite_key() {
+        // RFC 3261 §9.1: a CANCEL carries the same top-`Via` branch as the
+        // INVITE it cancels. `invite_target` maps a received CANCEL's key onto
+        // that INVITE server transaction so the UAS can 487 it (§9.2). If this
+        // ever drifts, a cancelled INVITE would never be terminated and the
+        // call would ring forever.
+        let invite = request(Method::Invite, "z9hG4bK-cxl", 1);
+        let cancel = request(Method::Cancel, "z9hG4bK-cxl", 1);
+
+        let invite_key = TransactionKey::from_request(&invite).unwrap();
+        let cancel_key = TransactionKey::from_request(&cancel).unwrap();
+
+        // The CANCEL is its own transaction (method kept distinct)...
+        assert_ne!(cancel_key, invite_key);
+        // ...but its target is exactly the INVITE's key.
+        assert_eq!(cancel_key.invite_target(), invite_key);
+        // Branch + sent-by carried over verbatim; only the method is folded.
+        let target = cancel_key.invite_target();
+        assert_eq!(target.branch, cancel_key.branch);
+        assert_eq!(target.sent_by, cancel_key.sent_by);
+        assert_eq!(target.method, Method::Invite);
+    }
+
+    #[test]
     fn different_branches_yield_different_keys() {
         let a = request(Method::Bye, "z9hG4bK-aaa", 2);
         let b = request(Method::Bye, "z9hG4bK-bbb", 2);

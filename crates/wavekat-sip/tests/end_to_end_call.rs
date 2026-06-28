@@ -29,6 +29,50 @@ fn account(server: &str, port: u16) -> SipAccount {
     }
 }
 
+/// A raw INVITE carrying a real G.711 SDP offer, from `peer` to `callee`. Set
+/// `with_contact` for tests that go on to `accept()` — `Dialog::uas` needs the
+/// `Contact` to learn the remote target; omit it when the call only ever rings.
+/// The `Call-ID` is derived from `branch` so the matching `raw_cancel` shares it.
+fn raw_invite(callee: SocketAddr, peer: SocketAddr, branch: &str, with_contact: bool) -> Vec<u8> {
+    let sdp = String::from_utf8(build_sdp("127.0.0.1".parse().unwrap(), 40000)).unwrap();
+    let contact = if with_contact {
+        format!("Contact: <sip:caller@{peer}>\r\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "INVITE sip:1001@{callee} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {peer};branch={branch}\r\n\
+         From: <sip:caller@127.0.0.1>;tag=caller\r\n\
+         To: <sip:1001@127.0.0.1>\r\n\
+         Call-ID: {branch}-call\r\n\
+         CSeq: 1 INVITE\r\n\
+         Max-Forwards: 70\r\n\
+         {contact}\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {len}\r\n\r\n{sdp}",
+        len = sdp.len(),
+    )
+    .into_bytes()
+}
+
+/// A raw CANCEL sharing `branch` (and thus `Call-ID`) with the INVITE it
+/// cancels — the §9.1 correlation the endpoint relies on to 487 the right
+/// transaction.
+fn raw_cancel(callee: SocketAddr, peer: SocketAddr, branch: &str) -> Vec<u8> {
+    format!(
+        "CANCEL sip:1001@{callee} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {peer};branch={branch}\r\n\
+         From: <sip:caller@127.0.0.1>;tag=caller\r\n\
+         To: <sip:1001@127.0.0.1>\r\n\
+         Call-ID: {branch}-call\r\n\
+         CSeq: 1 CANCEL\r\n\
+         Max-Forwards: 70\r\n\
+         Content-Length: 0\r\n\r\n"
+    )
+    .into_bytes()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_accept_hangup_over_loopback() {
     let cancel = CancellationToken::new();
@@ -298,20 +342,12 @@ async fn inbound_cancel_fires_incoming_cancelled_and_487s_the_invite() {
     let branch = "z9hG4bK-cancel-it";
 
     // The INVITE carries a real G.711 SDP offer so the endpoint surfaces it.
-    let sdp = String::from_utf8(build_sdp("127.0.0.1".parse().unwrap(), 40000)).unwrap();
-    let invite = format!(
-        "INVITE sip:1001@{callee_addr} SIP/2.0\r\n\
-         Via: SIP/2.0/UDP {peer_addr};branch={branch}\r\n\
-         From: <sip:caller@127.0.0.1>;tag=caller\r\n\
-         To: <sip:1001@127.0.0.1>\r\n\
-         Call-ID: cancel-test-call\r\n\
-         CSeq: 1 INVITE\r\n\
-         Max-Forwards: 70\r\n\
-         Content-Type: application/sdp\r\n\
-         Content-Length: {}\r\n\r\n{sdp}",
-        sdp.len(),
-    );
-    peer.send_to(invite.as_bytes(), callee_addr).await.unwrap();
+    peer.send_to(
+        &raw_invite(callee_addr, peer_addr, branch, false),
+        callee_addr,
+    )
+    .await
+    .unwrap();
 
     let incoming = timeout(Duration::from_secs(10), callee.next_incoming_call())
         .await
@@ -321,17 +357,7 @@ async fn inbound_cancel_fires_incoming_cancelled_and_487s_the_invite() {
     assert!(!cancelled.is_cancelled(), "must not be cancelled yet");
 
     // The caller hangs up while ringing: a CANCEL sharing the INVITE's branch.
-    let cancel_req = format!(
-        "CANCEL sip:1001@{callee_addr} SIP/2.0\r\n\
-         Via: SIP/2.0/UDP {peer_addr};branch={branch}\r\n\
-         From: <sip:caller@127.0.0.1>;tag=caller\r\n\
-         To: <sip:1001@127.0.0.1>\r\n\
-         Call-ID: cancel-test-call\r\n\
-         CSeq: 1 CANCEL\r\n\
-         Max-Forwards: 70\r\n\
-         Content-Length: 0\r\n\r\n"
-    );
-    peer.send_to(cancel_req.as_bytes(), callee_addr)
+    peer.send_to(&raw_cancel(callee_addr, peer_addr, branch), callee_addr)
         .await
         .unwrap();
 
@@ -366,6 +392,133 @@ async fn inbound_cancel_fires_incoming_cancelled_and_487s_the_invite() {
         saw_487,
         "peer should receive 487 Request Terminated for the INVITE"
     );
+
+    cancel.cancel();
+}
+
+/// A `CANCEL` that races in *after* the INVITE was accepted must not `487` the
+/// now-established call, nor fire `cancelled()`: `accept` unregisters the pending
+/// INVITE, so the late CANCEL is answered `200` and otherwise ignored. Guards the
+/// unregister-on-decision contract — without it, a straggling CANCEL would tear
+/// down a call the user already answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_after_accept_does_not_487_the_established_call() {
+    let cancel = CancellationToken::new();
+
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    let callee_addr: SocketAddr = format!("127.0.0.1:{}", callee.local_addr().port())
+        .parse()
+        .unwrap();
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let branch = "z9hG4bK-late-cancel";
+
+    // Ring, then accept — the INVITE needs a Contact so the dialog can form.
+    peer.send_to(
+        &raw_invite(callee_addr, peer_addr, branch, true),
+        callee_addr,
+    )
+    .await
+    .unwrap();
+    let incoming = timeout(Duration::from_secs(10), callee.next_incoming_call())
+        .await
+        .expect("inbound INVITE arrives within 10s")
+        .expect("inbound call");
+    let cancelled = incoming.cancelled();
+    // Hold the Call so the dialog stays established for the duration.
+    let _call = incoming.accept().await.expect("accept inbound call");
+
+    // A CANCEL now races in on the same branch.
+    peer.send_to(&raw_cancel(callee_addr, peer_addr, branch), callee_addr)
+        .await
+        .unwrap();
+
+    // Drain responses until the wire goes quiet (there is no TU-side 2xx
+    // retransmit, so this terminates). We expect the 200 OK to the INVITE and a
+    // 200 to the CANCEL — and crucially never a 487.
+    let mut saw_200 = false;
+    let mut saw_487 = false;
+    let mut buf = [0u8; 4096];
+    while let Ok(Ok((n, _))) = timeout(Duration::from_millis(600), peer.recv_from(&mut buf)).await {
+        let text = String::from_utf8_lossy(&buf[..n]);
+        let first_line = text.lines().next().unwrap_or_default();
+        if first_line.contains("200") {
+            saw_200 = true;
+        }
+        if first_line.contains("487") {
+            saw_487 = true;
+        }
+    }
+    assert!(
+        saw_200,
+        "the CANCEL (and the INVITE) should be answered 200"
+    );
+    assert!(
+        !saw_487,
+        "a late CANCEL must not 487 an already-accepted call"
+    );
+    assert!(
+        !cancelled.is_cancelled(),
+        "cancelled() must not fire once the call has been accepted"
+    );
+
+    cancel.cancel();
+}
+
+/// A stray `CANCEL` with no INVITE behind it (late duplicate, or a peer bug) is
+/// answered `200` and otherwise a no-op — it must not `487` anything or panic
+/// the router. Guards the `None`-match arm of the §9.2 handling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stray_cancel_is_answered_200_without_487() {
+    let cancel = CancellationToken::new();
+
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    let callee_addr: SocketAddr = format!("127.0.0.1:{}", callee.local_addr().port())
+        .parse()
+        .unwrap();
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+
+    // A CANCEL whose branch was never seen as an INVITE.
+    peer.send_to(
+        &raw_cancel(callee_addr, peer_addr, "z9hG4bK-orphan"),
+        callee_addr,
+    )
+    .await
+    .unwrap();
+
+    // The first response is the 200 to the CANCEL.
+    let mut buf = [0u8; 4096];
+    let (n, _) = timeout(Duration::from_secs(5), peer.recv_from(&mut buf))
+        .await
+        .expect("a response to the stray CANCEL")
+        .unwrap();
+    let first_line = String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        first_line.contains("200"),
+        "stray CANCEL should be answered 200, got: {first_line}"
+    );
+
+    // Nothing else should follow — in particular no 487.
+    if let Ok(Ok((n, _))) = timeout(Duration::from_millis(400), peer.recv_from(&mut buf)).await {
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            !text.contains("487"),
+            "a stray CANCEL must not 487 anything: {text}"
+        );
+    }
 
     cancel.cancel();
 }
