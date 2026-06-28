@@ -27,7 +27,7 @@ use rsip::headers::{ToTypedHeader, UntypedHeader};
 use rsip::message::HeadersExt;
 use rsip::{Header, Headers, Method, Request, Response, Uri};
 
-use super::transaction::gen_branch;
+use super::transaction::{gen_branch, via_value};
 
 /// One end of a dialog: identity (display name + URI) plus its dialog tag.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,8 +215,8 @@ impl Dialog {
         let mut headers = Headers::default();
         // Via sent-by is our own contact address; UDP is our only transport.
         let host = self.local_contact.host_with_port.to_string();
-        headers.push(Header::Via(rsip::headers::Via::new(format!(
-            "SIP/2.0/UDP {host};branch={branch}"
+        headers.push(Header::Via(rsip::headers::Via::new(via_value(
+            &host, &branch,
         ))));
         headers.push(Header::MaxForwards(rsip::headers::MaxForwards::default()));
 
@@ -404,6 +404,17 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(branch.starts_with("z9hG4bK"));
+    }
+
+    #[test]
+    fn in_dialog_request_via_advertises_rport() {
+        // RFC 3581: in-dialog requests (BYE / re-INVITE / INFO) must also carry
+        // rport — this is the path that the peer's BYE travels in reverse, and
+        // it must route back to our public address when we are behind NAT.
+        let mut dialog = Dialog::uac(&invite(), &ok_response(), local_contact()).unwrap();
+        let bye = dialog.new_request(Method::Bye);
+        let via = bye.via_header().unwrap().to_string();
+        assert!(via.contains(";rport"), "in-dialog Via lacks rport: {via}");
     }
 
     #[test]

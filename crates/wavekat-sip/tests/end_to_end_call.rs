@@ -73,6 +73,158 @@ fn raw_cancel(callee: SocketAddr, peer: SocketAddr, branch: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A raw INVITE like [`raw_invite`] but carrying a `Record-Route` — the header a
+/// routing proxy inserts so in-dialog requests traverse it — and always a
+/// `Contact` (the call is accepted). Used to prove the callee's 2xx mirrors the
+/// Record-Route back (RFC 3261 §12.1.1).
+fn raw_invite_via_proxy(
+    callee: SocketAddr,
+    peer: SocketAddr,
+    branch: &str,
+    record_route: &str,
+) -> Vec<u8> {
+    let sdp = String::from_utf8(build_sdp("127.0.0.1".parse().unwrap(), 40000)).unwrap();
+    format!(
+        "INVITE sip:1001@{callee} SIP/2.0\r\n\
+         Record-Route: {record_route}\r\n\
+         Via: SIP/2.0/UDP {peer};branch={branch}\r\n\
+         From: <sip:caller@127.0.0.1>;tag=caller\r\n\
+         To: <sip:1001@127.0.0.1>\r\n\
+         Call-ID: {branch}-call\r\n\
+         CSeq: 1 INVITE\r\n\
+         Max-Forwards: 70\r\n\
+         Contact: <sip:caller@{peer}>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {len}\r\n\r\n{sdp}",
+        len = sdp.len(),
+    )
+    .into_bytes()
+}
+
+/// A raw in-dialog request (`ACK` or `BYE`) addressed to the established dialog:
+/// the peer's `From` tag plus the callee's `To` tag learned from the 2xx. `cseq`
+/// and a `-{method}` branch suffix keep each its own transaction.
+fn raw_in_dialog(
+    method: &str,
+    cseq: u32,
+    callee: SocketAddr,
+    peer: SocketAddr,
+    branch: &str,
+    to_tag: &str,
+) -> Vec<u8> {
+    format!(
+        "{method} sip:1001@{callee} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {peer};branch={branch}-{lower}\r\n\
+         From: <sip:caller@127.0.0.1>;tag=caller\r\n\
+         To: <sip:1001@127.0.0.1>;tag={to_tag}\r\n\
+         Call-ID: {branch}-call\r\n\
+         CSeq: {cseq} {method}\r\n\
+         Max-Forwards: 70\r\n\
+         Content-Length: 0\r\n\r\n",
+        lower = method.to_lowercase(),
+    )
+    .into_bytes()
+}
+
+/// A routing proxy (modeled here by the raw peer itself) inserts a
+/// `Record-Route` into the INVITE. RFC 3261 §12.1.1 requires the callee to
+/// mirror it, verbatim, into its 2xx so the peer's reversed route set (§12.1.2)
+/// sends the terminating BYE back *through the proxy* rather than straight to the
+/// callee's `Contact`. Behind NAT that Contact is a private, unroutable address,
+/// so a dropped Record-Route stranded the peer's BYE and the call never tore down
+/// on remote hangup — the live-gateway bug this guards.
+///
+/// The loopback `remote_bye_*` tests cannot catch it, for two independent
+/// reasons that both have to hold to trigger the bug: with no proxy there is no
+/// Record-Route to drop, and a directly-reachable `Contact` masks the empty
+/// route set even when there is. This test supplies both: a recorded route, and
+/// an assertion on the echo itself rather than on (locally-always-reachable) BYE
+/// delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_record_route_is_echoed_and_inbound_bye_terminates() {
+    let cancel = CancellationToken::new();
+
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    let callee_addr: SocketAddr = format!("127.0.0.1:{}", callee.local_addr().port())
+        .parse()
+        .unwrap();
+
+    // The raw peer doubles as the far-end UAC and the Record-Route'ing proxy:
+    // the route it records points at its own address, params and all.
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let branch = "z9hG4bK-proxy-rr";
+    let record_route = format!("<sip:{peer_addr};lr;did=7d6.33e1>");
+
+    peer.send_to(
+        &raw_invite_via_proxy(callee_addr, peer_addr, branch, &record_route),
+        callee_addr,
+    )
+    .await
+    .unwrap();
+
+    // Callee accepts; hold the Call so the dialog stays established for the BYE.
+    let incoming = timeout(Duration::from_secs(10), callee.next_incoming_call())
+        .await
+        .expect("inbound INVITE arrives within 10s")
+        .expect("inbound call");
+    let callee_call = incoming.accept().await.expect("accept inbound call");
+    let term = callee_call.terminated();
+    assert!(!term.is_cancelled(), "termination must not fire before BYE");
+
+    // The peer (proxy) receives the 200 OK. It MUST echo the Record-Route,
+    // verbatim — the regression assertion; without the fix the 2xx omits it.
+    let mut buf = [0u8; 8192];
+    let ok = loop {
+        let (n, _) = timeout(Duration::from_secs(5), peer.recv_from(&mut buf))
+            .await
+            .expect("a 200 OK to the INVITE")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        if text.starts_with("SIP/2.0 200") {
+            break text;
+        }
+        // Anything else (provisional retransmits, etc.) — keep waiting.
+    };
+    assert!(
+        ok.contains(&format!("Record-Route: {record_route}")),
+        "200 OK must echo the proxy's Record-Route verbatim; got:\n{ok}"
+    );
+
+    // The callee's local tag, from the 2xx `To`, identifies the dialog the BYE
+    // must address.
+    let to_tag = ok
+        .lines()
+        .find_map(|l| l.strip_prefix("To:").and_then(|v| v.split("tag=").nth(1)))
+        .map(|t| t.trim().to_string())
+        .expect("200 OK carries a To-tag");
+
+    // ACK the 2xx, then hang up with an in-dialog BYE — exactly what a UAC sitting
+    // behind the proxy sends once its route set is built from the echoed header.
+    peer.send_to(
+        &raw_in_dialog("ACK", 1, callee_addr, peer_addr, branch, &to_tag),
+        callee_addr,
+    )
+    .await
+    .unwrap();
+    peer.send_to(
+        &raw_in_dialog("BYE", 2, callee_addr, peer_addr, branch, &to_tag),
+        callee_addr,
+    )
+    .await
+    .unwrap();
+
+    // The callee learns of the remote hangup and the dialog tears down.
+    timeout(Duration::from_secs(10), term.cancelled())
+        .await
+        .expect("callee learns of the remote BYE via terminated()");
+
+    cancel.cancel();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_accept_hangup_over_loopback() {
     let cancel = CancellationToken::new();
@@ -316,6 +468,65 @@ async fn remote_bye_fires_call_terminated() {
     timeout(Duration::from_secs(10), term.cancelled())
         .await
         .expect("callee learns of the remote BYE via terminated()");
+
+    cancel.cancel();
+}
+
+/// The reverse of [`remote_bye_fires_call_terminated`]: when the **callee**
+/// hangs up, the **caller**'s [`Call::terminated`](wavekat_sip::Call::terminated)
+/// fires. This is the everyday product case — we place an outbound call and the
+/// far end (a PSTN gateway) ends it — so the caller's own endpoint must route
+/// the inbound BYE to the owning UAC `Call`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn callee_bye_fires_caller_terminated() {
+    let cancel = CancellationToken::new();
+
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    let callee_port = callee.local_addr().port();
+
+    let caller_account = account("127.0.0.1", callee_port);
+    let caller_ep = SipEndpoint::new(&caller_account, cancel.clone())
+        .await
+        .expect("bind caller");
+
+    let callee_for_task = callee.clone();
+    let accepted = tokio::spawn(async move {
+        let incoming = callee_for_task
+            .next_incoming_call()
+            .await
+            .expect("inbound call arrives");
+        incoming.accept().await.expect("accept inbound call")
+    });
+
+    let caller = Caller::new(caller_account, caller_ep.clone());
+    let target: Uri = "sip:1001@127.0.0.1".try_into().unwrap();
+    let call = timeout(Duration::from_secs(10), caller.dial(target))
+        .await
+        .expect("dial completes within 10s")
+        .expect("call is answered");
+
+    let mut callee_call = timeout(Duration::from_secs(10), accepted)
+        .await
+        .expect("accept finishes within 10s")
+        .expect("accept task did not panic");
+
+    // Before the BYE, the caller's termination signal is unfired.
+    let term = call.terminated();
+    assert!(!term.is_cancelled(), "termination must not fire before BYE");
+
+    // Callee hangs up: the caller's router must auto-answer the BYE and fire the
+    // caller's termination signal.
+    timeout(Duration::from_secs(10), callee_call.hangup())
+        .await
+        .expect("hangup completes within 10s")
+        .expect("BYE acknowledged");
+
+    timeout(Duration::from_secs(10), term.cancelled())
+        .await
+        .expect("caller learns of the callee's BYE via terminated()");
 
     cancel.cancel();
 }

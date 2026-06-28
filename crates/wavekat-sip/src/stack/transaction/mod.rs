@@ -287,6 +287,21 @@ pub(crate) fn gen_branch() -> String {
     format!("{MAGIC_COOKIE}{n:x}{seed:x}")
 }
 
+/// Build the `Via` header value for one of our outgoing requests: a UDP
+/// sent-by of `sent_by`, the given transaction `branch`, and a bare `;rport`
+/// (RFC 3581).
+///
+/// `rport` is what lets us be reached behind NAT. Without it, a proxy records
+/// our private sent-by / `Contact` and routes a later in-dialog request (most
+/// importantly the peer's `BYE`) to an address that never arrives — so the call
+/// never tears down on a remote hangup. With it, the proxy stamps `received` /
+/// `rport` from the packet's real source and routes back there instead. The
+/// value is empty in a request (RFC 3581 §3); the server fills it in its
+/// response.
+pub(crate) fn via_value(sent_by: impl std::fmt::Display, branch: &str) -> String {
+    format!("SIP/2.0/UDP {sent_by};rport;branch={branch}")
+}
+
 /// Generate a unique dialog tag (`From`/`To` tag). Like [`gen_branch`] but
 /// without the transaction magic cookie — a tag is just an opaque token.
 pub(crate) fn gen_tag() -> String {
@@ -421,6 +436,35 @@ mod tests {
             m = method,
         );
         Response::try_from(raw.as_bytes()).expect("valid response")
+    }
+
+    #[test]
+    fn via_value_advertises_rport_and_keeps_branch_parseable() {
+        let v = via_value("192.168.1.46:54991", "z9hG4bK-rp");
+        // RFC 3581: the request carries a bare `rport` (no value).
+        assert!(v.contains(";rport"), "Via must advertise rport: {v}");
+        assert!(
+            !v.contains("rport="),
+            "request rport must be valueless: {v}"
+        );
+        assert!(v.contains("branch=z9hG4bK-rp"));
+        assert!(v.contains("192.168.1.46:54991"));
+
+        // Regression: the bare `rport` param must not break branch extraction —
+        // transaction matching keys off the branch, so a request built with this
+        // Via must still yield a key with the right branch.
+        let raw = format!(
+            "BYE sip:bob@example.com SIP/2.0\r\n\
+             Via: {v}\r\n\
+             From: <sip:alice@example.com>;tag=alice\r\n\
+             To: <sip:bob@example.com>;tag=bob\r\n\
+             Call-ID: call-abc\r\n\
+             CSeq: 2 BYE\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        let req = Request::try_from(raw.as_bytes()).expect("valid request");
+        let key = TransactionKey::from_request(&req).expect("branch parses despite bare rport");
+        assert_eq!(key.branch, "z9hG4bK-rp");
     }
 
     #[test]

@@ -32,10 +32,20 @@ pub(crate) fn build_response(
 ) -> Option<Response> {
     let mut headers = Headers::default();
 
-    // Via(s), From, Call-ID, CSeq are echoed verbatim.
+    // Via(s), From, Call-ID, CSeq are echoed verbatim. Record-Route is also
+    // copied unchanged and in order (RFC 3261 §12.1.1): a UAS MUST mirror every
+    // Record-Route from the request into its 2xx so the peer's reversed route
+    // set (§12.1.2) sends in-dialog requests — crucially the terminating BYE —
+    // back through the proxies that recorded themselves, not straight to our
+    // Contact. Behind NAT our Contact is a private address, so dropping these
+    // strands the peer's BYE and the call never tears down on remote hangup.
     for header in request.headers.iter() {
         match header {
-            Header::Via(_) | Header::From(_) | Header::CallId(_) | Header::CSeq(_) => {
+            Header::Via(_)
+            | Header::From(_)
+            | Header::CallId(_)
+            | Header::CSeq(_)
+            | Header::RecordRoute(_) => {
                 headers.push(header.clone());
             }
             _ => {}
@@ -136,6 +146,43 @@ mod tests {
         assert_eq!(resp.cseq_header().unwrap().typed().unwrap().seq, 1);
         assert_eq!(resp.body, b"v=0\r\n");
         assert!(resp.headers.iter().any(|h| matches!(h, Header::Contact(_))));
+    }
+
+    #[test]
+    fn ok_echoes_record_route_in_order() {
+        // RFC 3261 §12.1.1: every Record-Route the proxy chain inserted must be
+        // mirrored into the 2xx, in the same order, so the peer can build its
+        // route set and send the in-dialog BYE back through the proxies. The
+        // 2talk gateway behind a NAT exposed this: without the echo the peer's
+        // BYE targeted our private Contact and the call never tore down.
+        let raw = "INVITE sip:bob@example.com SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-r\r\n\
+             Record-Route: <sip:proxy1.example.com;lr>\r\n\
+             Record-Route: <sip:proxy2.example.com;lr>\r\n\
+             From: <sip:alice@example.com>;tag=alice\r\n\
+             To: <sip:bob@example.com>\r\n\
+             Call-ID: call-r\r\n\
+             CSeq: 1 INVITE\r\n\
+             Content-Length: 0\r\n\r\n";
+        let invite = Request::try_from(raw.as_bytes()).unwrap();
+        let resp = build_response(&invite, StatusCode::OK, Some("srvtag"), None, None).unwrap();
+
+        let record_routes: Vec<String> = resp
+            .headers
+            .iter()
+            .filter_map(|h| match h {
+                Header::RecordRoute(rr) => Some(rr.value().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            record_routes,
+            vec![
+                "<sip:proxy1.example.com;lr>".to_string(),
+                "<sip:proxy2.example.com;lr>".to_string(),
+            ],
+            "2xx must mirror Record-Route values verbatim and in order"
+        );
     }
 
     #[test]

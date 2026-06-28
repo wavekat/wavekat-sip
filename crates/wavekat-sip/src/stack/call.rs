@@ -13,7 +13,7 @@ use rsip::{Header, Headers, Method, Request, StatusCode, Uri};
 
 use super::auth::Credentials;
 use super::dialog::Dialog;
-use super::transaction::gen_branch;
+use super::transaction::{gen_branch, via_value};
 
 /// Everything needed to place a call and answer a challenge.
 pub(crate) struct CallConfig {
@@ -69,9 +69,9 @@ pub(crate) enum CallOutcome {
 /// Compose an INVITE bound to `local_addr`, carrying the SDP offer.
 pub(crate) fn build_invite(cfg: &CallConfig, cseq: u32, local_addr: SocketAddr) -> Request {
     let mut headers = Headers::default();
-    headers.push(Header::Via(rsip::headers::Via::new(format!(
-        "SIP/2.0/UDP {local_addr};branch={}",
-        gen_branch()
+    headers.push(Header::Via(rsip::headers::Via::new(via_value(
+        local_addr,
+        &gen_branch(),
     ))));
     headers.push(Header::MaxForwards(rsip::headers::MaxForwards::default()));
 
@@ -202,6 +202,24 @@ mod tests {
             .headers
             .iter()
             .any(|h| matches!(h, Header::ContentType(_))));
+    }
+
+    #[test]
+    fn build_invite_via_advertises_rport() {
+        // RFC 3581: the INVITE's Via must carry `rport` so a NAT-fronting proxy
+        // learns our public address and can route in-dialog requests back. The
+        // CANCEL clones the INVITE's Via, so it inherits rport for free.
+        let cfg = config();
+        let invite = build_invite(&cfg, 1, "127.0.0.1:5060".parse().unwrap());
+        let via = invite.via_header().unwrap().to_string();
+        assert!(via.contains(";rport"), "INVITE Via lacks rport: {via}");
+
+        let cancel = build_cancel(&invite).expect("cancel built");
+        let cancel_via = cancel.via_header().unwrap().to_string();
+        assert!(
+            cancel_via.contains(";rport"),
+            "CANCEL Via lacks rport: {cancel_via}"
+        );
     }
 
     #[test]

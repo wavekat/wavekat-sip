@@ -12,7 +12,7 @@ use rsip::message::HeadersExt;
 use rsip::{Header, Headers, Method, Request, StatusCode, Uri};
 
 use super::auth::Credentials;
-use super::transaction::gen_branch;
+use super::transaction::{gen_branch, via_value};
 
 /// Everything needed to compose a REGISTER and answer a challenge.
 pub(crate) struct RegisterConfig {
@@ -65,9 +65,9 @@ pub(crate) enum RegisterOutcome {
 /// the given CSeq.
 pub(crate) fn build_register(cfg: &RegisterConfig, cseq: u32, local_addr: SocketAddr) -> Request {
     let mut headers = Headers::default();
-    headers.push(Header::Via(rsip::headers::Via::new(format!(
-        "SIP/2.0/UDP {local_addr};branch={}",
-        gen_branch()
+    headers.push(Header::Via(rsip::headers::Via::new(via_value(
+        local_addr,
+        &gen_branch(),
     ))));
     headers.push(Header::MaxForwards(rsip::headers::MaxForwards::default()));
 
@@ -156,6 +156,11 @@ mod tests {
             "alicetag"
         );
         assert_eq!(req.expires_header().unwrap().seconds().unwrap(), 60);
+        // RFC 3581: REGISTER advertises rport so the registrar binds our public
+        // address — the NAT pinhole that later inbound calls and in-dialog
+        // requests are routed through.
+        let via = req.via_header().unwrap().to_string();
+        assert!(via.contains(";rport"), "REGISTER Via lacks rport: {via}");
     }
 
     #[test]
