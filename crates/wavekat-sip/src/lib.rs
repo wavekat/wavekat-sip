@@ -1,42 +1,38 @@
 //! SIP signaling and RTP transport for voice pipelines.
 //!
 //! `wavekat-sip` is a small, focused toolkit for building softphones, voice
-//! bots, and recording bridges in Rust. It wraps [`rsipstack`] and owns the
-//! wire-level concerns — SIP registration, dialogs, SDP offer/answer, and
-//! RTP framing — while staying out of audio device I/O, codec work, and
-//! call orchestration so it remains light and embeddable.
+//! bots, and recording bridges in Rust. It owns the wire-level concerns — SIP
+//! registration, dialogs, SDP offer/answer, and RTP framing — on a from-scratch
+//! engine (no external SIP stack), while staying out of audio device I/O, codec
+//! work, and call orchestration so it remains light and embeddable.
 //!
-//! [`rsipstack`]: https://crates.io/crates/rsipstack
+//! The SIP transaction/dialog/transport engine is built in-house (see the
+//! `stack` plan in `docs/08-own-sip-stack.md`); only the [`rsip`] crate is used,
+//! for SIP message types. The engine is an internal detail — consumers depend on
+//! `wavekat-sip` alone.
+//!
+//! [`rsip`]: https://crates.io/crates/rsip
 //!
 //! # Scope
 //!
 //! What this crate covers:
 //!
 //! - **SIP signaling** — REGISTER with digest auth and keepalive
-//!   re-registration ([`Registrar`]), shared transport + dialog layer
-//!   ([`SipEndpoint`]).
+//!   re-registration ([`Registrar`]), a bound endpoint with inbound-call
+//!   routing ([`SipEndpoint`]), outbound calls ([`Caller`]), and inbound calls
+//!   ([`IncomingCall`]).
 //! - **SDP** — minimal G.711 (PCMU + PCMA) offer/answer with round-trip
 //!   parsing ([`build_sdp`], [`parse_sdp`]).
-//! - **RTP** — header parser ([`RtpHeader`]), a debug-friendly receive
-//!   loop ([`receive_rtp`]) suitable for transcription, recording, or
-//!   smoke-testing inbound media, and a codec-agnostic send loop
-//!   ([`send_loop`]) that packetizes consumer-supplied payloads onto
-//!   the wire.
+//! - **RTP** — header parser ([`RtpHeader`]), a debug-friendly receive loop
+//!   ([`receive_rtp`]), and a codec-agnostic send loop ([`send_loop`]).
 //!
-//! Explicitly out of scope (push these to the consuming application):
-//!
-//! - Audio device I/O (e.g. `cpal`), codec encode/decode, jitter buffering,
-//!   recording, WAV writing.
-//! - Account persistence (TOML files, system keychain).
-//! - Call orchestration, AI pipeline, business logic.
-//!
-//! Inbound INVITE handling lives in [`Callee`]; outbound INVITEs are
-//! placed via [`Caller`].
+//! Explicitly out of scope (push these to the consuming application): audio
+//! device I/O, codec encode/decode, jitter buffering, recording; account
+//! persistence; call orchestration / AI pipeline / business logic.
 //!
 //! # Quick start: register against a SIP server
 //!
 //! ```no_run
-//! use std::sync::Arc;
 //! use tokio_util::sync::CancellationToken;
 //! use wavekat_sip::{Registrar, SipAccount, SipEndpoint, Transport};
 //!
@@ -53,8 +49,7 @@
 //! };
 //!
 //! let cancel = CancellationToken::new();
-//! let (endpoint, _incoming) = SipEndpoint::new(&account, cancel.clone()).await?;
-//! let endpoint = Arc::new(endpoint);
+//! let endpoint = SipEndpoint::new(&account, cancel.clone()).await?;
 //!
 //! // Expires: 60s, re-register every 50s.
 //! let registrar = Registrar::new(account, endpoint, cancel, 60, 50)?;
@@ -63,10 +58,6 @@
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! The `_incoming` stream returned by [`SipEndpoint::new`] yields inbound
-//! transactions (INVITE, OPTIONS, …). For INVITEs, hand the transaction to
-//! [`Callee::accept_transaction`] or [`Callee::reject_transaction`].
 //!
 //! # Placing an outbound call
 //!
@@ -78,15 +69,27 @@
 //! #     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //! let caller = Caller::new(account, endpoint);
 //! let target: wavekat_sip::re_exports::Uri = "sip:bob@example.com".try_into()?;
-//! let mut pending = caller.dial(target).await?;
+//! let mut call = caller.dial(target).await?;
 //!
-//! // Pump pending.state_rx to render "Dialing…" / "Ringing…" in the UI.
-//! // When you see DialogState::Confirmed, promote to AcceptedDial:
-//! let accepted = pending.on_confirmed().await?;
+//! // Wire RTP to your audio / AI pipeline using call.rtp_socket and
+//! // call.remote_media. Hang up locally with:
+//! call.hangup().await?;
+//! # Ok(())
+//! # }
+//! ```
 //!
-//! // Wire RTP to your audio / AI pipeline using accepted.rtp_socket
-//! // and accepted.remote_media. Hang up locally with:
-//! accepted.dialog.bye().await?;
+//! # Answering inbound calls
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use wavekat_sip::SipEndpoint;
+//!
+//! # async fn run(endpoint: Arc<SipEndpoint>)
+//! #     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! while let Some(incoming) = endpoint.next_incoming_call().await {
+//!     // Inspect incoming.remote_media, then accept (or reject):
+//!     let _call = incoming.accept().await?;
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -100,7 +103,6 @@
 //! let local_ip: IpAddr = Ipv4Addr::new(192, 168, 1, 50).into();
 //! let offer = build_sdp(local_ip, 20000);
 //!
-//! // ... send `offer` in an INVITE, receive an SDP answer ...
 //! let answer = offer.clone(); // simulate a loopback answer
 //! let media = parse_sdp(&answer).expect("valid SDP");
 //! assert_eq!(media.port, 20000);
@@ -108,9 +110,6 @@
 //! ```
 //!
 //! # Reading RTP headers off the wire
-//!
-//! For real receive loops use [`receive_rtp`]; to inspect individual
-//! packets, parse directly:
 //!
 //! ```
 //! use wavekat_sip::RtpHeader;
@@ -131,19 +130,17 @@
 //! | Module          | Purpose                                                        |
 //! |-----------------|----------------------------------------------------------------|
 //! | [`account`]     | Runtime [`SipAccount`] + [`Transport`] enum.                   |
-//! | [`endpoint`]    | [`SipEndpoint`] — bound transport, dialog layer, RX stream.    |
+//! | [`endpoint`]    | [`SipEndpoint`] — bound transport, engine, inbound-call routing.|
 //! | [`registrar`]   | REGISTER + digest auth + keepalive re-registration.            |
 //! | [`resolve`]     | RFC 3263 (subset) server location: SRV + A/AAAA fallback.      |
-//! | [`callee`]      | Inbound INVITE accept/reject helper.                           |
-//! | [`caller`]      | Outbound INVITE / dial-cancel helper.                          |
+//! | [`callee`]      | [`IncomingCall`] — inbound INVITE accept/reject.               |
+//! | [`caller`]      | [`Caller`] outbound dial + the [`Call`] handle.                |
 //! | [`sdp`]         | Minimal G.711 offer/answer build + parse.                      |
 //! | [`rtp`]         | RTP header parser, debug receive loop, codec-agnostic send loop. |
-//! | [`session_timer`] | RFC 4028 session timers — refresh re-INVITEs + expiry watchdog. |
 //!
 //! # Stability
 //!
-//! Pre-1.0. The public API may still shift between minor versions. Pin
-//! an exact version if you need stability today.
+//! Pre-1.0. The public API may still shift between minor versions.
 //!
 //! # License
 //!
@@ -156,20 +153,22 @@ pub mod callee;
 pub mod caller;
 pub mod dtmf_info;
 pub mod endpoint;
+pub mod inbound;
 pub mod registrar;
 pub mod resolve;
 pub mod rtp;
 pub mod sdp;
 pub mod session_timer;
+// Internal clean-room SIP engine (see `docs/08-own-sip-stack.md`). Entirely
+// `pub(crate)`: it never appears in this crate's public API.
+pub(crate) mod stack;
 
 pub use account::{SipAccount, Transport};
-pub use callee::{AcceptedCall, Callee, PendingCall};
-pub use caller::{AcceptedDial, Caller, PendingDial};
-pub use dtmf_info::{
-    build_info_body, content_type_header, send_dtmf_info_client, send_dtmf_info_server,
-    InfoOutcome, CONTENT_TYPE,
-};
-pub use endpoint::{DispatchOutcome, SipEndpoint};
+pub use callee::IncomingCall;
+pub use caller::{Call, CallSession, Caller, InboundRequests};
+pub use dtmf_info::{build_info_body, content_type_header, InfoOutcome};
+pub use endpoint::SipEndpoint;
+pub use inbound::InboundRequest;
 pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use resolve::{order_candidates, resolve_sip_server, SrvRecord};
 pub use rtp::dtmf::{
@@ -178,7 +177,7 @@ pub use rtp::dtmf::{
 };
 pub use rtp::dtmf_recv::{parse_event_payload, DtmfEvent, DtmfEventPayload, DtmfReceiver};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
-pub use sdp::{build_sdp, parse_sdp, RemoteMedia, DTMF_DEFAULT_PT};
+pub use sdp::{build_sdp, build_sdp_with, parse_sdp, MediaDirection, RemoteMedia, DTMF_DEFAULT_PT};
 pub use session_timer::{
     min_se_in, negotiate_uac, negotiate_uas, require_timer_header, session_expires_in,
     session_timer_loop, supported_timer_header, supports_timer, Refresher, SessionDialogOps,
@@ -186,17 +185,10 @@ pub use session_timer::{
     DEFAULT_SESSION_EXPIRES_SECS, MIN_SESSION_EXPIRES_SECS,
 };
 
-/// Re-exports of upstream types that appear in our public API. Pinning
-/// them here lets consumers depend only on `wavekat-sip` without taking
-/// a direct dep on `rsip` / `rsipstack`.
+/// Re-exports of the [`rsip`] message types that appear in our public API.
+/// Pinning them here lets consumers depend only on `wavekat-sip`.
 pub mod re_exports {
     pub use rsip::{Header, Headers, Method, StatusCode, Uri};
-    pub use rsipstack::dialog::dialog::{
-        DialogState, DialogStateReceiver, TerminatedReason, TransactionHandle,
-    };
-    pub use rsipstack::dialog::DialogId;
-    pub use rsipstack::transaction::transaction::Transaction;
-    pub use rsipstack::transport::SipAddr;
 }
 
 /// Short git hash this crate was built from, or `"unknown"` if unavailable.

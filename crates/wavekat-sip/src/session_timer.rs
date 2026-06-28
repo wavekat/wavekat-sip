@@ -31,57 +31,28 @@
 //!
 //! # Wiring it up
 //!
-//! [`crate::Caller`] and [`crate::Callee`] already negotiate for you —
-//! [`crate::AcceptedDial::session_timer`] /
-//! [`crate::AcceptedCall::session_timer`] carry the result. Spawn the
-//! loop after the call confirms:
+//! [`crate::Caller`] and [`crate::IncomingCall`] negotiate for you:
+//! [`crate::Call::session_timer`] carries the result. Drive the loop
+//! against the call's shareable dialog handle
+//! ([`crate::Call::session_handle`]) so it runs alongside the audio path:
 //!
 //! ```ignore
-//! let accepted = pending.on_confirmed().await?;
-//! if let Some(timer) = accepted.session_timer {
-//!     let dialog = accepted.dialog.clone();
-//!     let refreshed = Arc::new(Notify::new());
+//! if let Some(timer) = call.session_timer() {
+//!     let handle = call.session_handle();
+//!     let refreshed = std::sync::Arc::new(tokio::sync::Notify::new());
 //!     let sdp = build_sdp(local_ip, rtp_port); // repeat our offer
-//!     tokio::spawn({
-//!         let refreshed = refreshed.clone();
-//!         let cancel = cancel.clone();
-//!         async move {
-//!             let outcome =
-//!                 session_timer_loop(&dialog, timer, Some(sdp), refreshed, cancel).await;
-//!             tracing::info!(?outcome, "session timer finished");
-//!         }
+//!     tokio::spawn(async move {
+//!         let outcome =
+//!             session_timer_loop(&handle, timer, Some(sdp), refreshed, cancel).await;
+//!         tracing::info!(?outcome, "session timer finished");
 //!     });
 //! }
 //! ```
 //!
-//! When the **peer** is the refresher, its refresh re-INVITEs arrive on
-//! the dialog state stream as `DialogState::Updated(_, request, handle)`
-//! (after routing the transaction through
-//! [`crate::SipEndpoint::dispatch_in_dialog`]). rsipstack does not
-//! auto-answer them — your state pump must reply and then ping the
-//! watchdog:
-//!
-//! ```ignore
-//! DialogState::Updated(_, _request, handle) => {
-//!     let echo = SessionExpires {
-//!         interval_secs: timer.interval_secs,
-//!         refresher: Some(Refresher::Uac), // the peer (that request's UAC) refreshes
-//!     };
-//!     handle
-//!         .respond(
-//!             StatusCode::OK,
-//!             Some(vec![
-//!                 rsip::Header::ContentType("application/sdp".into()),
-//!                 supported_timer_header(),
-//!                 echo.header(),
-//!             ]),
-//!             Some(sdp_answer.clone()),
-//!         )
-//!         .await
-//!         .ok();
-//!     refreshed.notify_one();
-//! }
-//! ```
+//! When the **peer** is the refresher, its refresh re-INVITEs arrive as
+//! inbound in-dialog requests. The consumer answers them with an SDP
+//! answer (echoing `Session-Expires`) and pings `refreshed` so the
+//! watchdog deadline resets.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -89,8 +60,6 @@ use std::time::Duration;
 
 use rsip::prelude::UntypedHeader;
 use rsip::Header;
-use rsipstack::dialog::client_dialog::ClientInviteDialog;
-use rsipstack::dialog::server_dialog::ServerInviteDialog;
 use tokio::select;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -365,8 +334,8 @@ pub fn negotiate_uas(invite_headers: &rsip::Headers) -> Option<UasSessionTimer> 
 /// The dialog operations [`session_timer_loop`] needs, abstracted so
 /// the loop's timing logic stays unit-testable without a live dialog.
 ///
-/// Implemented for [`ClientInviteDialog`] and [`ServerInviteDialog`]
-/// over their `reinvite` / `bye` methods.
+/// Implemented for [`crate::Call`]'s shareable session handle over the
+/// engine's in-dialog re-INVITE / BYE.
 pub trait SessionDialogOps {
     /// Send a session-refresh re-INVITE with the given extra headers
     /// and (typically SDP) body. Returns the final response, or
@@ -379,34 +348,6 @@ pub trait SessionDialogOps {
 
     /// Hang up the dialog with BYE.
     fn send_bye(&self) -> impl Future<Output = Result<(), BoxError>> + Send;
-}
-
-impl SessionDialogOps for ClientInviteDialog {
-    async fn refresh(
-        &self,
-        headers: Vec<Header>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<rsip::Response>, BoxError> {
-        Ok(self.reinvite(Some(headers), body).await?)
-    }
-
-    async fn send_bye(&self) -> Result<(), BoxError> {
-        Ok(self.bye().await?)
-    }
-}
-
-impl SessionDialogOps for ServerInviteDialog {
-    async fn refresh(
-        &self,
-        headers: Vec<Header>,
-        body: Option<Vec<u8>>,
-    ) -> Result<Option<rsip::Response>, BoxError> {
-        Ok(self.reinvite(Some(headers), body).await?)
-    }
-
-    async fn send_bye(&self) -> Result<(), BoxError> {
-        Ok(self.bye().await?)
-    }
 }
 
 /// How [`session_timer_loop`] ended.
@@ -438,8 +379,7 @@ pub enum SessionTimerOutcome {
 /// - Otherwise runs the expiry watchdog: every
 ///   `peer_refreshed.notify_one()` resets the deadline, and if the
 ///   deadline lapses the call is torn down with BYE. The consumer pings
-///   `peer_refreshed` after answering the peer's refresh re-INVITE —
-///   see the module docs for the `DialogState::Updated` wiring.
+///   `peer_refreshed` after answering the peer's refresh re-INVITE.
 ///
 /// All failures are folded into the returned [`SessionTimerOutcome`];
 /// the loop never panics and never returns early without standing the

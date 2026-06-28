@@ -1,158 +1,298 @@
-//! Outbound INVITE handling — symmetric to [`crate::callee`].
+//! Outbound calls and the established-call handle.
 //!
-//! [`Caller::dial`] sends an INVITE in the background and returns a
-//! [`PendingDial`] whose `state_rx` exposes the early dialog states
-//! (`Calling`, `Early`, `Confirmed`, `Terminated`). The consumer pumps
-//! that channel while the UI shows a "Dialing…" / "Ringing…" surface,
-//! then calls [`PendingDial::on_confirmed`] once a 2xx arrives to
-//! collect the negotiated SDP answer plus the bound local RTP socket.
-//!
-//! The local RTP socket is bound **at `dial` time**, not at
-//! `on_confirmed` time, because the SDP offer in the INVITE must carry
-//! a concrete local port. Cancelling the dial or dropping the
-//! [`PendingDial`] frees the socket.
-//!
-//! ## Hanging up a connected call
-//!
-//! [`AcceptedDial::dialog`] is a
-//! [`ClientInviteDialog`]. To hang up locally (user hit "End call"):
-//!
-//! ```ignore
-//! accepted.dialog.bye().await?;
-//! ```
-//!
-//! The dialog state machine then transitions to
-//! `Terminated(_, TerminatedReason::UacBye)` on `state_rx`, so a single
-//! watcher pumping `state_rx` handles both local and remote hangup
-//! through the same code path.
-//!
-//! Audio device I/O, codecs, recording, AI taps — all of those are the
-//! consumer's problem. The `rtp_socket` + `remote_media` +
-//! `local_rtp_addr` triple is the raw plumbing; route frames anywhere.
+//! [`Caller::dial`] binds a local RTP socket, builds the SDP offer, places the
+//! INVITE through the engine (answering a digest challenge if the server
+//! demands one), and on a 2xx returns a [`Call`] — the negotiated remote media
+//! plus the bound RTP socket. Audio device I/O, codecs and recording stay with
+//! the consumer; the `rtp_socket` + `remote_media` + `local_rtp_addr` triple is
+//! the raw plumbing.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use rsipstack::dialog::authenticate::Credential;
-use rsipstack::dialog::client_dialog::ClientInviteDialog;
-use rsipstack::dialog::dialog::{DialogState, DialogStateReceiver};
-use rsipstack::dialog::invitation::{InviteAsyncResult, InviteOption};
-use rsipstack::transport::SipAddr;
+use rsip::{Header, Uri};
 use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::account::SipAccount;
+use crate::dtmf_info::{build_info_body, classify, content_type_header, InfoOutcome};
 use crate::endpoint::SipEndpoint;
-use crate::sdp::{build_sdp, parse_sdp, RemoteMedia};
+use crate::inbound::InboundRequest;
+use crate::rtp::dtmf::DtmfDigit;
+use crate::sdp::{build_sdp, build_sdp_with, parse_sdp, MediaDirection, RemoteMedia};
 use crate::session_timer::{
-    negotiate_uac, supported_timer_header, SessionExpires, SessionTimer,
+    negotiate_uac, supported_timer_header, SessionDialogOps, SessionExpires, SessionTimer,
     DEFAULT_SESSION_EXPIRES_SECS,
 };
+use crate::stack::call::{CallConfig, CallOutcome};
+use crate::stack::dialog::{Dialog, DialogId};
+use crate::stack::transaction::gen_tag;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// SIP-only handles for an outbound call that the remote answered.
+/// An established call: negotiated remote media plus the local RTP socket.
 ///
-/// Symmetric to [`crate::callee::AcceptedCall`] but with a
-/// [`ClientInviteDialog`] (outbound) instead of `ServerInviteDialog`.
-/// The audio plumbing fields are deliberately raw so the consumer can
-/// drop a mic / recorder / AI pipeline onto them without satisfying a
-/// `wavekat-sip` trait.
-pub struct AcceptedDial {
-    /// Client-side dialog. Call `.bye().await` to hang up locally.
-    pub dialog: ClientInviteDialog,
-    /// Where the remote endpoint expects RTP (from the SDP answer).
+/// The same handle is produced by [`Caller::dial`] (outbound) and
+/// [`crate::IncomingCall::accept`] (inbound), so call control is uniform.
+pub struct Call {
+    endpoint: Arc<SipEndpoint>,
+    /// Shared so a background session-timer loop ([`Call::session_handle`]) can
+    /// send refresh re-INVITEs / BYE while the call owner drives audio. The
+    /// mutex serializes the dialog's CSeq across both.
+    dialog: Arc<Mutex<Dialog>>,
+    /// This dialog's identity, used to register for inbound in-dialog requests
+    /// and termination.
+    dialog_id: DialogId,
+    /// Fired when the peer ends the call (an in-dialog `BYE`); surfaced via
+    /// [`Call::terminated`]. Registered with the endpoint at construction.
+    terminated: CancellationToken,
+    peer: SocketAddr,
+    /// `true` once we have put the peer on hold via a `sendonly` re-INVITE.
+    held: bool,
+    /// SDP `o=` version; bumped on every re-offer (RFC 3264 §5).
+    sdp_version: u32,
+    /// The RFC 4028 session timer negotiated at call setup, if any.
+    session_timer: Option<SessionTimer>,
+    /// Where the remote endpoint expects RTP (from the negotiated SDP).
     pub remote_media: RemoteMedia,
     /// Local RTP socket; share via `Arc` to send and receive concurrently.
     pub rtp_socket: Arc<UdpSocket>,
-    /// Local RTP address advertised in the SDP offer.
+    /// Local RTP address advertised in our SDP.
     pub local_rtp_addr: SocketAddr,
-    /// Dialog state updates — re-INVITE acks, BYE, termination reasons.
-    /// Pump this to detect remote hangup.
-    pub state_rx: DialogStateReceiver,
-    /// RFC 4028 session timer negotiated from the 2xx, if the remote
-    /// supports it. Spawn [`crate::session_timer_loop`] with this to
-    /// keep the session refreshed / watched; `None` means the remote
-    /// declined session timers and no timer should run.
-    pub session_timer: Option<SessionTimer>,
 }
 
-/// An outbound INVITE on the wire whose final response has not arrived.
-///
-/// Pump `state_rx` while the UI shows "Dialing…" / "Ringing…":
-///
-/// - `Calling(_)` — early dialog created; provisional or no response yet.
-/// - `Early(_, _)` — provisional 1xx (180/183) received.
-/// - `Confirmed(_)` — remote picked up; call [`on_confirmed`] to get
-///   the [`AcceptedDial`] (parsed SDP answer + bound RTP socket).
-/// - `Terminated(_, reason)` — call ended; see `TerminatedReason`
-///   (`UasBusy`, `UasDecline`, `Timeout`, …).
-///
-/// If the user hits "End" on the dialing screen, call [`cancel`].
-///
-/// [`cancel`]: PendingDial::cancel
-/// [`on_confirmed`]: PendingDial::on_confirmed
-pub struct PendingDial {
-    /// Client-side dialog. Use this for [`cancel`](Self::cancel) and,
-    /// after promotion to [`AcceptedDial`], for `.bye()`.
-    pub dialog: ClientInviteDialog,
-    /// Dialog state updates from the moment the INVITE goes on the wire.
-    pub state_rx: DialogStateReceiver,
-    rtp_socket: Arc<UdpSocket>,
-    local_rtp_addr: SocketAddr,
-    invite_task: JoinHandle<InviteAsyncResult>,
-}
-
-impl PendingDial {
-    /// Send `CANCEL` for the pending INVITE. Idempotent: returns
-    /// `Ok(())` without re-sending if the dialog has already
-    /// confirmed or terminated. Maps to the user hitting "End" on the
-    /// dialing screen.
-    pub async fn cancel(&self) -> Result<(), BoxError> {
-        match self.dialog.state() {
-            DialogState::Confirmed(_, _) | DialogState::Terminated(_, _) => {
-                debug!("cancel on settled dialog; no-op");
-                Ok(())
-            }
-            _ => {
-                self.dialog.cancel().await?;
-                info!("sent CANCEL on outbound INVITE");
-                Ok(())
-            }
+impl Call {
+    pub(crate) fn new(
+        endpoint: Arc<SipEndpoint>,
+        dialog: Dialog,
+        peer: SocketAddr,
+        session_timer: Option<SessionTimer>,
+        remote_media: RemoteMedia,
+        rtp_socket: Arc<UdpSocket>,
+        local_rtp_addr: SocketAddr,
+    ) -> Self {
+        let dialog_id = dialog.id();
+        // Register for the peer-BYE termination signal up front, so a remote
+        // hangup is observable via `Call::terminated` whether or not the call
+        // ever opts into `inbound_requests`.
+        let terminated = endpoint.register_termination(dialog_id.clone());
+        Self {
+            endpoint,
+            dialog: Arc::new(Mutex::new(dialog)),
+            dialog_id,
+            terminated,
+            peer,
+            held: false,
+            // The initial offer/answer was o= version 0.
+            sdp_version: 0,
+            session_timer,
+            remote_media,
+            rtp_socket,
+            local_rtp_addr,
         }
     }
 
-    /// Wait for the INVITE transaction to complete and assemble the
-    /// [`AcceptedDial`] from the negotiated SDP answer plus the
-    /// already-bound local RTP socket.
+    /// Put the peer on hold (`on = true`, `a=sendonly`) or resume the call
+    /// (`on = false`, `a=sendrecv`) by sending an in-dialog re-INVITE with a
+    /// fresh SDP re-offer (RFC 3264 §8.4).
     ///
-    /// Returns an error if the call did not confirm with a 2xx (final
-    /// non-2xx, timeout, transport error). On error the local RTP
-    /// socket is dropped.
-    pub async fn on_confirmed(self) -> Result<AcceptedDial, BoxError> {
-        let (_dialog_id, resp) = self.invite_task.await??;
-        let resp = resp.ok_or_else::<BoxError, _>(|| "INVITE produced no final response".into())?;
-        if resp.status_code.kind() != rsip::StatusCodeKind::Successful {
-            return Err(format!("INVITE did not confirm: status {}", resp.status_code).into());
-        }
-        let remote_media = parse_sdp(&resp.body)?;
-        let session_timer = negotiate_uac(&resp.headers);
-        info!(
-            remote_addr = %remote_media.addr,
-            remote_port = remote_media.port,
-            payload_type = remote_media.payload_type,
-            ?session_timer,
-            "parsed SDP answer",
+    /// The local hold state only flips once the peer accepts the re-INVITE with
+    /// a 2xx; a non-2xx final surfaces the server's reason and leaves the call
+    /// unchanged. The `o=` version is bumped for each re-offer regardless, as
+    /// RFC 3264 requires.
+    pub async fn set_hold(&mut self, on: bool) -> Result<(), BoxError> {
+        let direction = if on {
+            MediaDirection::SendOnly
+        } else {
+            MediaDirection::SendRecv
+        };
+        self.sdp_version += 1;
+        let offer = build_sdp_with(
+            self.endpoint.local_ip(),
+            self.local_rtp_addr.port(),
+            direction,
+            self.sdp_version,
         );
-        Ok(AcceptedDial {
-            dialog: self.dialog,
-            remote_media,
-            rtp_socket: self.rtp_socket,
-            local_rtp_addr: self.local_rtp_addr,
-            state_rx: self.state_rx,
-            session_timer,
-        })
+        let headers = vec![Header::ContentType("application/sdp".into())];
+        let response = {
+            let mut dialog = self.dialog.lock().await;
+            self.endpoint
+                .ua()
+                .reinvite(self.peer, &mut dialog, headers, offer)
+                .await
+        };
+        match response {
+            Some(r) if (200..300).contains(&r.status_code.code()) => {
+                self.held = on;
+                info!(on, "hold state updated via re-INVITE");
+                Ok(())
+            }
+            Some(r) => Err(format!("re-INVITE rejected: {}", r.status_code).into()),
+            None => Err("re-INVITE timed out with no final response".into()),
+        }
+    }
+
+    /// `true` if the call is currently on hold (we sent a `sendonly` re-INVITE
+    /// the peer accepted).
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// The RFC 4028 session timer negotiated when the call was set up, or
+    /// `None` if neither side asked for one. Drive it with
+    /// [`crate::session_timer_loop`] against [`Call::session_handle`].
+    pub fn session_timer(&self) -> Option<SessionTimer> {
+        self.session_timer
+    }
+
+    /// A cloneable handle that sends refresh re-INVITEs / BYE on this call's
+    /// dialog, for running [`crate::session_timer_loop`] in a background task
+    /// alongside the audio path. Shares the dialog with the `Call`, so their
+    /// in-dialog requests serialize correctly.
+    pub fn session_handle(&self) -> CallSession {
+        CallSession {
+            endpoint: self.endpoint.clone(),
+            dialog: self.dialog.clone(),
+            peer: self.peer,
+        }
+    }
+
+    /// Opt in to handle this call's inbound in-dialog requests — the peer's
+    /// re-`INVITE`s (e.g. an RFC 4028 session refresh, or a peer-initiated
+    /// hold) and `INFO`s (e.g. SIP-INFO DTMF) — instead of having the endpoint
+    /// auto-answer them `200 OK`.
+    ///
+    /// Returns a stream; each [`InboundRequest`] must be answered (with
+    /// [`InboundRequest::respond`] / [`InboundRequest::ok`]). While the returned
+    /// [`InboundRequests`] is alive, those requests route here; drop it to
+    /// revert to auto-answering. `BYE` / `OPTIONS` are always auto-answered.
+    /// Call this once per [`Call`].
+    pub fn inbound_requests(&self) -> InboundRequests {
+        let rx = self.endpoint.register_dialog(self.dialog_id.clone());
+        InboundRequests {
+            endpoint: self.endpoint.clone(),
+            dialog_id: self.dialog_id.clone(),
+            rx,
+        }
+    }
+
+    /// A token that fires when the peer ends the call by sending an in-dialog
+    /// `BYE`. The endpoint auto-answers the BYE `200 OK`; this is purely the
+    /// notification. Clone it and `await` [`CancellationToken::cancelled`] in a
+    /// task to drive call teardown (stop audio, finalize a recording). It does
+    /// **not** fire for a local [`Call::hangup`] — the caller already knows.
+    pub fn terminated(&self) -> CancellationToken {
+        self.terminated.clone()
+    }
+
+    /// Send one DTMF press via SIP `INFO` (`application/dtmf-relay`).
+    ///
+    /// Use this only when the remote did not negotiate RFC 4733 — i.e.
+    /// [`RemoteMedia::dtmf_payload_type`] is `None`. When telephone-event is
+    /// available, prefer [`crate::send_dtmf_burst`] over RTP. A
+    /// [`InfoOutcome::UnsupportedMedia`] result means the remote rejects this
+    /// transport too; stop sending further presses on this dialog.
+    pub async fn send_dtmf_info(&mut self, digit: DtmfDigit, duration_ms: u32) -> InfoOutcome {
+        let body = build_info_body(digit, duration_ms).into_bytes();
+        let response = {
+            let mut dialog = self.dialog.lock().await;
+            self.endpoint
+                .ua()
+                .info(self.peer, &mut dialog, vec![content_type_header()], body)
+                .await
+        };
+        classify(response)
+    }
+
+    /// Hang up by sending an in-dialog `BYE`. Returns once the peer 2xxs it
+    /// (or the transaction gives up).
+    pub async fn hangup(&mut self) -> Result<(), BoxError> {
+        let acked = {
+            let mut dialog = self.dialog.lock().await;
+            self.endpoint.ua().hangup(self.peer, &mut dialog).await
+        };
+        if acked {
+            info!("call hung up (BYE acknowledged)");
+            Ok(())
+        } else {
+            Err("BYE was not acknowledged".into())
+        }
+    }
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        // Release the termination registration so the endpoint's table doesn't
+        // grow for the life of the process. (`InboundRequests` similarly
+        // unregisters the dialog on its own drop.)
+        self.endpoint.unregister_termination(&self.dialog_id);
+    }
+}
+
+/// A stream of a [`Call`]'s inbound in-dialog requests (peer re-`INVITE` /
+/// `INFO`), produced by [`Call::inbound_requests`].
+///
+/// Dropping it unregisters the dialog, so its inbound requests revert to being
+/// auto-answered `200 OK` by the endpoint.
+pub struct InboundRequests {
+    endpoint: Arc<SipEndpoint>,
+    dialog_id: DialogId,
+    rx: mpsc::Receiver<InboundRequest>,
+}
+
+impl InboundRequests {
+    /// Await the next inbound request, or `None` once the call's endpoint shuts
+    /// down or this stream is being torn down.
+    pub async fn recv(&mut self) -> Option<InboundRequest> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for InboundRequests {
+    fn drop(&mut self) {
+        self.endpoint.unregister_dialog(&self.dialog_id);
+    }
+}
+
+/// A cloneable session-control handle over a [`Call`]'s dialog.
+///
+/// Produced by [`Call::session_handle`] and consumed by
+/// [`crate::session_timer_loop`]: it implements [`SessionDialogOps`] so the
+/// loop can send refresh re-INVITEs and the tear-down BYE on the shared dialog.
+#[derive(Clone)]
+pub struct CallSession {
+    endpoint: Arc<SipEndpoint>,
+    dialog: Arc<Mutex<Dialog>>,
+    peer: SocketAddr,
+}
+
+impl SessionDialogOps for CallSession {
+    async fn refresh(
+        &self,
+        mut headers: Vec<Header>,
+        body: Option<Vec<u8>>,
+    ) -> Result<Option<rsip::Response>, BoxError> {
+        let body = body.unwrap_or_default();
+        if !body.is_empty() {
+            headers.push(Header::ContentType("application/sdp".into()));
+        }
+        let mut dialog = self.dialog.lock().await;
+        Ok(self
+            .endpoint
+            .ua()
+            .reinvite(self.peer, &mut dialog, headers, body)
+            .await)
+    }
+
+    async fn send_bye(&self) -> Result<(), BoxError> {
+        let mut dialog = self.dialog.lock().await;
+        if self.endpoint.ua().hangup(self.peer, &mut dialog).await {
+            Ok(())
+        } else {
+            Err("BYE was not acknowledged".into())
+        }
     }
 }
 
@@ -168,115 +308,119 @@ impl Caller {
         Self { account, endpoint }
     }
 
-    /// Place an outbound INVITE to `target`. Binds a local RTP socket,
-    /// builds the SDP offer, fires the INVITE in the background, and
-    /// returns a [`PendingDial`] the consumer pumps for state updates.
+    /// Place an outbound call to `target` and wait for it to be answered.
     ///
-    /// The destination is resolved from the account's
-    /// `server`/`port` (typical: a SIP proxy). Use
-    /// [`dial_with_destination`](Self::dial_with_destination) to route
-    /// directly to an explicit address (UA-to-UA, tests).
-    pub async fn dial(&self, target: rsip::Uri) -> Result<PendingDial, BoxError> {
-        let destination = resolve_server(&self.account).await?;
-        self.dial_with_destination(target, destination).await
+    /// Binds a local RTP socket, offers G.711 SDP, sends the INVITE to the
+    /// account's resolved server, follows provisional responses, and answers a
+    /// single `401`/`407` challenge. Returns the [`Call`] on a 2xx, or an error
+    /// if the call was rejected, timed out, or had no usable SDP answer.
+    pub async fn dial(&self, target: Uri) -> Result<Call, BoxError> {
+        self.dial_inner(target, &CancellationToken::new(), None)
+            .await
     }
 
-    /// Like [`dial`](Self::dial) but with an explicit network
-    /// destination override (useful for direct UA-to-UA flows and
-    /// tests where no proxy resolves the target URI).
-    pub async fn dial_with_destination(
+    /// Like [`Caller::dial`], but `cancel` aborts a still-ringing call with a
+    /// `CANCEL` (RFC 3261 §9). Firing the token once a provisional has arrived
+    /// tears the pending INVITE down; the returned error then reflects the
+    /// `487 Request Terminated`. Use `cancel.is_cancelled()` to tell a
+    /// cancellation apart from a callee rejection.
+    pub async fn dial_cancellable(
         &self,
-        target: rsip::Uri,
-        destination: Option<SipAddr>,
-    ) -> Result<PendingDial, BoxError> {
+        target: Uri,
+        cancel: &CancellationToken,
+    ) -> Result<Call, BoxError> {
+        self.dial_inner(target, cancel, None).await
+    }
+
+    /// Like [`Caller::dial_cancellable`], and additionally forwards each
+    /// provisional response status (e.g. [`rsip::StatusCode::Ringing`]) to
+    /// `progress` as it arrives — for a "ringing" UI. The channel closes when
+    /// the call reaches a final response.
+    pub async fn dial_with_progress(
+        &self,
+        target: Uri,
+        cancel: &CancellationToken,
+        progress: mpsc::Sender<rsip::StatusCode>,
+    ) -> Result<Call, BoxError> {
+        self.dial_inner(target, cancel, Some(progress)).await
+    }
+
+    async fn dial_inner(
+        &self,
+        target: Uri,
+        cancel: &CancellationToken,
+        progress: Option<mpsc::Sender<rsip::StatusCode>>,
+    ) -> Result<Call, BoxError> {
         let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
         let local_rtp_addr = rtp_socket.local_addr()?;
-        let rtp_port = local_rtp_addr.port();
         let local_ip = self.endpoint.local_ip();
-        info!(local_ip = %local_ip, rtp_port, "bound RTP socket for outbound dial");
+        info!(%local_ip, rtp_port = local_rtp_addr.port(), "bound RTP socket for outbound dial");
 
-        let offer = build_sdp(local_ip, rtp_port);
+        let offer = build_sdp(local_ip, local_rtp_addr.port());
         debug!("SDP offer:\n{}", String::from_utf8_lossy(&offer));
 
-        let opt = build_invite_option(
-            &self.account,
-            &self.endpoint.sip_addr.addr.to_string(),
+        let from: Uri =
+            format!("sip:{}@{}", self.account.username, self.account.domain).try_into()?;
+        let contact: Uri = format!(
+            "sip:{}@{}",
+            self.account.username,
+            self.endpoint.local_addr()
+        )
+        .try_into()?;
+
+        // Advertise RFC 4028 session-timer support so the answerer can pin a
+        // refresh interval in its 2xx (negotiated below).
+        let cfg = CallConfig {
             target,
-            offer,
-            destination,
-        )?;
-        let (state_sender, state_rx) = self.endpoint.dialog_layer.new_dialog_state_channel();
-        let (dialog, invite_task) = self
+            from,
+            contact,
+            from_tag: gen_tag(),
+            call_id: format!("{}@wavekat.com", gen_tag()),
+            sdp: offer,
+            extra_headers: vec![
+                supported_timer_header(),
+                SessionExpires {
+                    interval_secs: DEFAULT_SESSION_EXPIRES_SECS,
+                    refresher: None,
+                }
+                .header(),
+            ],
+            username: self.account.auth_username().to_string(),
+            password: self.account.password.clone(),
+        };
+
+        match self
             .endpoint
-            .dialog_layer
-            .do_invite_async(opt, state_sender)?;
-        info!("INVITE on the wire");
-
-        Ok(PendingDial {
-            dialog,
-            state_rx,
-            rtp_socket: Arc::new(rtp_socket),
-            local_rtp_addr,
-            invite_task,
-        })
-    }
-}
-
-/// Resolve the account's configured SIP server to a single
-/// [`SipAddr`] via [`crate::resolve::resolve_sip_server`] (RFC 3263
-/// subset: SRV when no explicit port / IP literal, A/AAAA otherwise).
-/// Returns `None` if DNS yields no usable address.
-async fn resolve_server(account: &SipAccount) -> Result<Option<SipAddr>, BoxError> {
-    Ok(crate::resolve::resolve_sip_server(account)
-        .await?
-        .map(SipAddr::from))
-}
-
-/// Compose an [`InviteOption`] from `account` + target. `contact_host`
-/// is the endpoint's bound `host:port` (used for the `Contact` URI).
-fn build_invite_option(
-    account: &SipAccount,
-    contact_host: &str,
-    target: rsip::Uri,
-    offer: Vec<u8>,
-    destination: Option<SipAddr>,
-) -> Result<InviteOption, BoxError> {
-    let caller_uri: rsip::Uri =
-        format!("sip:{}@{}", account.username, account.domain).try_into()?;
-    let contact_uri: rsip::Uri = format!("sip:{}@{}", account.username, contact_host).try_into()?;
-    let credential = Credential {
-        username: account.auth_username().to_string(),
-        password: account.password.clone(),
-        realm: None,
-    };
-    let display_name = if account.display_name.is_empty() {
-        None
-    } else {
-        Some(account.display_name.clone())
-    };
-    Ok(InviteOption {
-        caller_display_name: display_name,
-        caller: caller_uri,
-        callee: target,
-        destination,
-        content_type: Some("application/sdp".into()),
-        offer: Some(offer),
-        contact: contact_uri,
-        credential: Some(credential),
-        // Advertise RFC 4028 session timers: ask for the default 30 min
-        // interval and leave the refresher choice to the answerer (no
-        // `refresher` param). A remote without timer support simply
-        // omits Session-Expires from its 2xx and no timer runs.
-        headers: Some(vec![
-            supported_timer_header(),
-            SessionExpires {
-                interval_secs: DEFAULT_SESSION_EXPIRES_SECS,
-                refresher: None,
+            .ua()
+            .call_cancellable(&cfg, self.endpoint.server(), 1, cancel, progress.as_ref())
+            .await
+        {
+            CallOutcome::Answered { dialog, response } => {
+                let remote_media = parse_sdp(&response.body)?;
+                let session_timer = negotiate_uac(&response.headers);
+                info!(
+                    remote_addr = %remote_media.addr,
+                    remote_port = remote_media.port,
+                    payload_type = remote_media.payload_type,
+                    ?session_timer,
+                    "call answered; parsed SDP answer",
+                );
+                Ok(Call::new(
+                    self.endpoint.clone(),
+                    *dialog,
+                    self.endpoint.server(),
+                    session_timer,
+                    remote_media,
+                    Arc::new(rtp_socket),
+                    local_rtp_addr,
+                ))
             }
-            .header(),
-        ]),
-        ..Default::default()
-    })
+            CallOutcome::Rejected(status) => Err(format!("call rejected: {status}").into()),
+            CallOutcome::Unauthorized => Err("call rejected: authentication failed".into()),
+            CallOutcome::TimedOut => Err("call timed out with no final response".into()),
+            CallOutcome::EngineStopped => Err("engine stopped".into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -298,88 +442,10 @@ mod tests {
     }
 
     #[test]
-    fn build_invite_option_composes_from_account_and_target() {
+    fn caller_holds_account_and_endpoint_inputs() {
+        // Construction is pure; the call path is covered by the stack's
+        // loopback tests (`stack::ua`). Here we just check `new` wiring.
         let acct = test_account();
-        let target: rsip::Uri = "sip:bob@example.com".try_into().unwrap();
-        let opt = build_invite_option(
-            &acct,
-            "192.168.1.50:5060",
-            target.clone(),
-            b"v=0\r\n".to_vec(),
-            None,
-        )
-        .expect("build_invite_option");
-
-        assert_eq!(opt.caller.to_string(), "sip:1001@sip.example.com");
-        assert_eq!(opt.callee, target);
-        assert_eq!(opt.contact.to_string(), "sip:1001@192.168.1.50:5060");
-        assert_eq!(opt.content_type.as_deref(), Some("application/sdp"));
-        assert_eq!(opt.caller_display_name.as_deref(), Some("Office"));
-
-        let cred = opt.credential.expect("credential should be set");
-        assert_eq!(cred.username, "1001");
-        assert_eq!(cred.password, "secret");
-    }
-
-    #[test]
-    fn build_invite_option_uses_auth_username_when_set() {
-        let mut acct = test_account();
-        acct.auth_username = Some("admin".to_string());
-        let target: rsip::Uri = "sip:bob@example.com".try_into().unwrap();
-        let opt = build_invite_option(&acct, "10.0.0.1:5060", target, vec![], None).unwrap();
-        let cred = opt.credential.unwrap();
-        assert_eq!(
-            cred.username, "admin",
-            "credential.username should follow auth_username, not the AOR user"
-        );
-    }
-
-    #[test]
-    fn build_invite_option_omits_display_name_when_empty() {
-        let mut acct = test_account();
-        acct.display_name = String::new();
-        let target: rsip::Uri = "sip:bob@example.com".try_into().unwrap();
-        let opt = build_invite_option(&acct, "10.0.0.1:5060", target, vec![], None).unwrap();
-        assert!(opt.caller_display_name.is_none());
-    }
-
-    #[test]
-    fn build_invite_option_carries_offer_body() {
-        let acct = test_account();
-        let target: rsip::Uri = "sip:bob@example.com".try_into().unwrap();
-        let offer = b"v=0\r\nm=audio 30000 RTP/AVP 0\r\n".to_vec();
-        let opt = build_invite_option(&acct, "10.0.0.1:5060", target, offer.clone(), None).unwrap();
-        assert_eq!(opt.offer.as_deref(), Some(offer.as_slice()));
-    }
-
-    #[test]
-    fn build_invite_option_advertises_session_timers() {
-        let acct = test_account();
-        let target: rsip::Uri = "sip:bob@example.com".try_into().unwrap();
-        let opt = build_invite_option(&acct, "10.0.0.1:5060", target, vec![], None).unwrap();
-        let headers = opt.headers.expect("extra headers should be set");
-
-        let rendered: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
-        assert!(
-            rendered.iter().any(|h| h == "Supported: timer"),
-            "INVITE must advertise Supported: timer, got {rendered:?}"
-        );
-        assert!(
-            rendered
-                .iter()
-                .any(|h| h == &format!("Session-Expires: {DEFAULT_SESSION_EXPIRES_SECS}")),
-            "INVITE must request the default session interval without \
-             pinning a refresher, got {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn build_invite_option_threads_destination() {
-        let acct = test_account();
-        let target: rsip::Uri = "sip:bob@example.com".try_into().unwrap();
-        let dest: SipAddr = "127.0.0.1:5060".parse::<SocketAddr>().unwrap().into();
-        let opt = build_invite_option(&acct, "10.0.0.1:5060", target, vec![], Some(dest.clone()))
-            .unwrap();
-        assert_eq!(opt.destination, Some(dest));
+        assert_eq!(acct.auth_username(), "1001");
     }
 }

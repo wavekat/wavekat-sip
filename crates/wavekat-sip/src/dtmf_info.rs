@@ -5,9 +5,8 @@
 //! hasn't agreed to RFC 4733 — but most legacy PBXes still accept DTMF
 //! via SIP `INFO` requests inside the dialog with the
 //! `application/dtmf-relay` body originally defined by Cisco. This
-//! module builds that body and exposes thin async helpers around
-//! [`rsipstack::dialog::client_dialog::ClientInviteDialog::info`] /
-//! [`rsipstack::dialog::server_dialog::ServerInviteDialog::info`].
+//! module builds that body, classifies the response, and is driven by
+//! [`crate::Call::send_dtmf_info`].
 //!
 //! ## Wire format
 //!
@@ -27,23 +26,18 @@
 //!
 //! ## When to call
 //!
-//! Use [`send_dtmf_info_client`] / [`send_dtmf_info_server`] only
-//! after confirming the remote did not negotiate
-//! `telephone-event/8000`. If RFC 4733 is available, prefer
-//! [`crate::send_dtmf_burst`] — it's what every modern carrier
-//! expects and the wire footprint is smaller. A 415 (Unsupported
-//! Media Type) response from `INFO` means the remote rejects this
-//! transport too; surface it to the user as "this trunk doesn't
-//! accept touch-tones" and stop trying.
+//! Use [`crate::Call::send_dtmf_info`] only after confirming the remote
+//! did not negotiate `telephone-event/8000`. If RFC 4733 is available,
+//! prefer [`crate::send_dtmf_burst`] — it's what every modern carrier
+//! expects and the wire footprint is smaller. A 415 (Unsupported Media
+//! Type) response means the remote rejects this transport too; surface
+//! it to the user as "this trunk doesn't accept touch-tones" and stop
+//! trying ([`InfoOutcome::should_stop`]).
 
 use rsip::{Header, StatusCode};
-use rsipstack::dialog::client_dialog::ClientInviteDialog;
-use rsipstack::dialog::server_dialog::ServerInviteDialog;
 use tracing::warn;
 
 use crate::rtp::dtmf::DtmfDigit;
-
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// MIME type for the DTMF body carried in the `INFO` request.
 pub const CONTENT_TYPE: &str = "application/dtmf-relay";
@@ -51,8 +45,7 @@ pub const CONTENT_TYPE: &str = "application/dtmf-relay";
 /// Build the `application/dtmf-relay` body for one DTMF press.
 ///
 /// Returns a `String` like `"Signal=5\nDuration=160"`. No trailing
-/// newline. The consumer wraps this in `Vec<u8>` to hand to
-/// `dialog.info()`.
+/// newline. The consumer wraps this in `Vec<u8>` to send.
 pub fn build_info_body(digit: DtmfDigit, duration_ms: u32) -> String {
     format!("Signal={}\nDuration={duration_ms}", digit.as_char())
 }
@@ -76,8 +69,7 @@ pub enum InfoOutcome {
     /// The remote returned a non-2xx, non-415 response. Logged but
     /// not retried — same observable effect as packet loss.
     OtherFailure(StatusCode),
-    /// The dialog was not in the confirmed state, so `INFO` could not
-    /// be sent. Common cause: the call has already ended.
+    /// No final response arrived (e.g. the dialog already ended).
     DialogNotConfirmed,
 }
 
@@ -94,7 +86,11 @@ impl InfoOutcome {
     }
 }
 
-fn classify(response: Option<rsip::Response>) -> InfoOutcome {
+/// Classify the engine's in-dialog `INFO` result into an [`InfoOutcome`].
+///
+/// `None` (no final response) maps to [`InfoOutcome::DialogNotConfirmed`];
+/// the common cause is that the call has already ended.
+pub(crate) fn classify(response: Option<rsip::Response>) -> InfoOutcome {
     let Some(r) = response else {
         return InfoOutcome::DialogNotConfirmed;
     };
@@ -111,38 +107,6 @@ fn classify(response: Option<rsip::Response>) -> InfoOutcome {
         warn!(status = %r.status_code, "INFO DTMF failed");
         InfoOutcome::OtherFailure(r.status_code)
     }
-}
-
-/// Send one DTMF press via SIP `INFO` on a client-side (outbound) dialog.
-///
-/// Wraps [`ClientInviteDialog::info`] with the correct
-/// `Content-Type` and body. The dialog must be in the confirmed
-/// state (post-200-OK); calling before answer returns
-/// [`InfoOutcome::DialogNotConfirmed`].
-pub async fn send_dtmf_info_client(
-    dialog: &ClientInviteDialog,
-    digit: DtmfDigit,
-    duration_ms: u32,
-) -> Result<InfoOutcome, BoxError> {
-    let body = build_info_body(digit, duration_ms).into_bytes();
-    let headers = vec![content_type_header()];
-    let response = dialog.info(Some(headers), Some(body)).await?;
-    Ok(classify(response))
-}
-
-/// Send one DTMF press via SIP `INFO` on a server-side (inbound) dialog.
-///
-/// Mirror of [`send_dtmf_info_client`] for the case where we answered
-/// the call rather than placed it.
-pub async fn send_dtmf_info_server(
-    dialog: &ServerInviteDialog,
-    digit: DtmfDigit,
-    duration_ms: u32,
-) -> Result<InfoOutcome, BoxError> {
-    let body = build_info_body(digit, duration_ms).into_bytes();
-    let headers = vec![content_type_header()];
-    let response = dialog.info(Some(headers), Some(body)).await?;
-    Ok(classify(response))
 }
 
 #[cfg(test)]
@@ -183,8 +147,6 @@ mod tests {
     #[test]
     fn content_type_header_is_application_dtmf_relay() {
         let h = content_type_header();
-        // Header serializes to a string; compare against the canonical
-        // form used by Cisco-style DTMF.
         let s = h.to_string();
         assert!(
             s.contains(CONTENT_TYPE),
@@ -194,7 +156,6 @@ mod tests {
 
     #[test]
     fn classify_2xx_response_is_accepted() {
-        // Build a minimal 200 OK and confirm classify() picks Accepted.
         let resp = make_response(200);
         match classify(Some(resp)) {
             InfoOutcome::Accepted(code) => assert_eq!(code.code(), 200),
@@ -222,9 +183,9 @@ mod tests {
 
     #[test]
     fn classify_none_response_is_dialog_not_confirmed() {
-        // The rsipstack `info()` method returns `Ok(None)` when the
-        // dialog isn't confirmed; treat that as a distinct outcome so
-        // the consumer can refresh its UI rather than retry.
+        // The engine returns `None` when no final response arrives; treat
+        // that as a distinct outcome so the consumer can refresh its UI
+        // rather than retry.
         assert!(matches!(classify(None), InfoOutcome::DialogNotConfirmed));
     }
 

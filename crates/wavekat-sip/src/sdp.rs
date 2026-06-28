@@ -10,6 +10,29 @@ use std::net::IpAddr;
 /// boring and predictable.
 pub const DTMF_DEFAULT_PT: u8 = 101;
 
+/// Media direction (RFC 4566 `a=` attribute), used to put a call on hold
+/// and take it off again per RFC 3264 §8.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaDirection {
+    /// Send and receive media — the normal, active state (`a=sendrecv`).
+    SendRecv,
+    /// Send only, do not receive — places the peer on hold (`a=sendonly`).
+    SendOnly,
+    /// Neither send nor receive — a full two-way hold (`a=inactive`).
+    Inactive,
+}
+
+impl MediaDirection {
+    /// The `a=` attribute line value (no `a=` prefix, no CRLF).
+    pub fn attribute(&self) -> &'static str {
+        match self {
+            MediaDirection::SendRecv => "sendrecv",
+            MediaDirection::SendOnly => "sendonly",
+            MediaDirection::Inactive => "inactive",
+        }
+    }
+}
+
 /// Build a minimal SDP body for bidirectional G.711 audio with RFC 4733
 /// telephone-event (DTMF) advertised at payload type 101.
 ///
@@ -18,10 +41,30 @@ pub const DTMF_DEFAULT_PT: u8 = 101;
 /// listed first so the remote still selects PCMU/PCMA as the audio
 /// codec; the 101 entry adds DTMF support without changing the
 /// preferred audio choice.
+///
+/// This is the initial offer/answer: `a=sendrecv` with `o=` version 0.
+/// Re-offers (hold/resume) use [`build_sdp_with`].
 pub fn build_sdp(local_ip: IpAddr, rtp_port: u16) -> Vec<u8> {
+    build_sdp_with(local_ip, rtp_port, MediaDirection::SendRecv, 0)
+}
+
+/// Build the SDP body with an explicit media `direction` and `o=` session
+/// `version`.
+///
+/// RFC 3264 §5 requires every re-offer to keep the same session id but
+/// **increment** the `o=` version; hold/resume re-INVITEs feed the bumped
+/// version here and flip `direction` between [`MediaDirection::SendRecv`]
+/// and [`MediaDirection::SendOnly`]/[`MediaDirection::Inactive`].
+pub fn build_sdp_with(
+    local_ip: IpAddr,
+    rtp_port: u16,
+    direction: MediaDirection,
+    version: u32,
+) -> Vec<u8> {
+    let attr = direction.attribute();
     format!(
         "v=0\r\n\
-         o=wavekat 0 0 IN IP4 {local_ip}\r\n\
+         o=wavekat 0 {version} IN IP4 {local_ip}\r\n\
          s=wavekat-sip\r\n\
          c=IN IP4 {local_ip}\r\n\
          t=0 0\r\n\
@@ -30,7 +73,7 @@ pub fn build_sdp(local_ip: IpAddr, rtp_port: u16) -> Vec<u8> {
          a=rtpmap:8 PCMA/8000\r\n\
          a=rtpmap:{DTMF_DEFAULT_PT} telephone-event/8000\r\n\
          a=fmtp:{DTMF_DEFAULT_PT} 0-15\r\n\
-         a=sendrecv\r\n"
+         a={attr}\r\n"
     )
     .into_bytes()
 }
@@ -145,6 +188,34 @@ mod tests {
         assert!(text.contains("a=rtpmap:8 PCMA/8000\r\n"));
         assert!(text.contains("a=rtpmap:101 telephone-event/8000\r\n"));
         assert!(text.contains("a=fmtp:101 0-15\r\n"));
+    }
+
+    #[test]
+    fn build_sdp_with_sets_direction_and_version() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        let hold =
+            String::from_utf8(build_sdp_with(ip, 5004, MediaDirection::SendOnly, 1)).unwrap();
+        assert!(hold.contains("o=wavekat 0 1 IN IP4 10.0.0.1\r\n"));
+        assert!(hold.contains("a=sendonly\r\n"));
+        assert!(!hold.contains("a=sendrecv\r\n"));
+
+        let resume =
+            String::from_utf8(build_sdp_with(ip, 5004, MediaDirection::SendRecv, 2)).unwrap();
+        assert!(resume.contains("o=wavekat 0 2 IN IP4 10.0.0.1\r\n"));
+        assert!(resume.contains("a=sendrecv\r\n"));
+
+        let inactive =
+            String::from_utf8(build_sdp_with(ip, 5004, MediaDirection::Inactive, 3)).unwrap();
+        assert!(inactive.contains("a=inactive\r\n"));
+    }
+
+    #[test]
+    fn build_sdp_is_sendrecv_version_zero() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let base = String::from_utf8(build_sdp(ip, 5004)).unwrap();
+        assert!(base.contains("o=wavekat 0 0 IN IP4 10.0.0.1\r\n"));
+        assert!(base.contains("a=sendrecv\r\n"));
     }
 
     #[test]
