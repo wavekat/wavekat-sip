@@ -42,8 +42,12 @@ pub struct Call {
     /// send refresh re-INVITEs / BYE while the call owner drives audio. The
     /// mutex serializes the dialog's CSeq across both.
     dialog: Arc<Mutex<Dialog>>,
-    /// This dialog's identity, used to register for inbound in-dialog requests.
+    /// This dialog's identity, used to register for inbound in-dialog requests
+    /// and termination.
     dialog_id: DialogId,
+    /// Fired when the peer ends the call (an in-dialog `BYE`); surfaced via
+    /// [`Call::terminated`]. Registered with the endpoint at construction.
+    terminated: CancellationToken,
     peer: SocketAddr,
     /// `true` once we have put the peer on hold via a `sendonly` re-INVITE.
     held: bool,
@@ -70,10 +74,15 @@ impl Call {
         local_rtp_addr: SocketAddr,
     ) -> Self {
         let dialog_id = dialog.id();
+        // Register for the peer-BYE termination signal up front, so a remote
+        // hangup is observable via `Call::terminated` whether or not the call
+        // ever opts into `inbound_requests`.
+        let terminated = endpoint.register_termination(dialog_id.clone());
         Self {
             endpoint,
             dialog: Arc::new(Mutex::new(dialog)),
             dialog_id,
+            terminated,
             peer,
             held: false,
             // The initial offer/answer was o= version 0.
@@ -169,6 +178,15 @@ impl Call {
         }
     }
 
+    /// A token that fires when the peer ends the call by sending an in-dialog
+    /// `BYE`. The endpoint auto-answers the BYE `200 OK`; this is purely the
+    /// notification. Clone it and `await` [`CancellationToken::cancelled`] in a
+    /// task to drive call teardown (stop audio, finalize a recording). It does
+    /// **not** fire for a local [`Call::hangup`] — the caller already knows.
+    pub fn terminated(&self) -> CancellationToken {
+        self.terminated.clone()
+    }
+
     /// Send one DTMF press via SIP `INFO` (`application/dtmf-relay`).
     ///
     /// Use this only when the remote did not negotiate RFC 4733 — i.e.
@@ -201,6 +219,15 @@ impl Call {
         } else {
             Err("BYE was not acknowledged".into())
         }
+    }
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        // Release the termination registration so the endpoint's table doesn't
+        // grow for the life of the process. (`InboundRequests` similarly
+        // unregisters the dialog on its own drop.)
+        self.endpoint.unregister_termination(&self.dialog_id);
     }
 }
 

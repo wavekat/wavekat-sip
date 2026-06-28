@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use rsip::headers::ToTypedHeader;
 use rsip::message::HeadersExt;
-use rsip::{Method, StatusCode};
+use rsip::{Method, Request, StatusCode};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -28,7 +28,7 @@ use crate::resolve::resolve_sip_server;
 use crate::sdp::parse_sdp;
 use crate::stack::dialog::DialogId;
 use crate::stack::response::build_response;
-use crate::stack::transaction::gen_tag;
+use crate::stack::transaction::{gen_tag, TransactionKey};
 use crate::stack::ua::{Incoming, Ua};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -36,6 +36,26 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Dialogs whose owning [`crate::Call`] has opted in to handle inbound
 /// in-dialog requests itself, mapped to the channel that delivers them.
 type DialogRegistry = Arc<StdMutex<HashMap<DialogId, mpsc::Sender<InboundRequest>>>>;
+
+/// Confirmed dialogs whose owning [`crate::Call`] wants to be told when the
+/// peer ends the call (an in-dialog `BYE`). The endpoint still auto-answers the
+/// BYE `200 OK`; firing the token is how [`crate::Call::terminated`] resolves.
+type TerminationRegistry = Arc<StdMutex<HashMap<DialogId, CancellationToken>>>;
+
+/// A not-yet-accepted inbound INVITE, kept so a later `CANCEL` (which shares the
+/// INVITE's branch, RFC 3261 §9.1) can `487` the INVITE transaction and notify
+/// the waiting [`crate::IncomingCall`]. Keyed by the INVITE's transaction key.
+struct PendingInvite {
+    /// The original INVITE, needed to build the `487 Request Terminated`.
+    invite: Request,
+    /// Fired when a `CANCEL` for this INVITE arrives; surfaced as
+    /// [`crate::IncomingCall::cancelled`].
+    cancel: CancellationToken,
+}
+
+/// Inbound INVITEs awaiting an accept/reject decision, so a racing `CANCEL` can
+/// terminate them. Keyed by the INVITE's transaction key.
+type IncomingRegistry = Arc<StdMutex<HashMap<TransactionKey, PendingInvite>>>;
 
 /// A bound SIP endpoint: the engine, plus inbound-call routing.
 pub struct SipEndpoint {
@@ -48,6 +68,10 @@ pub struct SipEndpoint {
     incoming_calls: Mutex<mpsc::Receiver<Incoming>>,
     /// Calls that have opted in to receive their dialog's re-INVITE / INFO.
     dialogs: DialogRegistry,
+    /// Confirmed calls waiting to be told the peer hung up (in-dialog `BYE`).
+    terminations: TerminationRegistry,
+    /// Inbound INVITEs not yet accepted/rejected, for `CANCEL` handling.
+    incoming_invites: IncomingRegistry,
 }
 
 impl SipEndpoint {
@@ -83,6 +107,8 @@ impl SipEndpoint {
 
         let (calls_tx, calls_rx) = mpsc::channel(16);
         let dialogs: DialogRegistry = Arc::new(StdMutex::new(HashMap::new()));
+        let terminations: TerminationRegistry = Arc::new(StdMutex::new(HashMap::new()));
+        let incoming_invites: IncomingRegistry = Arc::new(StdMutex::new(HashMap::new()));
         let endpoint = Arc::new(Self {
             ua: ua.clone(),
             account: account.clone(),
@@ -92,13 +118,21 @@ impl SipEndpoint {
             cancel,
             incoming_calls: Mutex::new(calls_rx),
             dialogs: dialogs.clone(),
+            terminations: terminations.clone(),
+            incoming_invites: incoming_invites.clone(),
         });
 
         // Inbound router: new INVITE → calls stream; in-dialog re-INVITE / INFO
-        // → the owning Call if it opted in, else auto-answer.
+        // → the owning Call if it opted in, else auto-answer; BYE → fire the
+        // owning Call's termination signal; CANCEL → 487 the pending INVITE.
         tokio::spawn(async move {
+            let routing = Routing {
+                dialogs,
+                terminations,
+                incoming_invites,
+            };
             while let Some(inc) = ua.next_incoming().await {
-                route_inbound(&ua, &dialogs, inc, &calls_tx).await;
+                route_inbound(&ua, &routing, inc, &calls_tx).await;
             }
         });
 
@@ -121,6 +155,53 @@ impl SipEndpoint {
     pub(crate) fn unregister_dialog(&self, id: &DialogId) {
         if let Ok(mut map) = self.dialogs.lock() {
             map.remove(id);
+        }
+    }
+
+    /// Register `id` to be told when the peer ends the call (an in-dialog
+    /// `BYE`). Returns a token the endpoint cancels on BYE; the BYE itself is
+    /// still auto-answered. Called once per [`crate::Call`] at setup.
+    pub(crate) fn register_termination(&self, id: DialogId) -> CancellationToken {
+        let token = CancellationToken::new();
+        if let Ok(mut map) = self.terminations.lock() {
+            map.insert(id, token.clone());
+        }
+        token
+    }
+
+    /// Drop a dialog's termination registration (on [`crate::Call`] drop).
+    pub(crate) fn unregister_termination(&self, id: &DialogId) {
+        if let Ok(mut map) = self.terminations.lock() {
+            map.remove(id);
+        }
+    }
+
+    /// Register a not-yet-accepted inbound INVITE so a racing `CANCEL` can
+    /// `487` it. Returns a token cancelled if that CANCEL arrives. Cleared by
+    /// [`Self::unregister_incoming`] once the call is accepted or rejected.
+    pub(crate) fn register_incoming(
+        &self,
+        key: TransactionKey,
+        invite: Request,
+    ) -> CancellationToken {
+        let token = CancellationToken::new();
+        if let Ok(mut map) = self.incoming_invites.lock() {
+            map.insert(
+                key,
+                PendingInvite {
+                    invite,
+                    cancel: token.clone(),
+                },
+            );
+        }
+        token
+    }
+
+    /// Drop a pending-INVITE registration once it is accepted or rejected, so a
+    /// late `CANCEL` no longer tries to `487` an answered call.
+    pub(crate) fn unregister_incoming(&self, key: &TransactionKey) {
+        if let Ok(mut map) = self.incoming_invites.lock() {
+            map.remove(key);
         }
     }
 
@@ -151,12 +232,17 @@ impl SipEndpoint {
             let incoming = self.incoming_calls.lock().await.recv().await?;
             match parse_sdp(&incoming.request.body) {
                 Ok(remote_media) => {
+                    // Register the INVITE so a CANCEL before the call is
+                    // accepted/rejected `487`s it and cancels this token.
+                    let cancelled =
+                        self.register_incoming(incoming.key.clone(), incoming.request.clone());
                     return Some(IncomingCall::new(
                         self.clone(),
                         incoming.key,
                         incoming.peer,
                         incoming.request,
                         remote_media,
+                        cancelled,
                     ));
                 }
                 Err(e) => warn!(error = %e, "inbound INVITE has no usable SDP offer; skipping"),
@@ -177,10 +263,19 @@ impl SipEndpoint {
     }
 }
 
-/// Route one inbound request: new call, surface to a Call, auto-answer, or drop.
+/// The registries the inbound router consults, bundled so the router signature
+/// stays readable.
+struct Routing {
+    dialogs: DialogRegistry,
+    terminations: TerminationRegistry,
+    incoming_invites: IncomingRegistry,
+}
+
+/// Route one inbound request: new call, surface to a Call, auto-answer, fire a
+/// termination, terminate a cancelled INVITE, or drop.
 async fn route_inbound(
     ua: &Arc<Ua>,
-    dialogs: &DialogRegistry,
+    routing: &Routing,
     inc: Incoming,
     calls_tx: &mpsc::Sender<Incoming>,
 ) {
@@ -203,8 +298,13 @@ async fn route_inbound(
         // to handle these (e.g. answer a session refresh, read INFO DTMF),
         // otherwise auto-answer so the peer's transaction still completes.
         Method::Invite | Method::Info => {
-            let sender = DialogId::from_request(&inc.request)
-                .and_then(|id| dialogs.lock().ok().and_then(|map| map.get(&id).cloned()));
+            let sender = DialogId::from_request(&inc.request).and_then(|id| {
+                routing
+                    .dialogs
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(&id).cloned())
+            });
             match sender {
                 Some(sender) => {
                     let req = InboundRequest::new(ua.clone(), inc.key, inc.request);
@@ -212,21 +312,60 @@ async fn route_inbound(
                         warn!("in-dialog request dropped: Call no longer listening");
                     }
                 }
-                None => auto_answer_200(ua, inc).await,
+                None => auto_answer_200(ua, inc.key, &inc.request).await,
             }
         }
-        // Any other in-dialog request (BYE / OPTIONS / …): auto-answer so the
-        // peer's transaction completes.
-        _ => auto_answer_200(ua, inc).await,
+        // The peer ended the call: auto-answer the BYE, then fire the owning
+        // Call's termination signal so `Call::terminated` resolves.
+        Method::Bye => {
+            let dialog_id = DialogId::from_request(&inc.request);
+            auto_answer_200(ua, inc.key, &inc.request).await;
+            if let Some(token) = dialog_id.and_then(|id| {
+                routing
+                    .terminations
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(&id).cloned())
+            }) {
+                debug!("peer BYE — firing call termination");
+                token.cancel();
+            }
+        }
+        // The peer cancelled a still-ringing inbound INVITE (RFC 3261 §9.2):
+        // 200 the CANCEL, 487 the matching INVITE transaction, and notify the
+        // waiting IncomingCall.
+        Method::Cancel => {
+            let invite_key = inc.key.invite_target();
+            auto_answer_200(ua, inc.key, &inc.request).await;
+            let pending = routing
+                .incoming_invites
+                .lock()
+                .ok()
+                .and_then(|mut map| map.remove(&invite_key));
+            if let Some(pending) = pending {
+                if let Some(resp) = build_response(
+                    &pending.invite,
+                    StatusCode::RequestTerminated,
+                    Some(&gen_tag()),
+                    None,
+                    None,
+                ) {
+                    ua.answer(invite_key, resp).await;
+                }
+                debug!("peer CANCEL — 487ed the INVITE, notifying IncomingCall");
+                pending.cancel.cancel();
+            }
+        }
+        // Any other in-dialog request (OPTIONS / …): auto-answer so the peer's
+        // transaction completes.
+        _ => auto_answer_200(ua, inc.key, &inc.request).await,
     }
 }
 
-/// Auto-answer an inbound in-dialog request `200 OK` (no body).
-async fn auto_answer_200(ua: &Ua, inc: Incoming) {
-    if let Some(response) =
-        build_response(&inc.request, StatusCode::OK, Some(&gen_tag()), None, None)
-    {
-        let _ = ua.answer(inc.key, response).await;
+/// Auto-answer an inbound request `200 OK` (no body) on its transaction.
+async fn auto_answer_200(ua: &Ua, key: TransactionKey, request: &Request) {
+    if let Some(response) = build_response(request, StatusCode::OK, Some(&gen_tag()), None, None) {
+        let _ = ua.answer(key, response).await;
     }
 }
 

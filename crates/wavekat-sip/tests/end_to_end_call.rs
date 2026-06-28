@@ -7,12 +7,14 @@
 //! tests: it drives the *public* surface (`SipEndpoint` / `Caller` /
 //! `IncomingCall` / `Call`) exactly as a consumer would.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
+use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use wavekat_sip::re_exports::Uri;
-use wavekat_sip::{Caller, DtmfDigit, SipAccount, SipEndpoint, Transport};
+use wavekat_sip::{build_sdp, Caller, DtmfDigit, SipAccount, SipEndpoint, Transport};
 
 fn account(server: &str, port: u16) -> SipAccount {
     SipAccount {
@@ -213,5 +215,157 @@ async fn opted_in_call_receives_inbound_in_dialog_requests() {
     );
 
     responder.abort();
+    cancel.cancel();
+}
+
+/// A remote `BYE` on an established call fires the callee's
+/// [`Call::terminated`](wavekat_sip::Call::terminated) signal — the endpoint
+/// auto-answers the BYE `200 OK` and notifies the owning `Call` so a consumer
+/// can tear down audio and finalize a recording.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_bye_fires_call_terminated() {
+    let cancel = CancellationToken::new();
+
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    let callee_port = callee.local_addr().port();
+
+    let caller_account = account("127.0.0.1", callee_port);
+    let caller_ep = SipEndpoint::new(&caller_account, cancel.clone())
+        .await
+        .expect("bind caller");
+
+    let callee_for_task = callee.clone();
+    let accepted = tokio::spawn(async move {
+        let incoming = callee_for_task
+            .next_incoming_call()
+            .await
+            .expect("inbound call arrives");
+        incoming.accept().await.expect("accept inbound call")
+    });
+
+    let caller = Caller::new(caller_account, caller_ep.clone());
+    let target: Uri = "sip:1001@127.0.0.1".try_into().unwrap();
+    let mut call = timeout(Duration::from_secs(10), caller.dial(target))
+        .await
+        .expect("dial completes within 10s")
+        .expect("call is answered");
+
+    let callee_call = timeout(Duration::from_secs(10), accepted)
+        .await
+        .expect("accept finishes within 10s")
+        .expect("accept task did not panic");
+
+    // Before the BYE, the callee's termination signal is unfired.
+    let term = callee_call.terminated();
+    assert!(!term.is_cancelled(), "termination must not fire before BYE");
+
+    // Caller hangs up: the callee's router auto-answers the BYE and fires the
+    // termination signal.
+    timeout(Duration::from_secs(10), call.hangup())
+        .await
+        .expect("hangup completes within 10s")
+        .expect("BYE acknowledged");
+
+    timeout(Duration::from_secs(10), term.cancelled())
+        .await
+        .expect("callee learns of the remote BYE via terminated()");
+
+    cancel.cancel();
+}
+
+/// A `CANCEL` for a still-ringing inbound INVITE fires
+/// [`IncomingCall::cancelled`](wavekat_sip::IncomingCall::cancelled) and `487`s
+/// the INVITE — otherwise the call would ring forever. Driven with a raw UDP
+/// peer because the public `Caller` only emits a CANCEL after a provisional,
+/// which the bare endpoint doesn't send.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_cancel_fires_incoming_cancelled_and_487s_the_invite() {
+    let cancel = CancellationToken::new();
+
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    let callee_addr: SocketAddr = format!("127.0.0.1:{}", callee.local_addr().port())
+        .parse()
+        .unwrap();
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let branch = "z9hG4bK-cancel-it";
+
+    // The INVITE carries a real G.711 SDP offer so the endpoint surfaces it.
+    let sdp = String::from_utf8(build_sdp("127.0.0.1".parse().unwrap(), 40000)).unwrap();
+    let invite = format!(
+        "INVITE sip:1001@{callee_addr} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {peer_addr};branch={branch}\r\n\
+         From: <sip:caller@127.0.0.1>;tag=caller\r\n\
+         To: <sip:1001@127.0.0.1>\r\n\
+         Call-ID: cancel-test-call\r\n\
+         CSeq: 1 INVITE\r\n\
+         Max-Forwards: 70\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{sdp}",
+        sdp.len(),
+    );
+    peer.send_to(invite.as_bytes(), callee_addr).await.unwrap();
+
+    let incoming = timeout(Duration::from_secs(10), callee.next_incoming_call())
+        .await
+        .expect("inbound INVITE arrives within 10s")
+        .expect("inbound call");
+    let cancelled = incoming.cancelled();
+    assert!(!cancelled.is_cancelled(), "must not be cancelled yet");
+
+    // The caller hangs up while ringing: a CANCEL sharing the INVITE's branch.
+    let cancel_req = format!(
+        "CANCEL sip:1001@{callee_addr} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {peer_addr};branch={branch}\r\n\
+         From: <sip:caller@127.0.0.1>;tag=caller\r\n\
+         To: <sip:1001@127.0.0.1>\r\n\
+         Call-ID: cancel-test-call\r\n\
+         CSeq: 1 CANCEL\r\n\
+         Max-Forwards: 70\r\n\
+         Content-Length: 0\r\n\r\n"
+    );
+    peer.send_to(cancel_req.as_bytes(), callee_addr)
+        .await
+        .unwrap();
+
+    // The pending call surfaces the cancellation.
+    timeout(Duration::from_secs(10), cancelled.cancelled())
+        .await
+        .expect("CANCEL surfaces via IncomingCall::cancelled()");
+    // `incoming` is intentionally never accepted — the caller hung up.
+    drop(incoming);
+
+    // And the peer sees both a 200 (to the CANCEL) and a 487 (to the INVITE),
+    // so the INVITE transaction is torn down rather than ringing forever.
+    let mut saw_200 = false;
+    let mut saw_487 = false;
+    let mut buf = [0u8; 4096];
+    while !(saw_200 && saw_487) {
+        let (n, _) = match timeout(Duration::from_secs(5), peer.recv_from(&mut buf)).await {
+            Ok(res) => res.unwrap(),
+            Err(_) => break,
+        };
+        let text = String::from_utf8_lossy(&buf[..n]);
+        let first_line = text.lines().next().unwrap_or_default();
+        if first_line.contains("200") {
+            saw_200 = true;
+        }
+        if first_line.contains("487") {
+            saw_487 = true;
+        }
+    }
+    assert!(saw_200, "peer should receive 200 OK to its CANCEL");
+    assert!(
+        saw_487,
+        "peer should receive 487 Request Terminated for the INVITE"
+    );
+
     cancel.cancel();
 }

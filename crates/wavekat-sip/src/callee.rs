@@ -9,8 +9,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use rsip::headers::UntypedHeader;
+use rsip::message::HeadersExt;
 use rsip::{Request, StatusCode, Uri};
 use tokio::net::UdpSocket;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::caller::Call;
@@ -29,6 +32,9 @@ pub struct IncomingCall {
     key: TransactionKey,
     peer: SocketAddr,
     request: Request,
+    /// Fired if the caller `CANCEL`s before this call is accepted or rejected;
+    /// surfaced via [`Self::cancelled`].
+    cancelled: CancellationToken,
     /// Where the caller expects RTP (parsed from its SDP offer).
     pub remote_media: RemoteMedia,
 }
@@ -40,19 +46,42 @@ impl IncomingCall {
         peer: SocketAddr,
         request: Request,
         remote_media: RemoteMedia,
+        cancelled: CancellationToken,
     ) -> Self {
         Self {
             endpoint,
             key,
             peer,
             request,
+            cancelled,
             remote_media,
         }
+    }
+
+    /// A token that fires if the caller `CANCEL`s before the call is accepted or
+    /// rejected — i.e. they hung up while it was still ringing. Watch it
+    /// alongside the accept/reject decision to surface a missed call. Once
+    /// [`accept`](Self::accept) or [`reject`](Self::reject) is called the INVITE
+    /// is no longer cancellable and the token will not fire.
+    pub fn cancelled(&self) -> CancellationToken {
+        self.cancelled.clone()
+    }
+
+    /// The caller's `From` header value (e.g. `"Bob <sip:bob@example.com>;tag=…"`),
+    /// for displaying who is calling. `None` if the INVITE lacked a parseable
+    /// `From` (malformed; shouldn't happen in practice).
+    pub fn caller(&self) -> Option<String> {
+        self.request
+            .from_header()
+            .ok()
+            .map(|h| h.value().to_string())
     }
 
     /// Accept the call: bind an RTP socket, answer `200 OK` with an SDP answer,
     /// and return the established [`Call`].
     pub async fn accept(self) -> Result<Call, BoxError> {
+        // No longer cancellable once we commit to answering.
+        self.endpoint.unregister_incoming(&self.key);
         let rtp_socket = UdpSocket::bind("0.0.0.0:0").await?;
         let local_rtp_addr = rtp_socket.local_addr()?;
         let local_ip = self.endpoint.local_ip();
@@ -114,6 +143,8 @@ impl IncomingCall {
 
     /// Reject the call with a non-2xx final response (e.g. `486 Busy Here`).
     pub async fn reject(self, status: StatusCode) -> Result<(), BoxError> {
+        // No longer cancellable once we commit to rejecting.
+        self.endpoint.unregister_incoming(&self.key);
         if status.code() < 300 {
             return Err(format!("reject() got a non-failure status {status}").into());
         }

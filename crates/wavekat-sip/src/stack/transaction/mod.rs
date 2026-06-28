@@ -249,6 +249,18 @@ impl TransactionKey {
             method,
         })
     }
+
+    /// The key of the INVITE transaction a CANCEL targets: same `branch` and
+    /// `sent-by`, with the method folded to `INVITE`. A CANCEL shares the top
+    /// `Via` branch of the request it cancels (RFC 3261 §9.1), so this maps a
+    /// received CANCEL's key onto the server INVITE transaction it must 487.
+    pub(crate) fn invite_target(&self) -> TransactionKey {
+        TransactionKey {
+            branch: self.branch.clone(),
+            sent_by: self.sent_by.clone(),
+            method: Method::Invite,
+        }
+    }
 }
 
 /// Fold `ACK` onto `INVITE` for transaction matching; every other method
