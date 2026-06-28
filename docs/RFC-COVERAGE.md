@@ -161,6 +161,21 @@ negotiate RFC 4733 `telephone-event` — `Call::send_dtmf_info`,
 stop signal). Inbound `INFO` is still auto-answered `200 OK` and not yet
 surfaced (see `docs/17`).
 
+### RFC 3515 — REFER (blind call transfer)
+
+Outbound in-dialog `REFER` with a `Refer-To` target — `Call::blind_transfer`
+returns once the transferee accepts (`202 Accepted`). The implicit
+subscription's transfer-progress `NOTIFY`s (a `message/sipfrag` status line,
+RFC 3420) are surfaced on `Call::inbound_requests`, and `parse_sipfrag_status`
+/ `is_final_sipfrag` read the result so the consumer can tear its own leg down
+once the target answers. Inbound `REFER` / `NOTIFY` route to the owning `Call`
+(rather than being auto-answered) so a consumer can accept/reject a
+peer-initiated transfer or follow the sipfrag.
+
+Still absent: `Replaces` (RFC 3891, attended transfer) and `Referred-By`
+(RFC 3892) — `blind_transfer` sends neither; and acting on an *inbound* REFER
+(auto-dialing the target on the consumer's behalf) is left to the consumer.
+
 ## Not implemented
 
 NAT traversal and media security, in particular, are fully delegated
@@ -172,7 +187,7 @@ typically a PBX/SBC on the same network or a trunk that latches):
 | 3581 | Symmetric response routing (`rport`) | Not currently added to outgoing Via; responses route to the Via sent-by address. |
 | 3311 | UPDATE method | Not exposed |
 | 3326 | Reason header | Not emitted or parsed |
-| 3515 / 3891 / 3892 | REFER, Replaces, Referred-By (call transfer) | Not implemented |
+| 3891 / 3892 | Replaces, Referred-By (attended transfer) | Not implemented (blind transfer via REFER **is** — see RFC 3515 above) |
 | 3428 | MESSAGE (pager-mode IM) | Not implemented |
 | 6665 (ex-3265) | SUBSCRIBE/NOTIFY event framework | Not implemented |
 | 3856 / 3863 | Presence, PIDF | Not implemented |

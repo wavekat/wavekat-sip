@@ -154,6 +154,7 @@ pub mod caller;
 pub mod dtmf_info;
 pub mod endpoint;
 pub mod inbound;
+pub mod refer;
 pub mod registrar;
 pub mod resolve;
 pub mod rtp;
@@ -169,6 +170,7 @@ pub use caller::{Call, CallSession, Caller, InboundRequests};
 pub use dtmf_info::{build_info_body, content_type_header, InfoOutcome};
 pub use endpoint::SipEndpoint;
 pub use inbound::InboundRequest;
+pub use refer::{is_final_sipfrag, parse_sipfrag_status, refer_to_header};
 pub use registrar::{Registrar, RegistrarDiagnostics};
 pub use resolve::{order_candidates, resolve_sip_server, SrvRecord};
 pub use rtp::dtmf::{

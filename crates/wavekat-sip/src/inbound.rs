@@ -39,7 +39,9 @@ impl InboundRequest {
     }
 
     /// The request method — [`Method::Invite`] for a re-INVITE (re-offer /
-    /// session refresh) or [`Method::Info`] for SIP INFO.
+    /// session refresh), [`Method::Info`] for SIP INFO, [`Method::Notify`] for a
+    /// transfer-progress sipfrag, or [`Method::Refer`] for a peer-initiated
+    /// transfer.
     pub fn method(&self) -> &Method {
         self.request.method()
     }

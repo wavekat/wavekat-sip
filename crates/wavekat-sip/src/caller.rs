@@ -206,6 +206,41 @@ impl Call {
         classify(response)
     }
 
+    /// Blind-transfer the call: ask the peer to place a fresh call to `target`
+    /// by sending an in-dialog `REFER` with a `Refer-To` (RFC 3515).
+    ///
+    /// Returns `Ok(())` once the peer accepts the `REFER` with a 2xx
+    /// (`202 Accepted`) — at which point the transfer is *in progress*, not yet
+    /// complete. The peer then reports the outcome as a series of in-dialog
+    /// `NOTIFY`s (a `message/sipfrag` status line) that arrive on
+    /// [`Call::inbound_requests`]; the consumer watches those (parsing each with
+    /// [`crate::parse_sipfrag_status`]) and tears its own leg down once the
+    /// target answers. A non-2xx final to the `REFER` surfaces the peer's reason
+    /// and leaves the call unchanged — the peer won't honour the transfer, so
+    /// the consumer should keep the call up.
+    ///
+    /// This is *blind* (unattended) transfer: we do not first call `target`
+    /// ourselves. Attended transfer (consult `target`, then `REFER` with
+    /// `Replaces`) is a separate method, not yet implemented.
+    pub async fn blind_transfer(&mut self, target: Uri) -> Result<(), BoxError> {
+        let headers = vec![crate::refer::refer_to_header(&target)];
+        let response = {
+            let mut dialog = self.dialog.lock().await;
+            self.endpoint
+                .ua()
+                .refer(self.peer, &mut dialog, headers)
+                .await
+        };
+        match response {
+            Some(r) if (200..300).contains(&r.status_code.code()) => {
+                info!(%target, "blind transfer accepted (REFER 2xx); awaiting NOTIFY");
+                Ok(())
+            }
+            Some(r) => Err(format!("REFER rejected: {}", r.status_code).into()),
+            None => Err("REFER timed out with no final response".into()),
+        }
+    }
+
     /// Hang up by sending an in-dialog `BYE`. Returns once the peer 2xxs it
     /// (or the transaction gives up).
     pub async fn hangup(&mut self) -> Result<(), BoxError> {
