@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/wavekat/wavekat-sip/compare/v0.0.15...v0.1.0) - 2026-06-28
+
+### Added
+
+- [**breaking**] in-house SIP engine, full call lifecycle ([#43](https://github.com/wavekat/wavekat-sip/pull/43))
+
 ## [0.0.15](https://github.com/wavekat/wavekat-sip/compare/v0.0.14...v0.0.15) - 2026-06-06
 
 ### Added

@@ -3,10 +3,9 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-# Cargo's 0.0.x range matching is strict — keep version == published while
-# downstream consumers pin us via [patch.crates-io] to a specific 0.0.x.
-# Bump only when the in-flight port (see docs/01-port-plan.md) is ready
-# to publish.
-version = "0.0.15"
+# Now on the 0.1.x line: a 0.1.x bump signals an API-breaking release,
+# 0.1.(x+1) a compatible one. Downstream consumers pin us via
+# [patch.crates-io] to a specific 0.1.x.
+version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
