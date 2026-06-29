@@ -187,6 +187,18 @@ impl Call {
         self.terminated.clone()
     }
 
+    /// This call's dialog identity (Call-ID + our/remote tags), for naming it in
+    /// an attended transfer's `Replaces` (RFC 3891). Read it off the
+    /// *consultation* call (the leg we built to the transfer target) and pass it
+    /// to [`Call::attended_transfer`] on the call being transferred.
+    pub fn dialog_triplet(&self) -> crate::refer::DialogTriplet {
+        crate::refer::DialogTriplet {
+            call_id: self.dialog_id.call_id.clone(),
+            local_tag: self.dialog_id.local_tag.clone(),
+            remote_tag: self.dialog_id.remote_tag.clone(),
+        }
+    }
+
     /// Send one DTMF press via SIP `INFO` (`application/dtmf-relay`).
     ///
     /// Use this only when the remote did not negotiate RFC 4733 — i.e.
@@ -234,6 +246,42 @@ impl Call {
         match response {
             Some(r) if (200..300).contains(&r.status_code.code()) => {
                 info!(%target, "blind transfer accepted (REFER 2xx); awaiting NOTIFY");
+                Ok(())
+            }
+            Some(r) => Err(format!("REFER rejected: {}", r.status_code).into()),
+            None => Err("REFER timed out with no final response".into()),
+        }
+    }
+
+    /// Attended-transfer the call: ask the peer (the party we hold) to take over
+    /// the consultation dialog named by `replaces` by sending an in-dialog
+    /// `REFER` whose `Refer-To` carries `target` plus a `Replaces` header
+    /// (RFC 3515 + RFC 3891).
+    ///
+    /// `replaces` is the dialog identity of the *consultation* call — the leg we
+    /// already established to `target` ourselves — read via
+    /// [`Call::dialog_triplet`]. When the peer accepts (`202`), it `INVITE`s
+    /// `target` with that `Replaces`, so `target` replaces the consultation leg
+    /// rather than ringing afresh. The outcome arrives exactly as for a blind
+    /// transfer — `NOTIFY`/sipfrag on [`Call::inbound_requests`] — so the
+    /// consumer drives both the same way. A non-2xx final to the `REFER`
+    /// surfaces the peer's reason and leaves the call unchanged.
+    pub async fn attended_transfer(
+        &mut self,
+        target: Uri,
+        replaces: &crate::refer::DialogTriplet,
+    ) -> Result<(), BoxError> {
+        let headers = vec![crate::refer::refer_to_with_replaces(&target, replaces)];
+        let response = {
+            let mut dialog = self.dialog.lock().await;
+            self.endpoint
+                .ua()
+                .refer(self.peer, &mut dialog, headers)
+                .await
+        };
+        match response {
+            Some(r) if (200..300).contains(&r.status_code.code()) => {
+                info!(%target, "attended transfer accepted (REFER 2xx); awaiting NOTIFY");
                 Ok(())
             }
             Some(r) => Err(format!("REFER rejected: {}", r.status_code).into()),

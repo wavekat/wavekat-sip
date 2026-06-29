@@ -161,7 +161,7 @@ negotiate RFC 4733 `telephone-event` — `Call::send_dtmf_info`,
 stop signal). Inbound `INFO` is still auto-answered `200 OK` and not yet
 surfaced (see `docs/17`).
 
-### RFC 3515 — REFER (blind call transfer)
+### RFC 3515 — REFER (blind & attended call transfer)
 
 Outbound in-dialog `REFER` with a `Refer-To` target — `Call::blind_transfer`
 returns once the transferee accepts (`202 Accepted`). The implicit
@@ -172,9 +172,16 @@ once the target answers. Inbound `REFER` / `NOTIFY` route to the owning `Call`
 (rather than being auto-answered) so a consumer can accept/reject a
 peer-initiated transfer or follow the sipfrag.
 
-Still absent: `Replaces` (RFC 3891, attended transfer) and `Referred-By`
-(RFC 3892) — `blind_transfer` sends neither; and acting on an *inbound* REFER
-(auto-dialing the target on the consumer's behalf) is left to the consumer.
+`Call::attended_transfer` is the same `REFER`, but its `Refer-To` embeds a
+`Replaces` header (RFC 3891, via `refer_to_with_replaces`) naming a
+consultation dialog read off another `Call` with `Call::dialog_triplet` — so
+the transferee replaces the leg the transferor already built to the target
+instead of ringing it afresh. Progress is reported identically (sipfrag), so a
+consumer drives blind and attended the same way.
+
+Still absent: `Referred-By` (RFC 3892) — neither transfer sends it; and acting
+on an *inbound* REFER (auto-dialing the target on the consumer's behalf) is
+left to the consumer.
 
 ## Not implemented
 
@@ -187,7 +194,8 @@ typically a PBX/SBC on the same network or a trunk that latches):
 | 3581 | Symmetric response routing (`rport`) | Not currently added to outgoing Via; responses route to the Via sent-by address. |
 | 3311 | UPDATE method | Not exposed |
 | 3326 | Reason header | Not emitted or parsed |
-| 3891 / 3892 | Replaces, Referred-By (attended transfer) | Not implemented (blind transfer via REFER **is** — see RFC 3515 above) |
+| 3891 | Replaces (attended transfer) | **Implemented** — `attended_transfer` / `refer_to_with_replaces` (see RFC 3515 above) |
+| 3892 | Referred-By | Not emitted or required |
 | 3428 | MESSAGE (pager-mode IM) | Not implemented |
 | 6665 (ex-3265) | SUBSCRIBE/NOTIFY event framework | Not implemented |
 | 3856 / 3863 | Presence, PIDF | Not implemented |
