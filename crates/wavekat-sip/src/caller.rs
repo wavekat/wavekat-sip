@@ -45,6 +45,11 @@ pub struct Call {
     /// This dialog's identity, used to register for inbound in-dialog requests
     /// and termination.
     dialog_id: DialogId,
+    /// The peer's remote target (its `Contact`), captured at establishment. The
+    /// URI a third party should `INVITE` to reach this exact peer — used as the
+    /// `Refer-To` target of an attended transfer (RFC 5589 §7), paired with the
+    /// dialog's `Replaces`.
+    peer_uri: Uri,
     /// Fired when the peer ends the call (an in-dialog `BYE`); surfaced via
     /// [`Call::terminated`]. Registered with the endpoint at construction.
     terminated: CancellationToken,
@@ -74,6 +79,7 @@ impl Call {
         local_rtp_addr: SocketAddr,
     ) -> Self {
         let dialog_id = dialog.id();
+        let peer_uri = dialog.remote_target().clone();
         // Register for the peer-BYE termination signal up front, so a remote
         // hangup is observable via `Call::terminated` whether or not the call
         // ever opts into `inbound_requests`.
@@ -82,6 +88,7 @@ impl Call {
             endpoint,
             dialog: Arc::new(Mutex::new(dialog)),
             dialog_id,
+            peer_uri,
             terminated,
             peer,
             held: false,
@@ -185,6 +192,14 @@ impl Call {
     /// **not** fire for a local [`Call::hangup`] — the caller already knows.
     pub fn terminated(&self) -> CancellationToken {
         self.terminated.clone()
+    }
+
+    /// The peer's remote-target URI (its `Contact`) — the address a third party
+    /// should `INVITE` to reach this exact peer. Used as the `Refer-To` target
+    /// of an attended transfer (read off the *consultation* call), paired with
+    /// [`Call::dialog_triplet`] for the `Replaces`.
+    pub fn peer_uri(&self) -> &Uri {
+        &self.peer_uri
     }
 
     /// This call's dialog identity (Call-ID + our/remote tags), for naming it in
