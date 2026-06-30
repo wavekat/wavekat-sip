@@ -1,4 +1,5 @@
-//! Call transfer primitives — `REFER` (RFC 3515) for blind transfer.
+//! Call transfer primitives — `REFER` (RFC 3515) for blind and attended
+//! transfer, the latter with `Replaces` (RFC 3891).
 //!
 //! A blind transfer is one in-dialog `REFER` carrying a `Refer-To` header with
 //! the transfer target's URI: the *transferor* (us) asks the *transferee* (the
@@ -8,13 +9,39 @@
 //! `message/sipfrag` (RFC 3420) status line — `SIP/2.0 100 Trying`, then a
 //! final `SIP/2.0 200 OK` (the target answered) or a failure status.
 //!
+//! An **attended** transfer is the same in-dialog `REFER` to the transferee,
+//! except the `Refer-To` URI embeds a `Replaces` header (RFC 3891) naming a
+//! dialog the transferor *already established* to the target during a
+//! consultation call. The transferee's `INVITE` then replaces that leg rather
+//! than ringing the target afresh, so the held party and the consulted target
+//! are connected on the call the target already accepted.
+//!
 //! This module is the wire-format glue only: it builds the `Refer-To` header
 //! and parses a sipfrag status line. The `REFER` request itself goes out
-//! through [`Call::blind_transfer`](crate::Call::blind_transfer); the `NOTIFY`s
+//! through [`Call::blind_transfer`](crate::Call::blind_transfer) /
+//! [`Call::attended_transfer`](crate::Call::attended_transfer); the `NOTIFY`s
 //! arrive on the call's [`InboundRequests`](crate::InboundRequests) stream (the
 //! consumer reads each body with [`parse_sipfrag_status`]).
 
 use rsip::{Header, Uri};
+
+/// The dialog-identity triple (RFC 3261 §12) the consumer reads off the
+/// consultation [`Call`](crate::Call) so it can be named in an attended
+/// transfer's `Replaces` (RFC 3891).
+///
+/// These are *our* view of the consultation dialog: `local_tag` is the tag we
+/// placed in `From`, `remote_tag` the target's tag (its `To` tag in our
+/// requests). [`refer_to_with_replaces`] swaps them into the target's frame of
+/// reference when it builds the header — see there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialogTriplet {
+    /// The dialog's `Call-ID` (identical on both peers).
+    pub call_id: String,
+    /// Our local tag (`From` tag on requests we send in this dialog).
+    pub local_tag: String,
+    /// The target's tag (`To` tag on requests we send in this dialog).
+    pub remote_tag: String,
+}
 
 /// Build the `Refer-To` header naming the blind-transfer target.
 ///
@@ -23,6 +50,44 @@ use rsip::{Header, Uri};
 /// which every compliant transferee accepts.
 pub fn refer_to_header(target: &Uri) -> Header {
     Header::Other("Refer-To".into(), format!("<{target}>"))
+}
+
+/// Build the `Refer-To` header for an **attended** transfer: the target URI
+/// with an embedded `Replaces` header (RFC 3891) identifying the consultation
+/// dialog the transferee should take over.
+///
+/// The `Replaces` value is `call-id;to-tag=…;from-tag=…` **from the target's
+/// point of view** — so our consultation dialog's `remote_tag` (the target's
+/// own tag) becomes `to-tag`, and our `local_tag` becomes `from-tag`. The whole
+/// value is percent-escaped and carried as a URI header, e.g.
+/// `Refer-To: <sip:bob@biloxi?Replaces=call-2%3Bto-tag%3Dbob%3Bfrom-tag%3Dus>`
+/// (RFC 3891 §4).
+pub fn refer_to_with_replaces(target: &Uri, replaces: &DialogTriplet) -> Header {
+    // From the target's frame: its tag is our `remote_tag` (the to-tag), ours is
+    // the from-tag. This swap is the whole subtlety of RFC 3891 dialog matching.
+    let raw = format!(
+        "{};to-tag={};from-tag={}",
+        replaces.call_id, replaces.remote_tag, replaces.local_tag
+    );
+    let escaped = escape_uri_header_value(&raw);
+    Header::Other("Refer-To".into(), format!("<{target}?Replaces={escaped}>"))
+}
+
+/// Percent-escape a SIP URI header value (RFC 3261 §19.1.1): everything outside
+/// the unreserved set (`ALPHA / DIGIT / "-" / "_" / "." / "~"`) is `%`-encoded.
+/// Deliberately conservative — escaping the separators (`;`, `=`) and `@` is
+/// exactly what an embedded `Replaces` needs, matching the RFC 3891 examples.
+fn escape_uri_header_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Parse the SIP status code out of a `message/sipfrag` `NOTIFY` body
@@ -64,6 +129,32 @@ mod tests {
         };
         assert_eq!(name, "Refer-To");
         assert_eq!(value, "<sip:carol@example.com>");
+    }
+
+    #[test]
+    fn refer_to_with_replaces_embeds_escaped_dialog() {
+        let uri = Uri::try_from("sip:bob@biloxi.example.com").unwrap();
+        let replaces = DialogTriplet {
+            call_id: "call-2@host".into(),
+            local_tag: "ustag".into(),
+            remote_tag: "bobtag".into(),
+        };
+        let Header::Other(name, value) = refer_to_with_replaces(&uri, &replaces) else {
+            panic!("expected Header::Other");
+        };
+        assert_eq!(name, "Refer-To");
+        // The target's own tag (our remote_tag) is the to-tag; ours is from-tag.
+        // Separators (`;`, `=`) and `@` are percent-escaped per RFC 3891 §4.
+        assert_eq!(
+            value,
+            "<sip:bob@biloxi.example.com?Replaces=call-2%40host%3Bto-tag%3Dbobtag%3Bfrom-tag%3Dustag>"
+        );
+    }
+
+    #[test]
+    fn escape_leaves_unreserved_untouched() {
+        assert_eq!(escape_uri_header_value("aZ09-_.~"), "aZ09-_.~");
+        assert_eq!(escape_uri_header_value("a;b=c@d"), "a%3Bb%3Dc%40d");
     }
 
     #[test]

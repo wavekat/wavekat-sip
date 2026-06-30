@@ -817,6 +817,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attended_refer_carries_replaces() {
+        // Same as the blind REFER path, but the Refer-To embeds a Replaces
+        // (RFC 3891) naming a consultation dialog — the attended-transfer wire.
+        let cancel = CancellationToken::new();
+        let ua = Ua::bind_with_timers(
+            "127.0.0.1:0".parse().unwrap(),
+            fast_timers(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (m, src) = peer.recv().await.unwrap();
+            let SipMessage::Request(r) = m else { panic!() };
+            assert_eq!(*r.method(), Method::Invite);
+            let h = echo(&r);
+            let ok = format!("SIP/2.0 200 OK\r\n{h}To: <sip:bob@example.com>;tag=b\r\nContact: <sip:bob@{peer_addr}>\r\nContent-Length: 0\r\n\r\n");
+            peer.send_to(&SipMessage::try_from(ok.as_bytes()).unwrap(), src)
+                .await
+                .unwrap();
+            let (m, _) = peer.recv().await.unwrap();
+            assert!(matches!(m, SipMessage::Request(a) if *a.method() == Method::Ack));
+
+            let (m, src) = peer.recv().await.unwrap();
+            let SipMessage::Request(r) = m else { panic!() };
+            assert_eq!(*r.method(), Method::Refer, "expected an in-dialog REFER");
+            // The Refer-To carries the target plus the escaped Replaces.
+            assert!(
+                r.to_string().contains(
+                    "Refer-To: <sip:carol@example.com?Replaces=cid%3Bto-tag%3Dctag%3Bfrom-tag%3Dmytag>"
+                ),
+                "attended REFER must carry the Replaces:\n{r}",
+            );
+            let h = echo(&r);
+            let accepted = format!("SIP/2.0 202 Accepted\r\n{h}To: <sip:bob@example.com>;tag=b\r\nContent-Length: 0\r\n\r\n");
+            peer.send_to(&SipMessage::try_from(accepted.as_bytes()).unwrap(), src)
+                .await
+                .unwrap();
+        });
+
+        let outcome = timeout(
+            Duration::from_secs(3),
+            ua.call(&call_config(), peer_addr, 1),
+        )
+        .await
+        .unwrap();
+        let CallOutcome::Answered { dialog, .. } = outcome else {
+            panic!("call should be answered");
+        };
+        let mut dialog = *dialog;
+
+        let replaces = crate::refer::DialogTriplet {
+            call_id: "cid".into(),
+            local_tag: "mytag".into(),
+            remote_tag: "ctag".into(),
+        };
+        let refer_to = crate::refer::refer_to_with_replaces(
+            &Uri::try_from("sip:carol@example.com").unwrap(),
+            &replaces,
+        );
+        let response = timeout(
+            Duration::from_secs(3),
+            ua.refer(peer_addr, &mut dialog, vec![refer_to]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.unwrap().status_code().code(), 202);
+
+        server.await.unwrap();
+        cancel.cancel();
+    }
+
+    #[tokio::test]
     async fn cancel_after_ringing_terminates_call() {
         let shutdown = CancellationToken::new();
         let ua = Ua::bind_with_timers(
