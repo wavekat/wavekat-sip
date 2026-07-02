@@ -14,7 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use wavekat_sip::re_exports::Uri;
-use wavekat_sip::{build_sdp, Caller, DtmfDigit, SipAccount, SipEndpoint, Transport};
+use wavekat_sip::{AudioCodec, Caller, DtmfDigit, SipAccount, SipEndpoint, Transport};
 
 fn account(server: &str, port: u16) -> SipAccount {
     SipAccount {
@@ -29,12 +29,31 @@ fn account(server: &str, port: u16) -> SipAccount {
     }
 }
 
+/// A hand-written G.711-only SDP offer — the wire shape every pre-Opus peer
+/// (and most PBXes) sends. Kept literal rather than built with our own
+/// builder so these tests also exercise the answer-side intersection against
+/// a legacy offer: `accept()` must select G.711 here, never Opus.
+fn g711_only_sdp() -> String {
+    "v=0\r\n\
+     o=peer 0 0 IN IP4 127.0.0.1\r\n\
+     s=-\r\n\
+     c=IN IP4 127.0.0.1\r\n\
+     t=0 0\r\n\
+     m=audio 40000 RTP/AVP 0 8 101\r\n\
+     a=rtpmap:0 PCMU/8000\r\n\
+     a=rtpmap:8 PCMA/8000\r\n\
+     a=rtpmap:101 telephone-event/8000\r\n\
+     a=fmtp:101 0-15\r\n\
+     a=sendrecv\r\n"
+        .to_string()
+}
+
 /// A raw INVITE carrying a real G.711 SDP offer, from `peer` to `callee`. Set
 /// `with_contact` for tests that go on to `accept()` — `Dialog::uas` needs the
 /// `Contact` to learn the remote target; omit it when the call only ever rings.
 /// The `Call-ID` is derived from `branch` so the matching `raw_cancel` shares it.
 fn raw_invite(callee: SocketAddr, peer: SocketAddr, branch: &str, with_contact: bool) -> Vec<u8> {
-    let sdp = String::from_utf8(build_sdp("127.0.0.1".parse().unwrap(), 40000)).unwrap();
+    let sdp = g711_only_sdp();
     let contact = if with_contact {
         format!("Contact: <sip:caller@{peer}>\r\n")
     } else {
@@ -83,7 +102,7 @@ fn raw_invite_via_proxy(
     branch: &str,
     record_route: &str,
 ) -> Vec<u8> {
-    let sdp = String::from_utf8(build_sdp("127.0.0.1".parse().unwrap(), 40000)).unwrap();
+    let sdp = g711_only_sdp();
     format!(
         "INVITE sip:1001@{callee} SIP/2.0\r\n\
          Record-Route: {record_route}\r\n\
@@ -172,6 +191,8 @@ async fn proxy_record_route_is_echoed_and_inbound_bye_terminates() {
         .expect("inbound INVITE arrives within 10s")
         .expect("inbound call");
     let callee_call = incoming.accept().await.expect("accept inbound call");
+    // A G.711-only offer must negotiate G.711 — no Opus in the intersection.
+    assert_eq!(callee_call.remote_media.codec, Some(AudioCodec::Pcmu));
     let term = callee_call.terminated();
     assert!(!term.is_cancelled(), "termination must not fire before BYE");
 
@@ -267,9 +288,16 @@ async fn dial_accept_hangup_over_loopback() {
         .expect("dial completes within 10s")
         .expect("call is answered");
 
-    // The caller negotiated real remote media from the SDP answer.
+    // The caller negotiated real remote media from the SDP answer. Both ends
+    // speak the full menu, so the intersection lands on Opus at our offered
+    // dynamic PT — the whole point of preferring it in the offer.
     assert!(call.remote_media.port > 0);
-    assert_eq!(call.remote_media.payload_type, 0); // PCMU
+    assert_eq!(
+        call.remote_media.codec,
+        Some(AudioCodec::Opus { payload_type: 111 })
+    );
+    // And the answer's telephone-event entry rides the matching 48 kHz clock.
+    assert_eq!(call.remote_media.dtmf().map(|d| d.clock_rate), Some(48000));
 
     // RFC 4028: the caller advertised Supported: timer + Session-Expires, the
     // callee echoed it, so the caller negotiated a timer and (peer refresher

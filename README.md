@@ -23,7 +23,9 @@ recording bridges in Rust. It owns the wire-level concerns —
 - **SIP signaling**: REGISTER (digest auth + keepalive), outbound and inbound
   calls (`Caller` / `IncomingCall`), in-dialog hold/resume, DTMF (RFC 4733 +
   INFO fallback), and RFC 4028 session timers.
-- **SDP**: minimal offer/answer for G.711 (PCMU + PCMA) telephony audio.
+- **SDP**: offer/answer for Opus (preferred, with in-band FEC) and G.711
+  (PCMU + PCMA) fallback; answers and mid-call re-offers pin the negotiated
+  codec. Negotiation only — encode/decode stays with the consumer.
 - **RTP**: header parser, a debug-friendly receive loop, and a codec-agnostic
   send loop.
 
@@ -108,7 +110,7 @@ while let Some(incoming) = endpoint.next_incoming_call().await {
 | `resolve`   | Working — RFC 3263 (subset) SRV + A/AAAA fallback.     |
 | `caller`    | Working — outbound dial, hold/resume, DTMF, hangup.    |
 | `callee`    | Working — inbound INVITE accept/reject.                |
-| `sdp`       | Working — minimal G.711 offer/answer.                  |
+| `sdp`       | Working — Opus + G.711 offer/answer (negotiation only). |
 | `rtp`       | Working — header parser, receive loop, send loop.      |
 
 ## Architecture

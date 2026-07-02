@@ -21,8 +21,11 @@
 //!   re-registration ([`Registrar`]), a bound endpoint with inbound-call
 //!   routing ([`SipEndpoint`]), outbound calls ([`Caller`]), and inbound calls
 //!   ([`IncomingCall`]).
-//! - **SDP** — minimal G.711 (PCMU + PCMA) offer/answer with round-trip
-//!   parsing ([`build_sdp`], [`parse_sdp`]).
+//! - **SDP** — offer/answer for Opus (RFC 7587, preferred) and G.711
+//!   (PCMU + PCMA) with round-trip parsing ([`build_sdp_offer`],
+//!   [`parse_sdp`]); answers and mid-call re-offers pin the negotiated
+//!   codec ([`CodecMenu`]). Negotiation only — encode/decode stays with
+//!   the consumer.
 //! - **RTP** — header parser ([`RtpHeader`]), a debug-friendly receive loop
 //!   ([`receive_rtp`]), and a codec-agnostic send loop ([`send_loop`]).
 //!
@@ -98,15 +101,15 @@
 //!
 //! ```
 //! use std::net::{IpAddr, Ipv4Addr};
-//! use wavekat_sip::{build_sdp, parse_sdp};
+//! use wavekat_sip::{build_sdp_offer, parse_sdp, AudioCodec};
 //!
 //! let local_ip: IpAddr = Ipv4Addr::new(192, 168, 1, 50).into();
-//! let offer = build_sdp(local_ip, 20000);
+//! let offer = build_sdp_offer(local_ip, 20000); // Opus preferred, G.711 fallback
 //!
 //! let answer = offer.clone(); // simulate a loopback answer
 //! let media = parse_sdp(&answer).expect("valid SDP");
 //! assert_eq!(media.port, 20000);
-//! assert_eq!(media.payload_type, 0); // PCMU
+//! assert_eq!(media.codec, Some(AudioCodec::Opus { payload_type: 111 }));
 //! ```
 //!
 //! # Reading RTP headers off the wire
@@ -135,7 +138,7 @@
 //! | [`resolve`]     | RFC 3263 (subset) server location: SRV + A/AAAA fallback.      |
 //! | [`callee`]      | [`IncomingCall`] — inbound INVITE accept/reject.               |
 //! | [`caller`]      | [`Caller`] outbound dial + the [`Call`] handle.                |
-//! | [`sdp`]         | Minimal G.711 offer/answer build + parse.                      |
+//! | [`sdp`]         | Opus + G.711 offer/answer build + parse (negotiation only).    |
 //! | [`rtp`]         | RTP header parser, debug receive loop, codec-agnostic send loop. |
 //!
 //! # Stability
@@ -181,7 +184,11 @@ pub use rtp::dtmf::{
 };
 pub use rtp::dtmf_recv::{parse_event_payload, DtmfEvent, DtmfEventPayload, DtmfReceiver};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
-pub use sdp::{build_sdp, build_sdp_with, parse_sdp, MediaDirection, RemoteMedia, DTMF_DEFAULT_PT};
+pub use sdp::{
+    build_sdp_offer, build_sdp_with, parse_sdp, select_codec, select_dtmf, AudioCodec, CodecMenu,
+    DtmfSpec, MediaDirection, RemoteMedia, DTMF_DEFAULT_PT, DTMF_WIDEBAND_DEFAULT_PT,
+    OPUS_DEFAULT_PT, OPUS_RTP_CLOCK_RATE,
+};
 pub use session_timer::{
     min_se_in, negotiate_uac, negotiate_uas, require_timer_header, session_expires_in,
     session_timer_loop, supported_timer_header, supports_timer, Refresher, SessionDialogOps,
