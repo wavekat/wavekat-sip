@@ -21,7 +21,9 @@ use crate::dtmf_info::{build_info_body, classify, content_type_header, InfoOutco
 use crate::endpoint::SipEndpoint;
 use crate::inbound::InboundRequest;
 use crate::rtp::dtmf::DtmfDigit;
-use crate::sdp::{build_sdp, build_sdp_with, parse_sdp, MediaDirection, RemoteMedia};
+use crate::sdp::{
+    build_sdp_offer, build_sdp_with, parse_sdp, CodecMenu, MediaDirection, RemoteMedia,
+};
 use crate::session_timer::{
     negotiate_uac, supported_timer_header, SessionDialogOps, SessionExpires, SessionTimer,
     DEFAULT_SESSION_EXPIRES_SECS,
@@ -109,6 +111,11 @@ impl Call {
     /// a 2xx; a non-2xx final surfaces the server's reason and leaves the call
     /// unchanged. The `o=` version is bumped for each re-offer regardless, as
     /// RFC 3264 requires.
+    ///
+    /// The re-offer is **pinned to the negotiated codec** — re-offering the
+    /// full menu would invite the peer to switch codecs mid-call, which the
+    /// consumer's audio path (encoder state, sample rates, recording) is not
+    /// prepared for.
     pub async fn set_hold(&mut self, on: bool) -> Result<(), BoxError> {
         let direction = if on {
             MediaDirection::SendOnly
@@ -116,9 +123,20 @@ impl Call {
             MediaDirection::SendRecv
         };
         self.sdp_version += 1;
+        let menu = match self.remote_media.codec {
+            Some(codec) => CodecMenu::Pinned {
+                codec,
+                dtmf: self.remote_media.dtmf(),
+            },
+            // Unreachable on a healthy call (no resolvable codec means the
+            // consumer never got audio flowing); fall back to the symmetric
+            // full menu rather than inventing a codec to pin.
+            None => CodecMenu::Full,
+        };
         let offer = build_sdp_with(
             self.endpoint.local_ip(),
             self.local_rtp_addr.port(),
+            menu,
             direction,
             self.sdp_version,
         );
@@ -408,10 +426,13 @@ impl Caller {
 
     /// Place an outbound call to `target` and wait for it to be answered.
     ///
-    /// Binds a local RTP socket, offers G.711 SDP, sends the INVITE to the
-    /// account's resolved server, follows provisional responses, and answers a
-    /// single `401`/`407` challenge. Returns the [`Call`] on a 2xx, or an error
-    /// if the call was rejected, timed out, or had no usable SDP answer.
+    /// Binds a local RTP socket, offers the full codec menu (Opus preferred,
+    /// G.711 fallback — see [`crate::sdp::CodecMenu::Full`]), sends the INVITE
+    /// to the account's resolved server, follows provisional responses, and
+    /// answers a single `401`/`407` challenge. Returns the [`Call`] on a 2xx,
+    /// or an error if the call was rejected, timed out, or had no usable SDP
+    /// answer. The negotiated codec is [`RemoteMedia::codec`] on the returned
+    /// call.
     pub async fn dial(&self, target: Uri) -> Result<Call, BoxError> {
         self.dial_inner(target, &CancellationToken::new(), None)
             .await
@@ -454,7 +475,7 @@ impl Caller {
         let local_ip = self.endpoint.local_ip();
         info!(%local_ip, rtp_port = local_rtp_addr.port(), "bound RTP socket for outbound dial");
 
-        let offer = build_sdp(local_ip, local_rtp_addr.port());
+        let offer = build_sdp_offer(local_ip, local_rtp_addr.port());
         debug!("SDP offer:\n{}", String::from_utf8_lossy(&offer));
 
         let from: Uri =
@@ -500,6 +521,7 @@ impl Caller {
                     remote_addr = %remote_media.addr,
                     remote_port = remote_media.port,
                     payload_type = remote_media.payload_type,
+                    codec = ?remote_media.codec,
                     ?session_timer,
                     "call answered; parsed SDP answer",
                 );

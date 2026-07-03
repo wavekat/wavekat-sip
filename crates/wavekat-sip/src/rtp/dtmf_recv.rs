@@ -563,6 +563,7 @@ mod tests {
 
         let cfg = DtmfBurstConfig {
             payload_type: PT,
+            clock_rate: 8000,
             ssrc: SSRC,
             initial_seq: 100,
             initial_timestamp: 5000,

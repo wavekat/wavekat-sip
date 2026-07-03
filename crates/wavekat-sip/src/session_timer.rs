@@ -40,7 +40,13 @@
 //! if let Some(timer) = call.session_timer() {
 //!     let handle = call.session_handle();
 //!     let refreshed = std::sync::Arc::new(tokio::sync::Notify::new());
-//!     let sdp = build_sdp(local_ip, rtp_port); // repeat our offer
+//!     // A refresh re-offer must pin the negotiated codec — never the
+//!     // full menu, which would invite a mid-call codec switch.
+//!     let menu = CodecMenu::Pinned {
+//!         codec: call.remote_media.codec.expect("established call has a codec"),
+//!         dtmf: call.remote_media.dtmf(),
+//!     };
+//!     let sdp = build_sdp_with(local_ip, rtp_port, menu, MediaDirection::SendRecv, version);
 //!     tokio::spawn(async move {
 //!         let outcome =
 //!             session_timer_loop(&handle, timer, Some(sdp), refreshed, cancel).await;

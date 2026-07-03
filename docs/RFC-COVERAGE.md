@@ -41,26 +41,56 @@ observed but not acknowledged reliably (PRACK / 100rel is RFC 3262, below).
 
 Single `m=audio` line, one round of offer/answer:
 
-- Offer generated at `dial` time (`build_sdp`), answer parsed from the
-  2xx (`parse_sdp`) — UAC direction.
+- Offer generated at `dial` time (`build_sdp_offer` — the full menu,
+  Opus preferred, G.711 fallback), answer parsed from the 2xx
+  (`parse_sdp`) — UAC direction.
 - Offer parsed from the inbound INVITE, answer generated in the 200 OK
-  — UAS direction.
+  as a **real §6.1 intersection**: only the selected codec (Opus
+  wherever offered, at the offer's payload type, else the offer's first
+  G.711) plus the matching `telephone-event` entry, echoed at the
+  offer's numbers (`select_codec` / `select_dtmf` /
+  `CodecMenu::Pinned`); a no-common-codec offer is refused
+  `488 Not Acceptable Here` — UAS direction.
 
 Hold/resume **is** supported: `Call::set_hold` sends a re-INVITE with an
 `a=sendonly`/`a=sendrecv` re-offer and a bumped `o=` version (§5),
-`build_sdp_with` exposing the direction + version. Still absent: multiple
-media descriptions, `a=inactive` two-way hold as a first-class call state
-(the `MediaDirection::Inactive` variant exists but `set_hold` only toggles
-sendonly/sendrecv), and rejected-stream (`port 0`) handling. Inbound
-re-INVITE re-offers are auto-answered `200 OK` without a renegotiated SDP
-answer body — see the gap noted in `docs/17`.
+`build_sdp_with` exposing the codec menu + direction + version. Every
+post-negotiation re-offer is **pinned to the negotiated codec**
+(`CodecMenu::Pinned`) rather than repeating the full menu, so a
+hold/refresh cannot renegotiate the codec mid-call. Still absent:
+multiple media descriptions, `a=inactive` two-way hold as a first-class
+call state (the `MediaDirection::Inactive` variant exists but
+`set_hold` only toggles sendonly/sendrecv), and rejected-stream
+(`port 0`) handling. Inbound re-INVITE re-offers are auto-answered
+`200 OK` without a renegotiated SDP answer body — see the gap noted in
+`docs/17`.
 
 ### RFC 8866 (ex-4566) — SDP (minimal subset)
 
-`build_sdp` emits and `parse_sdp` reads exactly the subset telephony
-G.711 interop needs: `v=`, `o=`, `s=`, `c=` (IN IP4/IP6), `t=`,
-`m=audio … RTP/AVP …`, `a=rtpmap`, `a=fmtp`, `a=sendrecv`. Everything
-else in SDP is ignored on parse and never emitted.
+The builders emit and `parse_sdp` reads exactly the subset telephony
+interop needs: `v=`, `o=`, `s=`, `c=` (IN IP4/IP6), `t=`,
+`m=audio … RTP/AVP …`, `a=rtpmap` (including dynamic-PT resolution),
+`a=fmtp`, `a=sendrecv`. Everything else in SDP is ignored on parse and
+never emitted.
+
+### RFC 7587 — RTP payload format for Opus (SDP level)
+
+Negotiation only — the codec itself lives in `wavekat-core` (`opus`
+feature) per this crate's codec-agnostic scope:
+
+- Offers `opus/48000/2` first at dynamic PT 111 (`OPUS_DEFAULT_PT`)
+  with `a=fmtp… useinbandfec=1`; the §4.1 wire constants (48 kHz clock,
+  2 channels) are emitted and required on parse regardless of the
+  actual stream.
+- `parse_sdp` resolves any dynamic PT mapped to `opus/48000` —
+  `AudioCodec::Opus { payload_type }`, `RemoteMedia::codec`,
+  `RemoteMedia::opus_payload_type`.
+- The consumer feeds the 48 kHz timestamp step (960/20 ms) to
+  `RtpSendConfig::samples_per_frame`; the RTP layer is codec-agnostic.
+
+Not covered: `maxplaybackrate`/`maxaveragebitrate`/`stereo`/`cbr` fmtp
+parameters (offered bare, accepted-and-ignored on parse), and RTCP
+feedback.
 
 ### RFC 3550 — RTP (partial, no RTCP)
 
@@ -83,8 +113,8 @@ expected to live in the consumer (parsing headers with
 ### RFC 3551 — RTP/AVP profile (G.711 only)
 
 Static payload types 0 (PCMU) and 8 (PCMA); dynamic range 96–127
-honored when the remote maps `telephone-event` somewhere other
-than 101. No other codecs are negotiated or named.
+honored for Opus (RFC 7587) and for `telephone-event` mapped somewhere
+other than 101. No other codecs are negotiated or named.
 
 ### RFC 4733 — DTMF events over RTP (send and receive)
 
@@ -92,15 +122,19 @@ Send side:
 
 - Event codes 0–15 (`0`–`9`, `*`, `#`, `A`–`D`) — `DtmfDigit`.
 - 4-byte event payload (E bit, 6-bit volume with clamping, duration in
-  8 kHz ticks) — `build_event_payload`.
+  ticks of the negotiated event clock) — `build_event_payload`.
 - Burst transmission: marker on first packet, threefold start/end
   redundancy (§2.5.1.4), 20 ms continuation cadence, event-start
   timestamp shared across the burst (§2.5.1.2), monotonic seq/ts
   chaining across digits — `send_dtmf_burst`.
 - Separate-SSRC stream per §2.6.2.
-- SDP negotiation of `telephone-event/8000` (offer + answer detection,
-  `a=fmtp 0-15`); the 16000 Hz clock variant is deliberately not
-  selected — `DTMF_DEFAULT_PT`, `RemoteMedia::dtmf_payload_type`.
+- SDP negotiation of `telephone-event` at **both** the classic 8 kHz
+  clock (PT 101, `DTMF_DEFAULT_PT`) and the 48 kHz clock paired with
+  Opus (PT 110, `DTMF_WIDEBAND_DEFAULT_PT`), per the §2.1 guidance that
+  the event clock follow the audio stream's. `parse_sdp` records every
+  advertised entry with its clock (`DtmfSpec`); `RemoteMedia::dtmf`
+  picks the one matching the negotiated codec. Duration ticks and burst
+  pacing follow the negotiated clock (`DtmfBurstConfig::clock_rate`).
 
 Receive side:
 
@@ -203,7 +237,6 @@ typically a PBX/SBC on the same network or a trunk that latches):
 | 3711 / 5763 / 5764 | SRTP, DTLS-SRTP | No media encryption |
 | 8489 / 8445 / 8656 | STUN, ICE, TURN | No NAT traversal; local address discovery is a UDP-connect trick only |
 | 3605 / 5761 | RTCP attribute in SDP, RTP/RTCP mux | No RTCP at all |
-| 7587 et al. | Wideband codecs (Opus, …) | G.711 only by design (see scope in `CLAUDE.md`) |
 | 3262 | PRACK / 100rel | Provisional responses are not acknowledged reliably |
 | 7118 | SIP over WebSocket | Not exposed (`Transport` is UDP/TCP only) |
 

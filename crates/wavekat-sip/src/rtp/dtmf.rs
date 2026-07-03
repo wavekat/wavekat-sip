@@ -32,6 +32,7 @@
 //! let mut ts = 0_u32;
 //! let cfg = DtmfBurstConfig {
 //!     payload_type: 101,
+//!     clock_rate: 8000,
 //!     ssrc: 0xDEAD_BEEF,
 //!     initial_seq: seq,
 //!     initial_timestamp: ts,
@@ -63,10 +64,6 @@ use tracing::debug;
 /// value every major softphone defaults to. The valid range is 0-63
 /// (each unit is one dB below the reference; higher = quieter).
 pub const DEFAULT_VOLUME_DBM0: u8 = 10;
-
-/// 20 ms at an 8 kHz clock = 160 sample ticks. The RTP timestamp clock
-/// for `telephone-event/8000` is 8 kHz regardless of the audio codec.
-const TICKS_PER_PACKET: u16 = 160;
 
 /// Inter-packet gap for continuation packets.
 const PACKET_INTERVAL: Duration = Duration::from_millis(20);
@@ -215,8 +212,10 @@ impl DtmfDigit {
 /// - `R`: reserved (always 0).
 /// - `volume`: power in dBm0 (0-63, lower magnitude = louder; see
 ///   [`DEFAULT_VOLUME_DBM0`]). Clamped to 6 bits.
-/// - `duration`: how long the event has been going so far, in RTP
-///   timestamp ticks (8 kHz). Grows across continuation packets.
+/// - `duration`: how long the event has been going so far, in ticks of
+///   the negotiated `telephone-event` clock (160 per 20 ms at the
+///   classic 8 kHz, 960 at the 48 kHz clock used beside Opus). Grows
+///   across continuation packets.
 pub fn build_event_payload(event: u8, end: bool, volume: u8, duration_ticks: u16) -> [u8; 4] {
     let mut out = [0u8; 4];
     out[0] = event;
@@ -237,10 +236,16 @@ pub fn build_event_payload(event: u8, end: bool, volume: u8, duration_ticks: u16
 #[derive(Debug, Clone, Copy)]
 pub struct DtmfBurstConfig {
     /// Negotiated `telephone-event` payload type — typically 101. Get
-    /// this from [`crate::RemoteMedia::dtmf_payload_type`]; if it's
-    /// `None`, the remote didn't agree to RFC 4733 and DTMF must be
-    /// sent via SIP INFO instead.
+    /// this from [`crate::RemoteMedia::dtmf`]; if that's `None`, the
+    /// remote didn't agree to RFC 4733 and DTMF must be sent via SIP
+    /// INFO instead.
     pub payload_type: u8,
+    /// Negotiated `telephone-event` clock rate, from the same
+    /// [`crate::sdp::DtmfSpec`] — 8000 classically, 48000 when paired
+    /// with Opus. Duration fields and the per-packet tick step count in
+    /// this clock, so a wrong value here plays every digit at the wrong
+    /// length on the receiver.
+    pub clock_rate: u32,
     /// SSRC for the DTMF stream. Pick a fresh random value per call
     /// (distinct from the audio stream's SSRC, per the module docs).
     pub ssrc: u32,
@@ -257,8 +262,9 @@ pub struct DtmfBurstConfig {
     /// running a clock between presses.
     pub initial_timestamp: u32,
     /// How long to hold the digit, in milliseconds. Typical: 100-200.
-    /// The actual on-wire duration field uses 8 kHz ticks; this is
-    /// rounded to the nearest whole packet (`PACKET_INTERVAL` = 20 ms).
+    /// The actual on-wire duration field uses `clock_rate` ticks; this
+    /// is rounded to the nearest whole packet (`PACKET_INTERVAL` =
+    /// 20 ms).
     pub hold_duration_ms: u32,
     /// Volume in dBm0 (0-63). See [`DEFAULT_VOLUME_DBM0`].
     pub volume_dbm0: u8,
@@ -312,11 +318,15 @@ pub async fn send_dtmf_burst(
 ) -> Result<(u16, u32), std::io::Error> {
     let event = digit.event_code();
     let volume = config.volume_dbm0.min(0x3F);
+    // One packet covers 20 ms of the event clock: 160 ticks at the
+    // classic 8 kHz, 960 at the 48 kHz clock paired with Opus.
+    let ticks_per_packet = (config.clock_rate / 50) as u16;
 
     debug!(
-        "DTMF burst '{}' → {remote} (PT={}, SSRC=0x{:08X}, hold={}ms)",
+        "DTMF burst '{}' → {remote} (PT={}, clock={}Hz, SSRC=0x{:08X}, hold={}ms)",
         digit.as_char(),
         config.payload_type,
+        config.clock_rate,
         config.ssrc,
         config.hold_duration_ms,
     );
@@ -324,10 +334,10 @@ pub async fn send_dtmf_burst(
     // Total packets in the press: at least the 3 initial + 3 end.
     // Continuation packets fill in the middle every 20 ms.
     let total_packets = config.hold_duration_ms.div_ceil(20).max(1) as u16;
-    let total_duration_ticks = total_packets.saturating_mul(TICKS_PER_PACKET);
+    let total_duration_ticks = total_packets.saturating_mul(ticks_per_packet);
 
     let mut seq = config.initial_seq;
-    let mut current_duration = TICKS_PER_PACKET;
+    let mut current_duration = ticks_per_packet;
 
     // Marker bit + first three copies — `E=0`, duration = one tick.
     // All three share the marker'd timestamp; the receiver de-dupes by
@@ -353,7 +363,7 @@ pub async fn send_dtmf_burst(
     // first tick.
     for _ in 1..total_packets {
         sleep(PACKET_INTERVAL).await;
-        current_duration = current_duration.saturating_add(TICKS_PER_PACKET);
+        current_duration = current_duration.saturating_add(ticks_per_packet);
         let payload = build_event_payload(event, false, volume, current_duration);
         let pkt = build_rtp_dtmf_packet(
             config.payload_type,
@@ -524,6 +534,7 @@ mod tests {
 
         let cfg = DtmfBurstConfig {
             payload_type: 101,
+            clock_rate: 8000,
             ssrc: 0xDEAD_BEEF,
             initial_seq: 100,
             initial_timestamp: 5000,
@@ -604,6 +615,7 @@ mod tests {
 
         let cfg1 = DtmfBurstConfig {
             payload_type: 101,
+            clock_rate: 8000,
             ssrc: 0xCAFE_F00D,
             initial_seq: 0,
             initial_timestamp: 0,
@@ -643,5 +655,46 @@ mod tests {
         assert_eq!(t2, 640);
 
         receiver_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_at_48k_clock_counts_960_ticks_per_packet() {
+        // telephone-event/48000 (negotiated beside Opus): 20 ms is 960
+        // ticks, not 160. A receiver clocking the stream at 48 kHz
+        // would hear an 8 kHz-tick burst as a 6× too-short press.
+        let (sender, receiver) = loopback_pair().await;
+        let remote = receiver.local_addr().unwrap();
+
+        let cfg = DtmfBurstConfig {
+            payload_type: 110,
+            clock_rate: 48000,
+            ssrc: 0xDEAD_BEEF,
+            initial_seq: 0,
+            initial_timestamp: 1000,
+            hold_duration_ms: 100, // 5 packets
+            volume_dbm0: 10,
+        };
+
+        let handle = tokio::spawn(send_dtmf_burst(sender, remote, cfg, DtmfDigit::D5));
+
+        let mut buf = [0u8; 64];
+        let mut durations: Vec<u16> = Vec::new();
+        for _ in 0..10 {
+            tokio::time::timeout(Duration::from_millis(500), receiver.recv_from(&mut buf))
+                .await
+                .expect("packet arrived in time")
+                .expect("recv ok");
+            durations.push(u16::from_be_bytes([buf[14], buf[15]]));
+        }
+
+        let (_, next_ts) = handle.await.unwrap().unwrap();
+        // 5 packets × 960 ticks.
+        assert_eq!(next_ts, 1000 + 4800);
+
+        // Initial trio at one packet's ticks; continuations grow by 960;
+        // end trio holds the final duration.
+        assert_eq!(&durations[0..3], &[960, 960, 960]);
+        assert_eq!(&durations[3..7], &[1920, 2880, 3840, 4800]);
+        assert_eq!(&durations[7..10], &[4800, 4800, 4800]);
     }
 }
