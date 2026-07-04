@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/wavekat/wavekat-sip/compare/v0.2.0...v0.2.1) - 2026-07-04
+
+### Added
+
+- send 100 Trying and 180 Ringing for inbound calls ([#51](https://github.com/wavekat/wavekat-sip/pull/51))
+
 ## [0.2.0](https://github.com/wavekat/wavekat-sip/compare/v0.1.2...v0.2.0) - 2026-07-03
 
 ### Added
