@@ -37,6 +37,13 @@ pub struct IncomingCall {
     /// Fired if the caller `CANCEL`s before this call is accepted or rejected;
     /// surfaced via [`Self::cancelled`].
     cancelled: CancellationToken,
+    /// The UAS `To` tag for this call, generated once at construction and
+    /// reused across every response we send — `180 Ringing`, the `200 OK` /
+    /// reject final, and the established dialog. RFC 3261 §12.1.1 requires the
+    /// tag on an early-dialog `18x` to match the one on the final response;
+    /// generating a fresh tag per response would hand the caller two different
+    /// dialogs.
+    local_tag: String,
     /// Where the caller expects RTP (parsed from its SDP offer).
     pub remote_media: RemoteMedia,
 }
@@ -56,8 +63,37 @@ impl IncomingCall {
             peer,
             request,
             cancelled,
+            local_tag: gen_tag(),
             remote_media,
         }
+    }
+
+    /// Send a `180 Ringing` provisional: tell the caller the call is alerting
+    /// (so it can play ringback), and — per RFC 3261 §9.1 — unblock its ability
+    /// to `CANCEL` if it hangs up before we answer. A caller may not send
+    /// `CANCEL` until it has received a provisional response, so without this a
+    /// pre-answer hangup produces no signal and the call appears to ring
+    /// forever.
+    ///
+    /// Safe to call while the call rings and before deciding: it leaves the
+    /// INVITE acceptable/rejectable, and shares its `To` tag with the eventual
+    /// final response so the early and confirmed dialogs agree. Idempotent in
+    /// effect — the engine simply resends the latest provisional on an INVITE
+    /// retransmit.
+    pub async fn ring(&self) -> Result<(), BoxError> {
+        let response = build_response(
+            &self.request,
+            StatusCode::Ringing,
+            Some(&self.local_tag),
+            None,
+            None,
+        )
+        .ok_or("could not build 180 Ringing response")?;
+        if !self.endpoint.ua().answer(self.key.clone(), response).await {
+            return Err("engine stopped before 180 Ringing was sent".into());
+        }
+        debug!("sent 180 Ringing");
+        Ok(())
     }
 
     /// A token that fires if the caller `CANCEL`s before the call is accepted or
@@ -102,7 +138,7 @@ impl IncomingCall {
             let response = build_response(
                 &self.request,
                 StatusCode::NotAcceptableHere,
-                Some(&gen_tag()),
+                Some(&self.local_tag),
                 None,
                 None,
             )
@@ -130,7 +166,7 @@ impl IncomingCall {
         );
         debug!("SDP answer:\n{}", String::from_utf8_lossy(&answer));
 
-        let to_tag = gen_tag();
+        let to_tag = self.local_tag.clone();
         let contact: Uri = format!(
             "sip:{}@{}",
             self.endpoint.account().username,
@@ -194,8 +230,14 @@ impl IncomingCall {
         if status.code() < 300 {
             return Err(format!("reject() got a non-failure status {status}").into());
         }
-        let response = build_response(&self.request, status.clone(), Some(&gen_tag()), None, None)
-            .ok_or("could not build reject response")?;
+        let response = build_response(
+            &self.request,
+            status.clone(),
+            Some(&self.local_tag),
+            None,
+            None,
+        )
+        .ok_or("could not build reject response")?;
         if !self.endpoint.ua().answer(self.key, response).await {
             return Err("engine stopped before the reject was sent".into());
         }

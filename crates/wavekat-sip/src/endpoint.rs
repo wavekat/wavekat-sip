@@ -290,6 +290,16 @@ async fn route_inbound(
     match inc.request.method() {
         // A fresh INVITE (no dialog tag yet) is a new inbound call.
         Method::Invite if !has_to_tag => {
+            // RFC 3261 §17.2.1: promptly send `100 Trying` so the caller stops
+            // retransmitting the INVITE — and, per §9.1, becomes allowed to
+            // `CANCEL` if it hangs up before we answer (a caller may not send
+            // CANCEL until it has seen a provisional). Without this, a pre-answer
+            // hangup reaches us as *nothing at all* and the call rings forever.
+            // Tagless by convention — `100` does not establish an early dialog.
+            if let Some(trying) = build_response(&inc.request, StatusCode::Trying, None, None, None)
+            {
+                ua.answer(inc.key.clone(), trying).await;
+            }
             let _ = calls_tx.send(inc).await;
         }
         // The ACK for a 2xx we sent: it confirms our dialog; nothing to reply.

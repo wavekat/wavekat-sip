@@ -22,8 +22,8 @@ does is exactly what this document lists.
 |------|----------|----------------|
 | §10 Registrations | REGISTER, digest-auth retry on 401/407, re-registration on an interval, unregister (`Expires: 0`), outcome classification (registered / unauthorized / failed / timed out) | `Registrar` |
 | §13.2 UAC INVITE | Outbound INVITE with SDP offer, follows provisional responses to a final, answers one digest challenge, parses the SDP answer from the 2xx, sends the 2xx ACK; provisional statuses can be observed (`dial_with_progress`) | `Caller::dial`, `Call` |
-| §9 CANCEL | Cancel a still-ringing outbound INVITE (CANCEL after the first provisional; resolves `487 Request Terminated`) | `Caller::dial_cancellable` |
-| §13.3 UAS INVITE | Automatic `100 Trying`, deferred accept (`200 OK` + SDP answer) or reject (non-2xx final, e.g. `486`/`603`) | `SipEndpoint::next_incoming_call`, `IncomingCall` |
+| §9 CANCEL | Cancel a still-ringing outbound INVITE (CANCEL after the first provisional; resolves `487 Request Terminated`). Inbound CANCEL of a not-yet-answered INVITE is `200`-ed, the INVITE `487`-ed, and the waiting `IncomingCall::cancelled` token fired | `Caller::dial_cancellable`, `IncomingCall::cancelled`, `SipEndpoint` router |
+| §13.3 UAS INVITE | Automatic `100 Trying`, optional `180 Ringing` (`IncomingCall::ring`, sharing the final response's `To` tag per §12.1.1), deferred accept (`200 OK` + SDP answer) or reject (non-2xx final, e.g. `486`/`603`) | `SipEndpoint::next_incoming_call`, `IncomingCall` |
 | §14 Re-INVITE | Outbound in-dialog re-INVITE with SDP re-offer and the mandatory 2xx ACK, used for hold/resume and session refresh | `Call::set_hold`, `Call::session_handle` |
 | §15 Terminating | BYE — local hangup via the call handle; an inbound in-dialog BYE is auto-answered `200 OK` by the endpoint router | `Call::hangup`, `SipEndpoint` |
 | §12 Dialogs | Dialog establishment with route-set capture/reuse (UAC reverses Record-Route, UAS keeps order), in-dialog request composition addressed to the route set | internal (`Call`) |

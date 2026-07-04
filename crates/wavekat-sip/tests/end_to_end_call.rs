@@ -761,3 +761,112 @@ async fn stray_cancel_is_answered_200_without_487() {
 
     cancel.cancel();
 }
+
+/// Read datagrams from `peer` until one whose status line starts with `prefix`
+/// arrives, returning the whole message. Skips anything else (e.g. an earlier
+/// provisional) so a test can assert on a specific response.
+async fn recv_until_status(peer: &UdpSocket, prefix: &str) -> String {
+    let mut buf = [0u8; 8192];
+    loop {
+        let (n, _) = timeout(Duration::from_secs(5), peer.recv_from(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for a {prefix} response"))
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        if text.lines().next().unwrap_or_default().starts_with(prefix) {
+            return text;
+        }
+    }
+}
+
+/// Extract the `To` header's `tag=` value from a raw response, if present.
+fn response_to_tag(resp: &str) -> Option<String> {
+    resp.lines()
+        .find_map(|l| l.strip_prefix("To:").and_then(|v| v.split("tag=").nth(1)))
+        .map(|t| t.trim().to_string())
+}
+
+/// Every inbound INVITE must draw an automatic `100 Trying` (RFC 3261 §17.2.1).
+/// This is the provisional that both quenches INVITE retransmits and — per §9.1
+/// — lets a caller `CANCEL` if it hangs up before we answer. Without it a
+/// pre-answer hangup reaches the callee as nothing, and the call rings forever;
+/// this test is the regression guard for that "ghost ring" bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_invite_draws_automatic_100_trying() {
+    let cancel = CancellationToken::new();
+
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    let callee_addr: SocketAddr = format!("127.0.0.1:{}", callee.local_addr().port())
+        .parse()
+        .unwrap();
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+
+    peer.send_to(
+        &raw_invite(callee_addr, peer_addr, "z9hG4bK-auto100", false),
+        callee_addr,
+    )
+    .await
+    .unwrap();
+
+    // The 100 is emitted by the endpoint's inbound router the moment the INVITE
+    // lands — before the app even fishes the call off the queue.
+    let trying = recv_until_status(&peer, "SIP/2.0 100").await;
+    assert!(
+        trying.contains("100 Trying"),
+        "inbound INVITE must get an automatic 100 Trying; got:\n{trying}"
+    );
+
+    cancel.cancel();
+}
+
+/// `IncomingCall::ring()` sends a `180 Ringing`, and — the RFC 3261 §12.1.1
+/// requirement — its `To` tag matches the tag on the eventual `200 OK`, so the
+/// caller's early and confirmed dialogs are the same dialog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ring_sends_180_sharing_the_final_response_tag() {
+    let cancel = CancellationToken::new();
+
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    let callee_addr: SocketAddr = format!("127.0.0.1:{}", callee.local_addr().port())
+        .parse()
+        .unwrap();
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+
+    // Contact so the accepted dialog can form.
+    peer.send_to(
+        &raw_invite(callee_addr, peer_addr, "z9hG4bK-ring180", true),
+        callee_addr,
+    )
+    .await
+    .unwrap();
+    let incoming = timeout(Duration::from_secs(10), callee.next_incoming_call())
+        .await
+        .expect("inbound INVITE arrives")
+        .expect("inbound call");
+
+    // Alert the caller, then answer.
+    incoming.ring().await.expect("send 180 Ringing");
+    let ringing = recv_until_status(&peer, "SIP/2.0 180").await;
+    let tag_180 = response_to_tag(&ringing).expect("180 Ringing carries a To tag");
+
+    let _call = incoming.accept().await.expect("accept inbound call");
+    let ok = recv_until_status(&peer, "SIP/2.0 200").await;
+    let tag_200 = response_to_tag(&ok).expect("200 OK carries a To tag");
+
+    assert_eq!(
+        tag_180, tag_200,
+        "180 Ringing and 200 OK must carry the same UAS To tag (RFC 3261 §12.1.1)"
+    );
+
+    cancel.cancel();
+}
