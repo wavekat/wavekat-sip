@@ -19,6 +19,7 @@ fmt:
 	cargo fmt --all
 
 lint:
+	cargo clippy --workspace --all-features -- -D warnings
 	cargo clippy --workspace -- -D warnings
 
 doc:
