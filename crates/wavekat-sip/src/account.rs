@@ -15,6 +15,12 @@ pub enum Transport {
     Tcp,
     /// SIP over TLS (RFC 3261 §26.2.1). Defaults to port 5061 and is located
     /// via `_sips._tcp` SRV records.
+    ///
+    /// This variant exists regardless of build configuration, but using it
+    /// requires the `tls` cargo feature. Without that feature, establishing
+    /// an endpoint with this transport selected returns an `io::Error` with
+    /// [`io::ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported)
+    /// rather than failing to compile.
     Tls,
 }
 
@@ -26,6 +32,12 @@ pub enum Transport {
 /// [`Pinned`](TlsPolicy::Pinned) covers the case it is usually asked for — the
 /// self-signed on-premise server — and stays narrow: it trusts one certificate,
 /// not every certificate.
+///
+/// This type itself builds and (de)serializes with no cargo feature enabled —
+/// a consumer's stored config can carry a `tls_policy` unconditionally — but it
+/// only affects a connection once the `tls` feature is enabled and
+/// [`Transport::Tls`] is selected. Under any other transport it is accepted
+/// and ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

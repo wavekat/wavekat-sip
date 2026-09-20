@@ -28,6 +28,14 @@
 //!   the consumer.
 //! - **RTP** — header parser ([`RtpHeader`]), a debug-friendly receive loop
 //!   ([`receive_rtp`]), and a codec-agnostic send loop ([`send_loop`]).
+//! - **TLS** — SIP over TLS ([`Transport::Tls`]), gated behind the `tls`
+//!   cargo feature (off by default). Certificate verification against the
+//!   account's SIP domain, optional SHA-256 pinning ([`TlsPolicy`]), and a
+//!   typed error surface ([`CertFailure`], [`UntrustedCertificate`]).
+//!   `docs.rs` builds with all features, so this surface is always visible
+//!   here even when a consumer has not enabled it; see the crate README's
+//!   TLS section for the feature flag and the `Unsupported` error a
+//!   consumer gets if they select [`Transport::Tls`] without it.
 //!
 //! Explicitly out of scope (push these to the consuming application): audio
 //! device I/O, codec encode/decode, jitter buffering, recording; account
