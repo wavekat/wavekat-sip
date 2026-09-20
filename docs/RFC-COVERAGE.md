@@ -1,6 +1,6 @@
 # RFC coverage
 
-> Status: living document · Last audited: 2026-06-28 (deferred features reinstated — see `docs/17`)
+> Status: living document · Last audited: 2026-09-20 (TCP transport implemented — see `docs/18`)
 
 What standards this crate's **public API** implements, which parts of
 each, and what is knowingly absent. The yardstick is the surface a
@@ -238,15 +238,19 @@ typically a PBX/SBC on the same network or a trunk that latches):
 | 8489 / 8445 / 8656 | STUN, ICE, TURN | No NAT traversal; local address discovery is a UDP-connect trick only |
 | 3605 / 5761 | RTCP attribute in SDP, RTP/RTCP mux | No RTCP at all |
 | 3262 | PRACK / 100rel | Provisional responses are not acknowledged reliably |
-| 7118 | SIP over WebSocket | Not exposed (`Transport` is UDP/TCP only) |
+| 7118 | SIP over WebSocket | Not implemented (`Transport` is UDP/TCP only) |
 
 ### Transports
 
-The engine currently implements a **UDP** transport only. The `Transport`
-enum still carries a `Tcp` variant (and the transaction timers collapse their
-retransmission soak for a reliable transport), but a TCP transport
-implementation is not yet wired into the engine. TLS and WebSocket are out of
-scope.
+The engine implements **UDP** and **TCP**. `Transport::Udp` binds a datagram
+socket; `Transport::Tcp` connects to the resolved next hop, frames the byte
+stream per RFC 3261 §7.5 / §20.14, and reports itself reliable so the §17
+retransmission timers collapse as they should. `Via` names the transport
+actually in use and the registrar's `Contact` carries `;transport=tcp`, so a
+registrar routes inbound requests back over the connection we opened. RFC 5626
+§3.5.1 CRLF keepalives are accepted on the stream path (we do not yet send
+them, and do not yet reconnect a dropped connection). TLS and WebSocket are
+not implemented.
 
 ## Known gaps worth closing first
 
@@ -254,7 +258,10 @@ Ranked by how soon a real deployment trips over them:
 
 1. **`rport` (RFC 3581)** — needed for responses to come back through NAT/PAT;
    add `;rport` to outgoing Via and honor it on responses.
-2. **TCP transport** — the `Transport::Tcp` variant is currently inert.
+2. **Stream reconnect + keepalive** — a dropped TCP connection is not
+   re-established and we do not send RFC 5626 §3.5.1 CRLF keepalives, so a
+   NAT that times the connection out silently ends inbound reachability until
+   the endpoint is rebuilt.
 3. **RTCP receiver reports** — without them, neither side gets loss or jitter
    feedback; fine on a LAN, blind over the open internet.
 4. **TLS transport (SIPS)** — credentials currently ride plaintext except for

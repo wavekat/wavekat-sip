@@ -15,6 +15,9 @@ use rsip::SipMessage;
 use tokio::net::UdpSocket;
 use tracing::{debug, trace};
 
+use crate::account::Transport;
+
+use super::stream::StreamTransport;
 use super::transaction::Reliability;
 
 /// Largest datagram we will read. SIP-over-UDP messages must fit in a single
@@ -92,6 +95,69 @@ impl UdpTransport {
                     debug!(%src, bytes = n, "^ datagram above was unparseable; dropped");
                 }
             }
+        }
+    }
+}
+
+/// The bound transport the engine drives, in whichever shape the account
+/// selected.
+///
+/// An enum rather than a trait object: there are exactly two shapes, the crate
+/// carries no `async-trait` dependency, and keeping the dispatch visible is
+/// worth more here than open extension.
+pub(crate) enum BoundTransport {
+    /// UDP — one datagram per message, retransmission timers apply.
+    Datagram(UdpTransport),
+    /// TCP (and, later, TLS) — a framed byte stream to one next hop.
+    Stream(StreamTransport),
+}
+
+impl BoundTransport {
+    /// Bind (UDP) or connect (stream) for `transport`.
+    ///
+    /// `local` selects the outbound interface on the datagram path and is
+    /// ignored on the stream path, where connecting assigns the source
+    /// address. `peer` is the resolved next hop.
+    pub(crate) async fn bind(
+        local: SocketAddr,
+        peer: SocketAddr,
+        transport: Transport,
+    ) -> io::Result<Self> {
+        match transport {
+            Transport::Udp => Ok(Self::Datagram(UdpTransport::bind(local).await?)),
+            Transport::Tcp => Ok(Self::Stream(StreamTransport::connect(peer).await?)),
+        }
+    }
+
+    /// The address this transport sends from.
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Self::Datagram(t) => t.local_addr(),
+            Self::Stream(t) => t.local_addr(),
+        }
+    }
+
+    /// Whether RFC 3261 §17 retransmission timers apply.
+    pub(crate) fn reliability(&self) -> Reliability {
+        match self {
+            Self::Datagram(t) => t.reliability(),
+            Self::Stream(t) => t.reliability(),
+        }
+    }
+
+    /// Send one SIP message to `dst`.
+    pub(crate) async fn send_to(&self, msg: &SipMessage, dst: SocketAddr) -> io::Result<()> {
+        match self {
+            Self::Datagram(t) => t.send_to(msg, dst).await,
+            Self::Stream(t) => t.send_to(msg, dst).await,
+        }
+    }
+
+    /// Receive the next message and the address it came from.
+    pub(crate) async fn recv(&self) -> io::Result<(SipMessage, SocketAddr)> {
+        match self {
+            Self::Datagram(t) => t.recv().await,
+            Self::Stream(t) => t.recv().await,
         }
     }
 }
@@ -174,5 +240,59 @@ mod tests {
         let resp = Response::try_from(raw.as_bytes()).unwrap();
         let msg: SipMessage = resp.into();
         assert_eq!(parse(&serialize(&msg)).unwrap(), msg);
+    }
+
+    #[tokio::test]
+    async fn udp_kind_binds_a_datagram_transport() {
+        let peer: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let t = BoundTransport::bind("127.0.0.1:0".parse().expect("addr"), peer, Transport::Udp)
+            .await
+            .expect("binds");
+        assert!(matches!(t, BoundTransport::Datagram(_)));
+        assert!(!t.reliability().is_reliable(), "UDP is unreliable");
+    }
+
+    #[tokio::test]
+    async fn tcp_kind_binds_a_stream_transport() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let peer = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let t = BoundTransport::bind("127.0.0.1:0".parse().expect("addr"), peer, Transport::Tcp)
+            .await
+            .expect("binds");
+        assert!(
+            matches!(t, BoundTransport::Stream(_)),
+            "TCP must not silently bind UDP"
+        );
+        assert!(t.reliability().is_reliable(), "TCP is reliable");
+    }
+
+    /// The regression this whole phase exists for: before it, selecting TCP
+    /// produced a UDP socket reporting itself as unreliable.
+    #[tokio::test]
+    async fn tcp_local_addr_is_the_connections_not_a_udp_sockets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let peer = listener.local_addr().expect("addr");
+        let accepted = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            sock.peer_addr().expect("peer addr")
+        });
+
+        let t = BoundTransport::bind("127.0.0.1:0".parse().expect("addr"), peer, Transport::Tcp)
+            .await
+            .expect("binds");
+        let seen_by_server = accepted.await.expect("accept task");
+        assert_eq!(
+            t.local_addr().expect("local addr"),
+            seen_by_server,
+            "local_addr must be the TCP connection's address"
+        );
     }
 }

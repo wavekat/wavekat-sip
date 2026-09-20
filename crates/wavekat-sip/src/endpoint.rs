@@ -1,5 +1,6 @@
-//! Shared SIP endpoint: a bound UDP transport + the clean-room engine, with
-//! inbound requests routed to new calls or auto-answered in-dialog.
+//! Shared SIP endpoint: a bound SIP transport (UDP or TCP) + the clean-room
+//! engine, with inbound requests routed to new calls or auto-answered
+//! in-dialog.
 //!
 //! `SipEndpoint` owns the `Ua` (engine + router) and a
 //! background task that drains inbound requests:
@@ -93,17 +94,31 @@ impl SipEndpoint {
         product: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<Arc<Self>, BoxError> {
+        // Resolution comes first, and must: a stream transport has no local
+        // address until it has connected, and it cannot connect without
+        // knowing the next hop. The datagram path does not care about the
+        // order, so both share this one.
+        let server = resolve_sip_server(account)
+            .await?
+            .ok_or("could not resolve SIP server address")?;
+        info!(%server, "resolved SIP server");
+
+        // Selects the outbound interface on the datagram path; ignored on the
+        // stream path, where connecting assigns the source address.
         let local_ip = detect_local_ip(account)?;
         let bind_addr = SocketAddr::new(local_ip, 0);
         info!("Binding SIP transport to {bind_addr}");
 
         let ua = Arc::new(
-            Ua::bind_with_app(bind_addr, product.map(String::from), cancel.clone()).await?,
+            Ua::bind_with_app(
+                bind_addr,
+                server,
+                account.transport,
+                product.map(String::from),
+                cancel.clone(),
+            )
+            .await?,
         );
-        let server = resolve_sip_server(account)
-            .await?
-            .ok_or("could not resolve SIP server address")?;
-        info!(%server, "resolved SIP server");
 
         let (calls_tx, calls_rx) = mpsc::channel(16);
         let dialogs: DialogRegistry = Arc::new(StdMutex::new(HashMap::new()));
@@ -451,5 +466,54 @@ mod tests {
         // No explicit server → uses the domain (localhost resolves locally).
         let account = make_account(None, None);
         assert!(detect_local_ip(&account).is_ok());
+    }
+
+    /// A stream transport has no local address until it has connected, so the
+    /// next hop must be known before binding. Guarding the ordering directly
+    /// is awkward, so this asserts the observable consequence: a TCP endpoint
+    /// whose server does not resolve fails without having bound anything.
+    #[tokio::test]
+    async fn tcp_endpoint_fails_when_the_server_does_not_resolve() {
+        let mut account = make_account(Some("invalid.invalid"), Some(5060));
+        account.transport = Transport::Tcp;
+        let cancel = CancellationToken::new();
+        let result = SipEndpoint::new(&account, cancel).await;
+        assert!(
+            result.is_err(),
+            "an unresolvable server must not yield an endpoint"
+        );
+    }
+
+    /// A TCP endpoint against a real listener reports the connection's own
+    /// local address — the regression guard for "TCP silently bound UDP".
+    #[tokio::test]
+    async fn tcp_endpoint_binds_a_stream_to_the_resolved_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accepted = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            let seen = sock.peer_addr().expect("peer addr");
+            // Hold the connection open so the read task does not see EOF.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            seen
+        });
+
+        let mut account = make_account(Some("127.0.0.1"), Some(addr.port()));
+        account.transport = Transport::Tcp;
+        let cancel = CancellationToken::new();
+        let endpoint = SipEndpoint::new(&account, cancel.clone())
+            .await
+            .expect("binds a TCP endpoint");
+
+        assert_eq!(endpoint.transport(), Transport::Tcp);
+        let seen_by_server = accepted.await.expect("accept task");
+        assert_eq!(
+            endpoint.local_addr(),
+            seen_by_server,
+            "local address comes from the TCP connection, not a UDP socket"
+        );
+        endpoint.shutdown();
     }
 }
