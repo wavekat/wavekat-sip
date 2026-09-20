@@ -200,6 +200,7 @@ match SipEndpoint::new(&account, cancel).await {
 | `callee`    | Working — inbound INVITE accept/reject.                |
 | `sdp`       | Working — Opus + G.711 offer/answer (negotiation only). |
 | `rtp`       | Working — header parser, receive loop, send loop.      |
+| `tls_error` | Working — typed `CertFailure` / `UntrustedCertificate` reporting for TLS. |
 
 ## Architecture
 

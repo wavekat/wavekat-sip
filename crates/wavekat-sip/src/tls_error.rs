@@ -31,6 +31,11 @@ pub enum CertFailure {
     /// [`TlsPolicy::Pinned`](crate::TlsPolicy::Pinned).
     PinMismatch,
     /// The certificate could not be parsed.
+    ///
+    /// Unlikely to reach a consumer in practice: a failure this early — before
+    /// the verifier is even entered — leaves no fingerprint recorded and
+    /// surfaces as an opaque `io::Error`, not a typed [`UntrustedCertificate`].
+    /// Don't build a branch that assumes this arm fires.
     Malformed,
     /// A TLS failure this enum has no dedicated variant for. This can still
     /// be a certificate problem — one of the less common
