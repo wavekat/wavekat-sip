@@ -449,6 +449,7 @@ fn detect_local_ip(account: &SipAccount) -> Result<IpAddr, BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::TlsPolicy;
 
     fn make_account(server: Option<&str>, port: Option<u16>) -> SipAccount {
         SipAccount {
@@ -460,7 +461,7 @@ mod tests {
             server: server.map(|s| s.to_string()),
             port,
             transport: Transport::default(),
-            tls_policy: crate::account::TlsPolicy::default(),
+            tls_policy: TlsPolicy::default(),
         }
     }
 

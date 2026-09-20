@@ -206,7 +206,7 @@ impl Registrar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::Transport;
+    use crate::account::{TlsPolicy, Transport};
 
     fn account() -> SipAccount {
         SipAccount {
@@ -218,7 +218,7 @@ mod tests {
             server: Some("127.0.0.1".into()),
             port: Some(5060),
             transport: Transport::Udp,
-            tls_policy: crate::account::TlsPolicy::default(),
+            tls_policy: TlsPolicy::default(),
         }
     }
 

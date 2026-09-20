@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use wavekat_sip::re_exports::Uri;
-use wavekat_sip::{Caller, Registrar, SipAccount, SipEndpoint, Transport};
+use wavekat_sip::{Caller, Registrar, SipAccount, SipEndpoint, TlsPolicy, Transport};
 
 fn account(port: u16) -> SipAccount {
     SipAccount {
@@ -26,7 +26,7 @@ fn account(port: u16) -> SipAccount {
         server: Some("127.0.0.1".into()),
         port: Some(port),
         transport: Transport::Tcp,
-        tls_policy: Default::default(),
+        tls_policy: TlsPolicy::default(),
     }
 }
 

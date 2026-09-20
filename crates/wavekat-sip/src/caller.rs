@@ -549,7 +549,7 @@ impl Caller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::Transport;
+    use crate::account::{TlsPolicy, Transport};
 
     fn test_account() -> SipAccount {
         SipAccount {
@@ -561,7 +561,7 @@ mod tests {
             server: Some("pbx.example.com".to_string()),
             port: Some(5080),
             transport: Transport::Udp,
-            tls_policy: crate::account::TlsPolicy::default(),
+            tls_policy: TlsPolicy::default(),
         }
     }
 

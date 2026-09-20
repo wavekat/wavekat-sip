@@ -269,6 +269,7 @@ async fn resolve_with<D: Dns>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::TlsPolicy;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -291,7 +292,7 @@ mod tests {
             server: server.map(str::to_string),
             port,
             transport,
-            tls_policy: crate::account::TlsPolicy::default(),
+            tls_policy: TlsPolicy::default(),
         }
     }
 

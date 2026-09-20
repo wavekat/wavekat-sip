@@ -389,6 +389,30 @@ Content-Length: 0\r\n\r\n"
             .is_err());
     }
 
+    /// `TransportSetup { transport: Tls, tls: None }` is representable —
+    /// `Transport::Tls.into()` (the `From<Transport>` shim every plain
+    /// UDP/TCP call site relies on) produces exactly that — even though this
+    /// module can never actually negotiate TLS from it. `BoundTransport::
+    /// bind` always builds a real `TlsSetup` when it selects `Transport::
+    /// Tls` (see `endpoint.rs`), so this hazard path is unreached in
+    /// practice, but it must still fail clearly rather than panic or silently
+    /// fall back to cleartext if something ever reaches it directly.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn tls_transport_without_a_tls_setup_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let result = StreamTransport::connect(addr, &Transport::Tls.into()).await;
+        match result {
+            Ok(_) => panic!("must not connect without a TLS setup"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+        }
+    }
+
     /// `SipStream` must delegate reads and writes to its inner transport
     /// unchanged — the framer and read task above it depend on that, and a
     /// future `Tls` arm has to satisfy the same contract.

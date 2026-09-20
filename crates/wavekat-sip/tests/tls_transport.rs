@@ -10,9 +10,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use wavekat_sip::{untrusted_certificate, CertFailure, SipAccount, TlsPolicy, Transport};
 
-/// A CA (PEM-encoded — `verifies_the_sip_domain_not_the_resolved_target`
+/// A CA (PEM-encoded — `system_roots_checks_the_domain_and_rejects_untrusted_chains`
 /// stands it up as a trusted root via `SSL_CERT_FILE`) and a leaf it signs
-/// for `names`.
+/// for `names`. A name that parses as an IP address (e.g. `"127.0.0.1"`)
+/// becomes an IP SAN rather than a DNS SAN — `rcgen::CertificateParams::new`'s
+/// own behavior, not something this helper adds.
 fn chain(names: &[&str]) -> (String, Vec<u8>, Vec<u8>) {
     let mut ca_params = CertificateParams::new(Vec::new()).expect("ca params");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -68,31 +70,6 @@ fn account(server: &str, port: u16, policy: TlsPolicy) -> SipAccount {
     }
 }
 
-/// Serializes every test below that reads or writes `SSL_CERT_FILE`.
-///
-/// `TlsPolicy::SystemRoots` goes through the platform verifier's
-/// native-certs loader, which reads `SSL_CERT_FILE` off the process
-/// environment (`std::env::var_os`) on Unix. `std::env::set_var` racing a
-/// concurrent read on another thread is unsound, and `cargo test` runs each
-/// test function on its own thread — so every test that can reach that read
-/// (any `SystemRoots` connection attempt) or that write (only the RFC 5922
-/// regression test) takes this lock first.
-static CERT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Write `pem` to a fresh, process-unique temp file and return its path.
-fn write_temp_ca_pem(pem: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "wavekat-sip-test-ca-{}-{nanos}.pem",
-        std::process::id()
-    ));
-    std::fs::write(&path, pem).expect("write temp CA file");
-    path
-}
-
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Attempt a connection, with a timeout so a hung handshake fails the test
@@ -112,59 +89,157 @@ async fn connect_endpoint(
     }
 }
 
-/// The RFC 5922 §7.1 regression test.
+/// Guards the one test function below that mutates `SSL_CERT_FILE`.
 ///
-/// The certificate is valid for the SRV target and *not* for the SIP domain.
-/// If the implementation verified the resolved host, this would connect — which
-/// is exactly the failure that leaves a connection looking secure while whoever
-/// answers the DNS query chooses the identity.
-#[tokio::test]
-async fn verifies_the_sip_domain_not_the_resolved_target() {
-    let (ca_pem, leaf, key) = chain(&["edge-3.example.net"]);
-    let (addr, _h) = tls_listener(leaf, key).await;
-    // domain is sip.example.com; we connect to 127.0.0.1 standing in for the
-    // SRV target the certificate *is* valid for.
-    let acct = account("127.0.0.1", addr.port(), TlsPolicy::SystemRoots);
+/// Kept even though only that one function touches the environment now, so a
+/// second test added later that also needs to override the trust store is
+/// forced to coordinate through it rather than quietly racing it.
+///
+/// It is not a complete fix for `std::env::set_var`'s actual soundness
+/// requirement — see `TrustedCaOverride`'s doc for the residual this does
+/// not close.
+static CERT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    // `TlsPolicy::SystemRoots` verifies against the platform's real trust
-    // store, which rightly does not trust a certificate this test just
-    // generated. Left alone, the handshake fails on the untrusted issuer
-    // before ever reaching the name check this test exists to exercise — so
-    // the test stands its own CA up as an *additional* trusted root for the
-    // duration of the connection attempt, via `SSL_CERT_FILE` (the same
-    // input the platform verifier's native-certs loader already reads on
-    // Unix). That makes the chain trusted and lets the real assertion — the
-    // account's domain, not the SRV target, is what gets checked — run on
-    // its own, rather than being pre-empted by an unrelated trust failure.
-    let guard = CERT_ENV_LOCK.lock().expect("lock");
-    let ca_path = write_temp_ca_pem(&ca_pem);
-    let prev_cert_file = std::env::var_os("SSL_CERT_FILE");
-    // Safety: serialized by `CERT_ENV_LOCK` against every other test in this
-    // binary that reads or writes `SSL_CERT_FILE`.
-    unsafe { std::env::set_var("SSL_CERT_FILE", &ca_path) };
+/// Write `pem` to a fresh, process-unique temp file and return its path.
+fn write_temp_ca_pem(pem: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "wavekat-sip-test-ca-{}-{nanos}.pem",
+        std::process::id()
+    ));
+    std::fs::write(&path, pem).expect("write temp CA file");
+    path
+}
 
-    let result = connect_endpoint(&acct).await;
+/// Points `SSL_CERT_FILE` at a temp file holding `pem` — standing that CA up
+/// as a trusted root for the platform verifier's native-certs loader — for
+/// as long as this guard lives. Restores the previous value (or clears it)
+/// and deletes the temp file on drop, including on an unwind, so a panic
+/// between `install` and the end of the test cannot leave the environment or
+/// a stray temp file behind for the next test to trip over.
+///
+/// # What the surrounding `CERT_ENV_LOCK` does and does not make sound
+///
+/// `std::env::set_var`'s actual requirement is that no *other thread* call
+/// `getenv` for *any* variable while this mutates the environment — not just
+/// for `SSL_CERT_FILE`. `CERT_ENV_LOCK` excludes every other test in this
+/// binary that itself touches `SSL_CERT_FILE` (currently none — this is the
+/// only place that does). It does **not** exclude the `Pinned`-policy tests
+/// below, which run concurrently on their own threads: their own
+/// `SipEndpoint::new` calls (DNS resolution, tokio, tracing) may call
+/// `getenv` for an unrelated variable while this guard is live, and nothing
+/// here prevents that. That residual is accepted rather than hidden: the
+/// mutation window is exactly one TLS handshake attempt, and if the
+/// underlying native-certs lookup ever stops honouring `SSL_CERT_FILE`, the
+/// chain simply goes untrusted and the test using this guard fails loudly
+/// with `UnknownIssuer` — it does not pass for the wrong reason.
+struct TrustedCaOverride {
+    prev: Option<std::ffi::OsString>,
+    path: std::path::PathBuf,
+}
 
-    // Safety: see above.
-    unsafe {
-        match &prev_cert_file {
-            Some(v) => std::env::set_var("SSL_CERT_FILE", v),
-            None => std::env::remove_var("SSL_CERT_FILE"),
-        }
+impl TrustedCaOverride {
+    fn install(pem: &str) -> Self {
+        let path = write_temp_ca_pem(pem);
+        let prev = std::env::var_os("SSL_CERT_FILE");
+        // Safety: see this type's doc for what `CERT_ENV_LOCK` does and does
+        // not exclude.
+        unsafe { std::env::set_var("SSL_CERT_FILE", &path) };
+        Self { prev, path }
     }
-    let _ = std::fs::remove_file(&ca_path);
-    drop(guard);
+}
 
-    let err = match result {
-        Err(e) => e,
-        Ok(_) => panic!("must not connect"),
-    };
-    let u = untrusted_certificate(err.as_ref()).expect("reports the certificate");
-    assert!(
-        matches!(u.reason, CertFailure::NameMismatch { .. }),
-        "expected a name mismatch, got {:?}",
-        u.reason
-    );
+impl Drop for TrustedCaOverride {
+    fn drop(&mut self) {
+        // Safety: see this type's doc.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var("SSL_CERT_FILE", v),
+                None => std::env::remove_var("SSL_CERT_FILE"),
+            }
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// `TlsPolicy::SystemRoots` end to end: the RFC 5922 §7.1 domain check (the
+/// property this whole feature exists for), and an untrusted chain being
+/// refused with its fingerprint reported. One function, not two, so this is
+/// the only place in the binary that ever touches `SSL_CERT_FILE` — see
+/// `TrustedCaOverride`'s doc for what holding `CERT_ENV_LOCK` here does and
+/// does not make sound.
+///
+/// Unix-only: the trusted-root setup in the first case below rides
+/// `SSL_CERT_FILE`, which is specific to the native-certs loader
+/// `rustls-platform-verifier` uses on Unix. On another OS the certificate
+/// would stay untrusted and this would fail with `UnknownIssuer` instead of
+/// `NameMismatch`, for reasons that have nothing to do with the code under
+/// test — skipped there rather than left to produce a confusing result.
+#[cfg(unix)]
+#[tokio::test]
+async fn system_roots_checks_the_domain_and_rejects_untrusted_chains() {
+    let _lock = CERT_ENV_LOCK.lock().expect("lock");
+
+    // --- RFC 5922 §7.1: the account's domain is what gets verified, never
+    // the resolved target. ---
+    //
+    // The leaf's only SAN is an IP SAN for 127.0.0.1 — the address the
+    // socket actually dials, i.e. exactly the identity a *wrong*
+    // implementation (one that verified the resolved target instead of the
+    // account's domain) would find and accept. The account's domain is
+    // sip.example.com, which this certificate was never issued for. So the
+    // right implementation gets a `NameMismatch`; a wrong one completes the
+    // handshake, and the `Ok(_) => panic!` arm below is what catches that —
+    // this is what makes the test discriminate between the two, not just
+    // assert that *some* failure happened. (Verified directly: see the fix
+    // report for the command that points `stack::tls::connect`'s
+    // `server_name` at the resolved target instead of `account.domain` and
+    // confirms this test then fails at that `panic!`, not at the
+    // `CertFailure` assertion.)
+    {
+        let (ca_pem, leaf, key) = chain(&["127.0.0.1"]);
+        let (addr, _h) = tls_listener(leaf, key).await;
+        let acct = account("127.0.0.1", addr.port(), TlsPolicy::SystemRoots);
+        let _trust = TrustedCaOverride::install(&ca_pem);
+
+        let err = match connect_endpoint(&acct).await {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "must not connect: an identity valid for the resolved target \
+                 was accepted in place of the account's domain"
+            ),
+        };
+        let u = untrusted_certificate(err.as_ref()).expect("reports the certificate");
+        assert!(
+            matches!(u.reason, CertFailure::NameMismatch { .. }),
+            "expected a name mismatch, got {:?}",
+            u.reason
+        );
+    }
+
+    // --- An untrusted chain is refused too, and reports the fingerprint it
+    // actually saw. No override here: the `TrustedCaOverride` above already
+    // dropped at the end of its block, so this runs against whatever the
+    // platform verifier finds on its own. ---
+    {
+        let (_ca, leaf, key) = chain(&["sip.example.com"]);
+        let (addr, _h) = tls_listener(leaf, key).await;
+        let acct = account("127.0.0.1", addr.port(), TlsPolicy::SystemRoots);
+
+        let err = match connect_endpoint(&acct).await {
+            Err(e) => e,
+            Ok(_) => panic!("must not connect"),
+        };
+        let u = untrusted_certificate(err.as_ref()).expect("reports the certificate");
+        assert!(matches!(
+            u.reason,
+            CertFailure::UnknownIssuer | CertFailure::NameMismatch { .. }
+        ));
+        assert_ne!(u.sha256, [0u8; 32]);
+    }
 }
 
 #[tokio::test]
@@ -200,30 +275,4 @@ async fn a_wrong_pin_is_refused_despite_a_valid_chain() {
     let u = untrusted_certificate(err.as_ref()).expect("reports the certificate");
     assert_eq!(u.reason, CertFailure::PinMismatch);
     assert_eq!(u.fingerprint_hex().len(), 64, "reports what it saw");
-}
-
-#[tokio::test]
-async fn an_untrusted_chain_is_refused_and_reports_its_fingerprint() {
-    let (_ca, leaf, key) = chain(&["sip.example.com"]);
-    let (addr, _h) = tls_listener(leaf, key).await;
-    let acct = account("127.0.0.1", addr.port(), TlsPolicy::SystemRoots);
-
-    // Shares `CERT_ENV_LOCK` with the RFC 5922 regression test above: both
-    // reach the platform verifier's native-certs loader, which reads
-    // `SSL_CERT_FILE` off the process environment, and that read must not
-    // race that test's write of it.
-    let guard = CERT_ENV_LOCK.lock().expect("lock");
-    let result = connect_endpoint(&acct).await;
-    drop(guard);
-
-    let err = match result {
-        Err(e) => e,
-        Ok(_) => panic!("must not connect"),
-    };
-    let u = untrusted_certificate(err.as_ref()).expect("reports the certificate");
-    assert!(matches!(
-        u.reason,
-        CertFailure::UnknownIssuer | CertFailure::NameMismatch { .. }
-    ));
-    assert_ne!(u.sha256, [0u8; 32]);
 }

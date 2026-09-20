@@ -53,6 +53,7 @@ pub(crate) struct TransportSetup {
 pub(crate) struct TlsSetup {
     /// The account's SIP domain — RFC 5922 §7.1. Never the SRV target.
     pub(crate) server_name: String,
+    /// How to trust the server's certificate.
     pub(crate) policy: crate::account::TlsPolicy,
 }
 
@@ -156,6 +157,18 @@ impl BoundTransport {
     ) -> io::Result<Self> {
         match setup.transport {
             Transport::Udp => Ok(Self::Datagram(UdpTransport::bind(local).await?)),
+            // Rejected here, before any socket is touched — not folded into
+            // the `Tcp | Tls` arm below, which would open a real TCP
+            // connection (and only then reject it) for a transport this
+            // build cannot use at all.
+            #[cfg(not(feature = "tls"))]
+            Transport::Tls => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS transport requires the `tls` feature",
+            )),
+            #[cfg(not(feature = "tls"))]
+            Transport::Tcp => Ok(Self::Stream(StreamTransport::connect(peer, setup).await?)),
+            #[cfg(feature = "tls")]
             Transport::Tcp | Transport::Tls => {
                 Ok(Self::Stream(StreamTransport::connect(peer, setup).await?))
             }
@@ -357,26 +370,15 @@ mod tests {
         );
     }
 
-    /// Without the `tls` feature, `Transport::Tls` must fail loudly rather
-    /// than silently falling back to a cleartext transport. With the feature
-    /// on, this same selection is exercised end-to-end in
-    /// `tests/tls_transport.rs`.
-    ///
-    /// Connects to a real listener rather than a closed port: the TCP
-    /// handshake happens before the feature check (see `StreamTransport::
-    /// connect`'s doc comment), so a closed port would fail with
-    /// `ConnectionRefused` before ever reaching the case this test targets.
+    /// Without the `tls` feature, `Transport::Tls` must fail loudly, and
+    /// without ever touching the network — `bind` rejects it directly rather
+    /// than routing it through `StreamTransport::connect` and opening a TCP
+    /// connection it can never use. With the feature on, this same selection
+    /// is exercised end-to-end in `tests/tls_transport.rs`.
     #[cfg(not(feature = "tls"))]
     #[tokio::test]
     async fn tls_kind_is_rejected_without_the_tls_feature() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let peer = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
-
+        let peer: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let result = BoundTransport::bind(
             "127.0.0.1:0".parse().expect("addr"),
             peer,
