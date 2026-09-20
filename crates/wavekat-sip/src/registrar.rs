@@ -218,6 +218,7 @@ mod tests {
             server: Some("127.0.0.1".into()),
             port: Some(5060),
             transport: Transport::Udp,
+            tls_policy: crate::account::TlsPolicy::default(),
         }
     }
 

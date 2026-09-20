@@ -291,6 +291,7 @@ mod tests {
             server: server.map(str::to_string),
             port,
             transport,
+            tls_policy: crate::account::TlsPolicy::default(),
         }
     }
 

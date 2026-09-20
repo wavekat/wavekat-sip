@@ -35,6 +35,10 @@ use super::transport::serialize;
 /// is a TCP connection with a handshake in front of it.
 pub(crate) enum SipStream {
     Tcp(TcpStream),
+    /// Boxed: a rustls connection is large enough that an inline variant would
+    /// set the enum's size for the TCP arm too.
+    #[cfg(feature = "tls")]
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for SipStream {
@@ -45,6 +49,8 @@ impl AsyncRead for SipStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -57,18 +63,24 @@ impl AsyncWrite for SipStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -89,15 +101,43 @@ pub(crate) struct StreamTransport {
 
 impl StreamTransport {
     /// Connect to `peer` and start reading framed messages from it.
-    pub(crate) async fn connect(peer: SocketAddr) -> io::Result<Self> {
+    ///
+    /// For TLS the TCP connection is established first and then upgraded, so a
+    /// refused port and a refused certificate stay distinguishable.
+    pub(crate) async fn connect(
+        peer: SocketAddr,
+        setup: &super::transport::TransportSetup,
+    ) -> io::Result<Self> {
         let sock = TcpStream::connect(peer).await?;
-        // SIP is request/response over small messages; Nagle's algorithm
-        // would hold a request back waiting for more bytes that are not
-        // coming.
+        // SIP is request/response over small messages; Nagle's algorithm would
+        // hold a request back waiting for more bytes that are not coming.
         sock.set_nodelay(true)?;
         let local = sock.local_addr()?;
-        let (read, write) = tokio::io::split(SipStream::Tcp(sock));
 
+        let stream = match setup.transport {
+            #[cfg(feature = "tls")]
+            crate::account::Transport::Tls => {
+                let tls = setup.tls.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "TLS transport selected without a TLS setup",
+                    )
+                })?;
+                SipStream::Tls(Box::new(
+                    super::tls::connect(sock, &tls.server_name, &tls.policy).await?,
+                ))
+            }
+            #[cfg(not(feature = "tls"))]
+            crate::account::Transport::Tls => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "TLS transport requires the `tls` feature",
+                ))
+            }
+            _ => SipStream::Tcp(sock),
+        };
+
+        let (read, write) = tokio::io::split(stream);
         let (tx, rx) = mpsc::channel(INBOUND_DEPTH);
         tokio::spawn(read_task(read, peer, tx));
 
@@ -200,6 +240,7 @@ async fn read_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::Transport;
     use tokio::net::TcpListener;
 
     fn options_to(dst: SocketAddr) -> SipMessage {
@@ -236,7 +277,9 @@ Content-Length: 0\r\n\r\n"
             let _ = listener.accept().await;
         });
 
-        let t = StreamTransport::connect(addr).await.expect("connects");
+        let t = StreamTransport::connect(addr, &Transport::Tcp.into())
+            .await
+            .expect("connects");
         let local = t.local_addr().expect("local addr");
         assert_eq!(local.ip().to_string(), "127.0.0.1");
         assert_ne!(local.port(), 0, "the OS assigned a real port");
@@ -249,7 +292,9 @@ Content-Length: 0\r\n\r\n"
         tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        let t = StreamTransport::connect(addr).await.expect("connects");
+        let t = StreamTransport::connect(addr, &Transport::Tcp.into())
+            .await
+            .expect("connects");
         assert!(t.reliability().is_reliable());
     }
 
@@ -264,7 +309,9 @@ Content-Length: 0\r\n\r\n"
             String::from_utf8_lossy(&buf[..n]).to_string()
         });
 
-        let t = StreamTransport::connect(addr).await.expect("connects");
+        let t = StreamTransport::connect(addr, &Transport::Tcp.into())
+            .await
+            .expect("connects");
         t.send_to(&options_to(addr), addr).await.expect("sends");
 
         let got = server.await.expect("server task");
@@ -281,7 +328,9 @@ Content-Length: 0\r\n\r\n"
         tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        let t = StreamTransport::connect(addr).await.expect("connects");
+        let t = StreamTransport::connect(addr, &Transport::Tcp.into())
+            .await
+            .expect("connects");
         let elsewhere: SocketAddr = "127.0.0.1:1".parse().expect("addr");
         assert!(t.send_to(&options_to(addr), elsewhere).await.is_err());
     }
@@ -299,7 +348,9 @@ Content-Length: 0\r\n\r\n"
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         });
 
-        let t = StreamTransport::connect(addr).await.expect("connects");
+        let t = StreamTransport::connect(addr, &Transport::Tcp.into())
+            .await
+            .expect("connects");
         t.send_to(&options_to(addr), addr).await.expect("sends");
         let (msg, src) = t.recv().await.expect("receives");
         assert!(matches!(msg, SipMessage::Response(_)));
@@ -320,7 +371,9 @@ Content-Length: 0\r\n\r\n"
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         });
 
-        let t = StreamTransport::connect(addr).await.expect("connects");
+        let t = StreamTransport::connect(addr, &Transport::Tcp.into())
+            .await
+            .expect("connects");
         assert!(t.recv().await.is_ok(), "first message");
         assert!(t.recv().await.is_ok(), "second message");
     }
@@ -331,7 +384,9 @@ Content-Length: 0\r\n\r\n"
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         drop(listener);
-        assert!(StreamTransport::connect(addr).await.is_err());
+        assert!(StreamTransport::connect(addr, &Transport::Tcp.into())
+            .await
+            .is_err());
     }
 
     /// `SipStream` must delegate reads and writes to its inner transport

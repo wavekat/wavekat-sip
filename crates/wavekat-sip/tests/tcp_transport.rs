@@ -26,6 +26,7 @@ fn account(port: u16) -> SipAccount {
         server: Some("127.0.0.1".into()),
         port: Some(port),
         transport: Transport::Tcp,
+        tls_policy: Default::default(),
     }
 }
 

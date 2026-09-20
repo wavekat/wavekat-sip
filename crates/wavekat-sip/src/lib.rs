@@ -37,7 +37,7 @@
 //!
 //! ```no_run
 //! use tokio_util::sync::CancellationToken;
-//! use wavekat_sip::{Registrar, SipAccount, SipEndpoint, Transport};
+//! use wavekat_sip::{Registrar, SipAccount, SipEndpoint, TlsPolicy, Transport};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //! let account = SipAccount {
@@ -49,6 +49,7 @@
 //!     server: None,
 //!     port: None,
 //!     transport: Transport::Udp,
+//!     tls_policy: TlsPolicy::default(),
 //! };
 //!
 //! let cancel = CancellationToken::new();

@@ -22,6 +22,7 @@ fn account(domain: &str) -> SipAccount {
         server: None,
         port: None,
         transport: Transport::Udp,
+        tls_policy: Default::default(),
     }
 }
 

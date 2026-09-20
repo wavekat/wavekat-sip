@@ -561,6 +561,7 @@ mod tests {
             server: Some("pbx.example.com".to_string()),
             port: Some(5080),
             transport: Transport::Udp,
+            tls_policy: crate::account::TlsPolicy::default(),
         }
     }
 

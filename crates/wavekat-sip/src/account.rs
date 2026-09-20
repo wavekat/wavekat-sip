@@ -64,6 +64,10 @@ pub struct SipAccount {
     /// Transport protocol, defaults to UDP.
     #[serde(default)]
     pub transport: Transport,
+    /// How to verify the server's certificate under [`Transport::Tls`].
+    /// Ignored for UDP and TCP.
+    #[serde(default)]
+    pub tls_policy: TlsPolicy,
 }
 
 impl SipAccount {
@@ -104,6 +108,7 @@ mod tests {
             server: None,
             port: None,
             transport: Transport::default(),
+            tls_policy: TlsPolicy::default(),
         }
     }
 
@@ -199,5 +204,30 @@ mod tests {
     fn tls_policy_serializes_as_snake_case() {
         let json = serde_json::to_string(&TlsPolicy::SystemRoots).expect("serialize");
         assert_eq!(json, "\"system_roots\"");
+    }
+
+    #[test]
+    fn tls_policy_defaults_to_system_roots() {
+        assert_eq!(make_account().tls_policy, TlsPolicy::SystemRoots);
+    }
+
+    /// A consumer's config predating `tls_policy` — no such key at all — must
+    /// still deserialize, with the field defaulting rather than erroring.
+    /// (No `toml` dev-dependency in this crate; `serde_json` exercises the
+    /// same `#[serde(default)]` path `TlsPolicy` relies on.)
+    #[test]
+    fn a_config_without_tls_policy_still_deserializes() {
+        let json = r#"{
+            "display_name": "Test",
+            "username": "1001",
+            "password": "secret",
+            "domain": "sip.example.com",
+            "auth_username": null,
+            "server": null,
+            "port": null,
+            "transport": "udp"
+        }"#;
+        let acct: SipAccount = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(acct.tls_policy, TlsPolicy::SystemRoots);
     }
 }
