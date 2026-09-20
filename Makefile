@@ -26,6 +26,8 @@ doc:
 
 ci:
 	cargo fmt --all -- --check
+	cargo clippy --workspace --all-features -- -D warnings
 	cargo clippy --workspace -- -D warnings
+	cargo test --workspace --all-features
 	cargo test --workspace
 	cargo doc --no-deps -p wavekat-sip --all-features

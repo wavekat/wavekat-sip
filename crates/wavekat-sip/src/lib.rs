@@ -166,8 +166,9 @@ pub mod session_timer;
 // Internal clean-room SIP engine (see `docs/08-own-sip-stack.md`). Entirely
 // `pub(crate)`: it never appears in this crate's public API.
 pub(crate) mod stack;
+pub mod tls_error;
 
-pub use account::{SipAccount, Transport};
+pub use account::{SipAccount, TlsPolicy, Transport};
 pub use callee::IncomingCall;
 pub use caller::{Call, CallSession, Caller, InboundRequests};
 pub use dtmf_info::{build_info_body, content_type_header, InfoOutcome};
@@ -195,6 +196,7 @@ pub use session_timer::{
     SessionExpires, SessionTimer, SessionTimerOutcome, UasSessionTimer,
     DEFAULT_SESSION_EXPIRES_SECS, MIN_SESSION_EXPIRES_SECS,
 };
+pub use tls_error::{untrusted_certificate, CertFailure, UntrustedCertificate};
 
 /// Re-exports of the [`rsip`] message types that appear in our public API.
 /// Pinning them here lets consumers depend only on `wavekat-sip`.

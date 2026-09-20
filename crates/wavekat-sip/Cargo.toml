@@ -12,6 +12,11 @@ keywords = ["sip", "rtp", "voip", "telephony", "wavekat"]
 categories = ["network-programming", "multimedia::audio"]
 build = "build.rs"
 
+[features]
+default = []
+# SIP over TLS (`Transport::Tls`). See docs/19-sip-over-tls.md.
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-platform-verifier", "dep:sha2"]
+
 [dependencies]
 # Only `rsip` (SIP message types) is used; the transaction/dialog/transport
 # engine is built in-house under `src/stack/` (see docs/08-own-sip-stack.md).
@@ -24,9 +29,21 @@ thiserror = "2"
 hostname = "0.4"
 # DNS SRV lookups for RFC 3263 server location (src/resolve.rs).
 hickory-resolver = "0.25"
+# SIP over TLS, all optional behind the `tls` feature. `rustls` rather than
+# `native-tls`: no OpenSSL in a consumer's cross-build.
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-platform-verifier = { version = "0.7", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+# Test certificates are generated in-test, so nothing is checked into the repo
+# and nothing has to be rotated.
+rcgen = "0.14"
+# Exercises the derived Serialize/Deserialize impls on config types (e.g.
+# TlsPolicy) that a consumer stores; not used by the library itself.
+serde_json = "1"
 
 [package.metadata.docs.rs]
 all-features = true

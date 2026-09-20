@@ -18,6 +18,30 @@ pub enum Transport {
     Tls,
 }
 
+/// How to decide whether to trust a TLS server's certificate.
+///
+/// There is deliberately no "skip verification" variant. It is the setting
+/// people enable to make an error message disappear, after which the connection
+/// has ceremony and no security, permanently, with nothing saying so.
+/// [`Pinned`](TlsPolicy::Pinned) covers the case it is usually asked for — the
+/// self-signed on-premise server — and stays narrow: it trusts one certificate,
+/// not every certificate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TlsPolicy {
+    /// Validate against the operating system's trust store. A private CA an
+    /// administrator has installed system-wide works with no extra setup.
+    #[default]
+    SystemRoots,
+    /// Accept exactly one certificate, by SHA-256 of its DER encoding.
+    Pinned {
+        /// The pinned fingerprint. [`UntrustedCertificate::sha256`](crate::UntrustedCertificate::sha256)
+        /// reports the value to pin.
+        sha256: [u8; 32],
+    },
+}
+
 /// Runtime SIP account. The password is held in memory while the endpoint
 /// is registered; load it from your application's secret store on startup.
 #[derive(Debug, Clone, Deserialize)]
@@ -149,5 +173,31 @@ mod tests {
         assert_eq!(acct.port(), 5060);
         acct.transport = Transport::Udp;
         assert_eq!(acct.port(), 5060);
+    }
+
+    #[test]
+    fn tls_policy_default_is_system_roots() {
+        assert_eq!(TlsPolicy::default(), TlsPolicy::SystemRoots);
+    }
+
+    #[test]
+    fn tls_policy_round_trips_through_serde() {
+        // A consumer's stored account config carries `TlsPolicy` with
+        // `#[serde(default)]`; if the derive ever stops round-tripping, that
+        // config silently stops loading correctly.
+        for policy in [
+            TlsPolicy::SystemRoots,
+            TlsPolicy::Pinned { sha256: [9u8; 32] },
+        ] {
+            let json = serde_json::to_string(&policy).expect("serialize");
+            let back: TlsPolicy = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(policy, back, "round trip through {json}");
+        }
+    }
+
+    #[test]
+    fn tls_policy_serializes_as_snake_case() {
+        let json = serde_json::to_string(&TlsPolicy::SystemRoots).expect("serialize");
+        assert_eq!(json, "\"system_roots\"");
     }
 }
