@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`tls_error`).
 
   This ships in the 0.2.x line by deliberate maintainer decision, so it is
-  not a major-version bump — but it is not additive either. It carries two
+  not a major-version bump — but it is not additive either. It carries three
   source-breaking changes, and cargo treats `0.2.x -> 0.2.y` as compatible,
   so anything depending on `"0.2"` picks these up on a routine
   `cargo update`:
@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Transport` gained a new variant, `Transport::Tls`. An exhaustive
     `match` on `Transport` in consumer code stops compiling — add an arm
     for `Tls`.
+  - `Transport` is now `#[non_exhaustive]`, so that `match` also needs a
+    wildcard arm. This is deliberately bundled into the same release as
+    the variant above: it is the last time adding a transport breaks a
+    consumer. Every future variant is additive.
   - `SipAccount` gained a new field, `tls_policy: TlsPolicy`. Constructing
     the struct with a literal stops compiling — add
     `tls_policy: TlsPolicy::default()` (or your chosen policy).

@@ -7,8 +7,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Transport protocol for SIP signaling.
+///
+/// Marked `#[non_exhaustive]`: a `match` on this type in consumer code needs a
+/// wildcard arm. SIP keeps acquiring transports — this enum has already grown
+/// [`Tcp`](Transport::Tcp) and [`Tls`](Transport::Tls), and WebSocket (RFC
+/// 7118) is the obvious next one. Without the attribute every such addition is
+/// a source break for anyone matching exhaustively; with it they are additive.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Transport {
     #[default]
     Udp,
@@ -272,6 +279,25 @@ mod tests {
     #[test]
     fn default_transport_is_udp() {
         assert_eq!(Transport::default(), Transport::Udp);
+    }
+
+    #[test]
+    fn transport_round_trips_through_serde_as_lowercase() {
+        // `#[non_exhaustive]` on `Transport` changes what consumers may write
+        // in a `match`, not what the derives emit. A stored config carries
+        // these strings, so the wire form is pinned here: if the attribute or
+        // a future variant ever disturbs `rename_all`, a saved account stops
+        // loading with its chosen transport.
+        for (transport, wire) in [
+            (Transport::Udp, "\"udp\""),
+            (Transport::Tcp, "\"tcp\""),
+            (Transport::Tls, "\"tls\""),
+        ] {
+            let json = serde_json::to_string(&transport).expect("serialize");
+            assert_eq!(json, wire);
+            let back: Transport = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(transport, back, "round trip through {json}");
+        }
     }
 
     #[test]
