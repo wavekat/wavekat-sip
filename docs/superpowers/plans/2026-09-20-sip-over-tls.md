@@ -479,11 +479,20 @@ Under `[dependencies]`, after `hickory-resolver`:
 ```toml
 # SIP over TLS, all optional behind the `tls` feature. `rustls` rather than
 # `native-tls`: no OpenSSL in a consumer's cross-build.
-tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", optional = true }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-platform-verifier = { version = "0.7", optional = true }
 sha2 = { version = "0.10", optional = true }
 ```
+
+**`ring`, not the default `aws_lc_rs`.** Both crates default to the `aws_lc_rs`
+provider, which pulls `aws-lc-sys` and needs a C toolchain (and NASM on
+Windows) to build. That is the same cross-build burden this plan cites for
+choosing rustls over `native-tls` in the first place, so taking it back via a
+default feature would defeat the point. `ring` is pure-Rust-plus-vendored-asm
+and is what `rustls-platform-verifier` itself uses for testing.
+`default-features = false` is what actually removes `aws_lc_rs`; adding
+`features = ["ring"]` alone would enable *both* providers.
 
 Under `[dev-dependencies]`:
 
