@@ -691,8 +691,14 @@ mod tests {
 - [ ] **Step 4: Run the error-surface tests**
 
 Declare the module in `src/lib.rs` (`pub mod tls_error;`) and export
-`pub use tls_error::{untrusted_certificate, CertFailure, UntrustedCertificate};`,
-then:
+`pub use tls_error::{untrusted_certificate, CertFailure, UntrustedCertificate};`.
+
+**Export `TlsPolicy` in this task too**, not in Task 4 —
+`pub use account::{SipAccount, TlsPolicy, Transport};` — because
+`CertFailure`'s doc comments link to `crate::TlsPolicy`, and a link to a type
+the crate does not export is a broken intra-doc link, which is a `cargo doc`
+warning and so fails this task's own zero-warning gate. Add `TlsPolicy` to
+`src/account.rs` first (Step 7 has it), then:
 
 ```sh
 cargo test --workspace tls_error 2>&1 | tail -20
@@ -1069,10 +1075,10 @@ fn config_with_recorder(
 ) -> io::Result<(rustls::ClientConfig, Arc<Mutex<Option<[u8; 32]>>>)> {
     let provider = provider();
     let inner: Arc<dyn ServerCertVerifier> = match policy {
-        TlsPolicy::SystemRoots => {
-            rustls_platform_verifier::verifier_for_provider(provider.clone())
-                .map_err(|e| io::Error::other(format!("platform trust store unavailable: {e}")))?
-        }
+        TlsPolicy::SystemRoots => Arc::new(
+            rustls_platform_verifier::Verifier::new(provider.clone())
+                .map_err(|e| io::Error::other(format!("platform trust store unavailable: {e}")))?,
+        ),
         TlsPolicy::Pinned { sha256 } => Arc::new(PinnedVerifier::new(*sha256, provider.clone())),
     };
 
@@ -1443,11 +1449,7 @@ call with a built setup:
         };
 ```
 
-Export the policy from `src/lib.rs`:
-
-```rust
-pub use account::{SipAccount, TlsPolicy, Transport};
-```
+`TlsPolicy` is already exported from `src/lib.rs` by Task 3; do not re-add it.
 
 - [ ] **Step 6: Write the end-to-end tests**
 
@@ -1723,11 +1725,13 @@ worth having. If it is hard to set up, make the setup harder — do not relax th
 assertion. A TLS implementation that verifies the resolved target has ceremony
 and no security, and it looks identical to one that works.
 
-**If `rustls_platform_verifier::verifier_for_provider` has a different name or
-signature** in 0.7 than Task 3 assumes, check the crate's docs and adapt — the
-requirement is "a `ServerCertVerifier` backed by the OS trust store", not that
-exact call. Everything else in Task 3 was checked against rustls 0.23.40 and
-rcgen 0.14.10 as vendored locally.
+**The dependency APIs in this plan were checked against the vendored sources**
+— rustls 0.23.40, rustls-platform-verifier 0.7.0, rcgen 0.14.10, rsip 0.4.0 —
+not written from memory. `rustls_platform_verifier::Verifier::new(provider)`
+returns `Result<Verifier, rustls::Error>` and `Verifier` implements
+`ServerCertVerifier`. If something still does not compile, adapt to the real
+API: the requirement is "a `ServerCertVerifier` backed by the OS trust store",
+not a particular call.
 
 **Do not add a "skip verification" variant**, however the request arrives. It is
 the single decision in this design most likely to be argued with, and the
