@@ -143,6 +143,14 @@ verify.
 A rejected certificate **drops the connection**. There is no
 continue-anyway path, at any layer.
 
+> **Amended after review:** the code block and table below are as
+> originally planned (five variants, mapped onto five
+> `rustls::CertificateError` cases). Review added four more variants —
+> `Revoked`, `BadSignature`, `PinMismatch`, and the catch-all `Other`.
+> See "Amendments after review" at the end of this doc for what shipped
+> and why; the code block and table are left as planned rather than
+> rewritten, per this doc's own rule for plan docs.
+
 ```rust
 pub struct UntrustedCertificate {
     pub sha256: [u8; 32],
@@ -257,6 +265,12 @@ leaving it.
 
 ## Dependencies
 
+> **Amended after review:** the `[features]` line below is as planned.
+> What shipped adds `dep:rustls` as its own explicit dependency (both
+> `rustls` and `tokio-rustls` need their crypto provider pinned — see
+> below) and `serde_json` as a dev-dependency. Details in "Amendments
+> after review" at the end of this doc.
+
 ```toml
 [features]
 default = []
@@ -321,3 +335,81 @@ so it is not done for its own sake.
 Re-audited when this lands: gap #4 (TLS) closes, and RFC 5922 (SIP
 domain identity in TLS) becomes a new row. The scope is stated
 precisely — client-side only, SDES/SRTP still absent.
+
+---
+
+## Amendments after review
+
+This plan doc is a point-in-time record and is not rewritten after the
+fact (see `docs/README.md`). Review moved the implementation away from
+what is planned above in four ways; they are recorded here rather than
+edited into the sections above, except for the two inline notes that
+point back to this section.
+
+**1. `CertFailure` shipped with nine variants, not five.** The planned
+`Expired` / `NotYetValid` / `NameMismatch` / `UnknownIssuer` /
+`Malformed` are unchanged. Four more were added:
+
+- **`PinMismatch`** — a chain can be perfectly valid and simply not be
+  the certificate `TlsPolicy::Pinned` pinned. Collapsing that into
+  `UnknownIssuer` or `Malformed` would describe a chain problem that
+  was not the actual failure; a consumer offering a re-pin prompt needs
+  to say plainly that the certificate changed. It maps from
+  `rustls::CertificateError::ApplicationVerificationFailure`, which
+  only the pinned verifier produces.
+- **`Revoked`** and **`BadSignature`** — the two strongest attack
+  signals TLS produces. The original `Malformed`-or-nothing shape would
+  have forced both into the catch-all, and the catch-all's doc
+  originally read "not about the certificate at all" — which would
+  have shipped a revoked certificate reported as a non-certificate
+  failure. That is the opposite of the honest-reporting argument this
+  type exists to make, so both got their own variant instead.
+- **`Other(String)`** — the catch-all for any `rustls::Error` not
+  already covered. It carries both a non-certificate TLS failure (a
+  protocol error, no shared cipher suite) reported as-is, and any of
+  `rustls::CertificateError`'s less common variants this crate has not
+  given its own case; the latter is prefixed `"certificate: "` so a
+  consumer can still tell the two apart by inspecting the message.
+
+The enum is `#[non_exhaustive]`, so a consumer's `match` already has to
+handle "some other reason" regardless of how many named variants exist.
+
+The mapping table above gains three rows:
+
+| `CertFailure` | `rustls::CertificateError` |
+|---------------|----------------------------|
+| `Revoked` | `Revoked` |
+| `BadSignature` | `BadSignature` |
+| `PinMismatch` | `ApplicationVerificationFailure` |
+| `Other(String)` | Any other `rustls::CertificateError` (prefixed `"certificate: "`), or any `rustls::Error` that is not `InvalidCertificate` at all |
+
+**2. The crypto provider is pinned to `ring`, not left at rustls'
+default.** Both `rustls` and `tokio-rustls` are declared with
+`default-features = false` and the `ring` feature explicitly enabled,
+rather than pulling in rustls' default `aws_lc_rs` provider. Reason:
+`aws-lc-sys` needs a C toolchain (and NASM on Windows) to build — the
+same category of cross-build burden this doc's "Dependencies" section
+above cites (there, OpenSSL) as the reason for choosing `rustls` over
+`native-tls` in the first place. Picking the default provider here
+would have reintroduced that burden one dependency layer down, so both
+crates are pinned to `ring` instead.
+
+**3. Two dependency-list corrections.** `sha2` (used to fingerprint the
+leaf DER) ships as planned, under the `tls` feature. Two dev-only
+additions were not in the original plan:
+
+- `rcgen` was already planned as a dev-dependency for in-test
+  certificate generation (unchanged).
+- `serde_json` is also a dev-dependency, added to exercise
+  `TlsPolicy`'s derived `Serialize`/`Deserialize` round-trip — the path
+  a consumer's own stored account config relies on via
+  `#[serde(default)]`. It is not used by the library itself.
+
+**4. The platform-verifier call site.** `stack/tls.rs` builds the
+system-roots verifier with
+`rustls_platform_verifier::Verifier::new(provider)`, which returns
+`Result<Verifier, rustls::Error>`; `Verifier` implements
+`rustls::client::danger::ServerCertVerifier`. This doc did not commit
+to a specific call, so there is no correction to make here — noted for
+completeness since the other three amendments are all API-shape
+changes from what was planned.

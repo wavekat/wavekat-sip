@@ -1,6 +1,6 @@
 # RFC coverage
 
-> Status: living document · Last audited: 2026-09-20 (TCP transport implemented — see `docs/18`)
+> Status: living document · Last audited: 2026-09-20 (SIP over TLS implemented — see `docs/19`)
 
 What standards this crate's **public API** implements, which parts of
 each, and what is knowingly absent. The yardstick is the surface a
@@ -34,8 +34,10 @@ does is exactly what this document lists.
 | §22 Authentication | Digest challenge/response as a client, on both REGISTER and INVITE | `Registrar`, `Caller` (credentials threaded internally) |
 
 Not covered from RFC 3261: acting as a proxy/registrar/redirect server,
-SIPS/TLS (§26.2), and multicast (§18.1.1). Provisional responses are
-observed but not acknowledged reliably (PRACK / 100rel is RFC 3262, below).
+and multicast (§18.1.1). Provisional responses are observed but not
+acknowledged reliably (PRACK / 100rel is RFC 3262, below). SIPS/TLS
+(§26.2) is covered client-side only — see RFC 3261 §26.2 / RFC 5922,
+below.
 
 ### RFC 3264 — SDP offer/answer model (minimal subset)
 
@@ -153,20 +155,55 @@ implement the 4733 revision.)
 
 ### RFC 3263 — Locating SIP servers (SRV subset)
 
-- SRV lookup (`_sip._udp.` / `_sip._tcp.` per the account transport)
-  with RFC 2782 priority ordering and weighted-random selection within
-  a priority — `resolve_sip_server`, `order_candidates`, `SrvRecord`.
+- SRV lookup (`_sip._udp.` / `_sip._tcp.` / `_sips._tcp.`, per the
+  account transport) with RFC 2782 priority ordering and
+  weighted-random selection within a priority — `resolve_sip_server`,
+  `order_candidates`, `SrvRecord`.
 - §4.1 short-circuits: an explicit port or an IP-literal server skips
   SRV entirely and resolves A/AAAA directly (or uses the literal as
   is), keeping the pre-SRV behavior byte-identical for those accounts.
 - No-SRV-records fallback to A/AAAA on the bare host at the default
   port; SRV-target resolution failure does *not* fall back (per the
-  RFC).
+  RFC). `SipAccount::port()` defaults to 5061 under `Transport::Tls`,
+  5060 otherwise.
 
 Not covered: NAPTR (§4.1 transport selection starts from the account's
-configured transport instead), `_sips._tcp` / TLS targets, and failover
-across multiple SRV targets on connection failure — only the first
-candidate is used today.
+configured transport instead), and failover across multiple SRV
+targets on connection failure — only the first candidate is used
+today.
+
+### RFC 3261 §26.2 & RFC 5922 — SIP over TLS, SIP domain identity (client-side)
+
+- Outbound `Transport::Tls` runs SIP over a `rustls`-backed TLS stream
+  (RFC 3261 §26.2.1): 5061 default port, `_sips._tcp` SRV lookups (RFC
+  3263 §4.1, above), `sips:` URIs accepted wherever a URI is parsed,
+  `Via` emits `SIP/2.0/TLS`, `Contact` carries `;transport=tls` —
+  `Transport::Tls`, `SipAccount::tls_policy`, `SipAccount::port`.
+- Certificate verification checks the **account's SIP domain**, never
+  the host an SRV lookup resolved to — RFC 5922 §7.1's requirement, and
+  the reason this crate names the domain (not the resolved
+  `SocketAddr`) as both the verified name and the SNI sent.
+- Two verification policies, no way to disable verification:
+  `TlsPolicy::SystemRoots` validates against the OS trust store via
+  `rustls-platform-verifier`; `TlsPolicy::Pinned { sha256 }` trusts
+  exactly one operator-supplied certificate fingerprint, for a
+  self-signed on-premise server. A rejected certificate always drops
+  the connection and is reported as a typed `CertFailure` (fingerprint
+  + reason) via `UntrustedCertificate` / `untrusted_certificate`, so a
+  consumer can build an honest trust-on-first-use pinning prompt
+  instead of guessing.
+
+Not covered: **no TLS listener** — this crate is a UA that connects
+out; inbound requests arrive only on the connection it opened, never
+accepted cold on a listening port. No client-certificate / mutual TLS.
+No revocation checking of our own: `CertFailure::Revoked` only surfaces
+when the platform verifier's underlying OS API performs OCSP/CRL
+checking, which `rustls-platform-verifier` does not guarantee on every
+platform (its Linux/WASM fallback does not check revocation unless
+CRLs are supplied, which this crate does not do). SRTP/SDES (RFC
+3711/4568) is unaffected by this: media stays unencrypted even when
+signaling runs over TLS — that is a separate, not-yet-shipped phase
+(see `docs/18-secure-transport-tls-and-srtp.md`).
 
 ### RFC 4028 — Session timers
 
@@ -238,19 +275,22 @@ typically a PBX/SBC on the same network or a trunk that latches):
 | 8489 / 8445 / 8656 | STUN, ICE, TURN | No NAT traversal; local address discovery is a UDP-connect trick only |
 | 3605 / 5761 | RTCP attribute in SDP, RTP/RTCP mux | No RTCP at all |
 | 3262 | PRACK / 100rel | Provisional responses are not acknowledged reliably |
-| 7118 | SIP over WebSocket | Not implemented (`Transport` is UDP/TCP only) |
+| 7118 | SIP over WebSocket | Not implemented (`Transport` is UDP/TCP/TLS only) |
 
 ### Transports
 
-The engine implements **UDP** and **TCP**. `Transport::Udp` binds a datagram
-socket; `Transport::Tcp` connects to the resolved next hop, frames the byte
-stream per RFC 3261 §7.5 / §20.14, and reports itself reliable so the §17
-retransmission timers collapse as they should. `Via` names the transport
-actually in use and the registrar's `Contact` carries `;transport=tcp`, so a
-registrar routes inbound requests back over the connection we opened. RFC 5626
-§3.5.1 CRLF keepalives are accepted on the stream path (we do not yet send
-them, and do not yet reconnect a dropped connection). TLS and WebSocket are
-not implemented.
+The engine implements **UDP**, **TCP**, and **TLS**. `Transport::Udp` binds a
+datagram socket; `Transport::Tcp` and `Transport::Tls` connect to the resolved
+next hop, frame the byte stream per RFC 3261 §7.5 / §20.14, and report
+themselves reliable so the §17 retransmission timers collapse as they should.
+`Transport::Tls` adds a `rustls` handshake in front of the same stream (see
+"RFC 3261 §26.2 & RFC 5922", above) — the framer and read task do not know the
+difference. `Via` names the transport actually in use and the registrar's
+`Contact` carries `;transport=tcp` / `;transport=tls`, so a registrar routes
+inbound requests back over the connection we opened. RFC 5626 §3.5.1 CRLF
+keepalives are accepted on the stream path (we do not yet send them, and do
+not yet reconnect a dropped connection — TCP or TLS). WebSocket is not
+implemented.
 
 ## Known gaps worth closing first
 
@@ -258,13 +298,16 @@ Ranked by how soon a real deployment trips over them:
 
 1. **`rport` (RFC 3581)** — needed for responses to come back through NAT/PAT;
    add `;rport` to outgoing Via and honor it on responses.
-2. **Stream reconnect + keepalive** — a dropped TCP connection is not
+2. **Stream reconnect + keepalive** — a dropped TCP or TLS connection is not
    re-established and we do not send RFC 5626 §3.5.1 CRLF keepalives, so a
    NAT that times the connection out silently ends inbound reachability until
    the endpoint is rebuilt.
 3. **RTCP receiver reports** — without them, neither side gets loss or jitter
    feedback; fine on a LAN, blind over the open internet.
-4. **TLS transport (SIPS)** — credentials currently ride plaintext except for
-   the digest exchange itself.
+4. ~~**TLS transport (SIPS)** — credentials currently ride plaintext except
+   for the digest exchange itself.~~ **Closed** — see "RFC 3261 §26.2 & RFC
+   5922", above (`docs/19-sip-over-tls.md`). Client-side only: no TLS
+   listener, and SDES/SRTP (media encryption) is still absent, so RTP itself
+   remains plaintext even under `Transport::Tls`.
 5. **SRV failover (RFC 3263)** — we order the candidates correctly but only ever
    try the first; a dead primary should fall through to the next target.

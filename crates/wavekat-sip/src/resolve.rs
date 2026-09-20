@@ -6,13 +6,13 @@
 //! - An explicit `port` on the account, or an IP-literal `server`,
 //!   skips SRV entirely and resolves A/AAAA directly (RFC 3263 §4.1) —
 //!   identical to the crate's historical behavior.
-//! - Otherwise `_sip._udp.<host>` / `_sip._tcp.<host>` is queried and
-//!   candidates are ordered by priority, then weighted-random within a
-//!   priority class (RFC 2782). The first target that resolves wins,
-//!   at the SRV-provided port.
+//! - Otherwise `_sip._udp.<host>` / `_sip._tcp.<host>` / `_sips._tcp.<host>`
+//!   (per the account's transport) is queried and candidates are ordered by
+//!   priority, then weighted-random within a priority class (RFC 2782). The
+//!   first target that resolves wins, at the SRV-provided port.
 //! - No SRV records (NXDOMAIN/empty, or a failed query) falls back to
 //!   A/AAAA on the bare host at the default port — today's behavior.
-//! - NAPTR and TLS (`_sips._tcp`) are not implemented.
+//! - NAPTR is not implemented.
 
 use std::net::{IpAddr, SocketAddr};
 
