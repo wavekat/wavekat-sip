@@ -32,10 +32,15 @@ pub enum CertFailure {
     PinMismatch,
     /// The certificate could not be parsed.
     ///
-    /// Unlikely to reach a consumer in practice: a failure this early — before
-    /// the verifier is even entered — leaves no fingerprint recorded and
-    /// surfaces as an opaque `io::Error`, not a typed [`UntrustedCertificate`].
-    /// Don't build a branch that assumes this arm fires.
+    /// Usually still carries a fingerprint: the verifier records the leaf's
+    /// SHA-256 over the raw wire bytes before delegating to the policy
+    /// verifier that raises this failure, so under
+    /// [`TlsPolicy::SystemRoots`](crate::TlsPolicy::SystemRoots) a malformed
+    /// leaf still reaches you as a typed [`UntrustedCertificate`] with a
+    /// usable fingerprint — this variant exists for the narrower case where
+    /// parsing fails before that point. Under
+    /// [`TlsPolicy::Pinned`](crate::TlsPolicy::Pinned) it cannot arise at
+    /// all: that verifier compares raw bytes and never parses X.509.
     Malformed,
     /// A TLS failure this enum has no dedicated variant for. This can still
     /// be a certificate problem — one of the less common
