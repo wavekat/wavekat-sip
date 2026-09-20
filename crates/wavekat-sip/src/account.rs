@@ -50,8 +50,114 @@ pub enum TlsPolicy {
     Pinned {
         /// The pinned fingerprint. [`UntrustedCertificate::sha256`](crate::UntrustedCertificate::sha256)
         /// reports the value to pin.
+        ///
+        /// Serializes as a 64-character lowercase hex string — the same form
+        /// [`UntrustedCertificate::fingerprint_hex`](crate::UntrustedCertificate::fingerprint_hex)
+        /// produces, so a fingerprint read off a trust-on-first-use prompt can
+        /// be pasted straight into a stored config. A 32-element byte array
+        /// (this field's shape before the hex format shipped) still
+        /// deserializes, so existing configs are unaffected.
+        #[serde(with = "hex_sha256")]
         sha256: [u8; 32],
     },
+}
+
+impl TlsPolicy {
+    /// Build [`TlsPolicy::Pinned`] from a 64-character hex SHA-256
+    /// fingerprint — the same string
+    /// [`UntrustedCertificate::fingerprint_hex`](crate::UntrustedCertificate::fingerprint_hex)
+    /// produces. Returns an error describing what was wrong (wrong length, or
+    /// a non-hex character) rather than truncating or padding.
+    ///
+    /// This is a convenience constructor, not the serde wire format —
+    /// `hex_sha256` (this module) is the one-way door; this function can
+    /// change shape freely.
+    pub fn pinned_from_hex(hex: &str) -> Result<Self, String> {
+        parse_hex_sha256(hex).map(|sha256| Self::Pinned { sha256 })
+    }
+}
+
+/// Parse a 64-character hex string into a 32-byte digest. Shared by
+/// [`TlsPolicy::pinned_from_hex`] and `hex_sha256`'s deserializer, so there is
+/// exactly one place that decides what counts as valid hex.
+fn parse_hex_sha256(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err(format!(
+            "expected a 64-character hex string, got {} characters",
+            hex.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|_| format!("`{hex}` is not valid hex"))?;
+        out[i] = u8::from_str_radix(s, 16).map_err(|_| format!("`{hex}` is not valid hex"))?;
+    }
+    Ok(out)
+}
+
+/// `TlsPolicy::Pinned`'s `sha256` field as a lowercase hex string on the wire,
+/// accepting either that or the legacy 32-element byte array on the way in.
+///
+/// A fingerprint is display data before it is config data —
+/// [`UntrustedCertificate::fingerprint_hex`](crate::UntrustedCertificate::fingerprint_hex)
+/// already hands a consumer hex, so serializing as a byte array of integers
+/// forced a conversion at the one boundary this type exists to make easy: an
+/// operator pasting a fingerprint off a screen into a stored config.
+mod hex_sha256 {
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub(super) fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        serializer.serialize_str(&hex)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(Sha256Visitor)
+    }
+
+    struct Sha256Visitor;
+
+    impl<'de> Visitor<'de> for Sha256Visitor {
+        type Value = [u8; 32];
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "a 64-character lowercase hex string, or a 32-element byte array"
+            )
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            super::parse_hex_sha256(v).map_err(E::custom)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = [0u8; 32];
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(i, &self))?;
+            }
+            if seq.next_element::<u8>()?.is_some() {
+                return Err(de::Error::invalid_length(33, &self));
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// Runtime SIP account. The password is held in memory while the endpoint
@@ -221,6 +327,81 @@ mod tests {
     #[test]
     fn tls_policy_defaults_to_system_roots() {
         assert_eq!(make_account().tls_policy, TlsPolicy::SystemRoots);
+    }
+
+    #[test]
+    fn tls_policy_pinned_serializes_as_a_hex_string() {
+        // The wire form a consumer's stored config actually carries: a
+        // fingerprint read off a trust-on-first-use prompt, pasted straight
+        // in — not a 32-element array of integers.
+        let policy = TlsPolicy::Pinned {
+            sha256: [0xabu8; 32],
+        };
+        let json = serde_json::to_string(&policy).expect("serialize");
+        assert_eq!(
+            json,
+            format!(r#"{{"pinned":{{"sha256":"{}"}}}}"#, "ab".repeat(32))
+        );
+    }
+
+    #[test]
+    fn tls_policy_pinned_accepts_the_legacy_byte_array() {
+        // Configs stored before the wire format changed to hex used a
+        // 32-element byte array; those must keep deserializing unchanged.
+        let mut sha256 = [0u8; 32];
+        sha256[0] = 171;
+        sha256[1] = 63;
+        sha256[31] = 9;
+        let array = sha256
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(r#"{{"pinned":{{"sha256":[{array}]}}}}"#);
+        let policy: TlsPolicy = serde_json::from_str(&json).expect("legacy array deserializes");
+        assert_eq!(policy, TlsPolicy::Pinned { sha256 });
+    }
+
+    #[test]
+    fn tls_policy_pinned_rejects_a_wrong_length_hex_string() {
+        let json = r#"{"pinned":{"sha256":"abcd"}}"#;
+        let err = serde_json::from_str::<TlsPolicy>(json).expect_err("too short must fail");
+        assert!(err.to_string().contains("64"), "{err}");
+    }
+
+    #[test]
+    fn tls_policy_pinned_rejects_a_non_hex_string() {
+        let bad = format!("{}zz", "0".repeat(62)); // 64 chars, trailing non-hex
+        let json = format!(r#"{{"pinned":{{"sha256":"{bad}"}}}}"#);
+        let err = serde_json::from_str::<TlsPolicy>(&json).expect_err("non-hex must fail");
+        assert!(err.to_string().contains("hex"), "{err}");
+    }
+
+    #[test]
+    fn pinned_from_hex_matches_fingerprint_hex() {
+        // The constructor and UntrustedCertificate::fingerprint_hex must
+        // agree on format, or an operator pasting one into the other fails.
+        let cert = crate::tls_error::UntrustedCertificate {
+            sha256: [0x42u8; 32],
+            reason: crate::tls_error::CertFailure::UnknownIssuer,
+        };
+        let policy = TlsPolicy::pinned_from_hex(&cert.fingerprint_hex()).expect("valid hex");
+        assert_eq!(
+            policy,
+            TlsPolicy::Pinned {
+                sha256: cert.sha256
+            }
+        );
+    }
+
+    #[test]
+    fn pinned_from_hex_rejects_wrong_length() {
+        assert!(TlsPolicy::pinned_from_hex("ab").is_err());
+    }
+
+    #[test]
+    fn pinned_from_hex_rejects_non_hex_characters() {
+        assert!(TlsPolicy::pinned_from_hex(&format!("{}zz", "0".repeat(62))).is_err());
     }
 
     /// A consumer's config predating `tls_policy` — no such key at all — must
