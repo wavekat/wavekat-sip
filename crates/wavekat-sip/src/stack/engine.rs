@@ -37,6 +37,10 @@ use super::transaction::client_non_invite::ClientNonInvite;
 use super::transaction::server_invite::ServerInvite;
 use super::transaction::server_non_invite::ServerNonInvite;
 use super::transaction::{Reliability, TimerId, Timers, Transaction, TransactionKey, TxAction};
+use crate::account::Transport;
+
+use super::transport::BoundTransport;
+#[cfg(test)]
 use super::transport::UdpTransport;
 
 /// A request from the transaction user (TU) to the engine.
@@ -151,7 +155,7 @@ struct Entry {
 
 /// The engine task's owned state.
 struct Engine {
-    transport: Arc<UdpTransport>,
+    transport: Arc<BoundTransport>,
     reliability: Reliability,
     timers: Timers,
     txns: HashMap<TransactionKey, Entry>,
@@ -159,25 +163,30 @@ struct Engine {
     event_tx: mpsc::Sender<Event>,
 }
 
-/// Bind a UDP socket and spawn the engine task.
+/// Bind the transport and spawn the engine task.
 ///
 /// Returns a handle for issuing commands and the stream of [`Event`]s the
-/// engine produces. The task runs until `cancel` fires or the socket errors.
+/// engine produces. The task runs until `cancel` fires or the transport
+/// errors.
 pub(crate) async fn start(
     local: SocketAddr,
+    peer: SocketAddr,
+    transport: Transport,
     cancel: CancellationToken,
 ) -> io::Result<(EngineHandle, mpsc::Receiver<Event>)> {
-    start_with_timers(local, Timers::default(), cancel).await
+    start_with_timers(local, peer, transport, Timers::default(), cancel).await
 }
 
 /// Like [`start`], but with explicit base timers. Used by tests to shrink the
 /// RFC timer table so timeouts and soak periods fire in milliseconds.
 pub(crate) async fn start_with_timers(
     local: SocketAddr,
+    peer: SocketAddr,
+    transport: Transport,
     timers: Timers,
     cancel: CancellationToken,
 ) -> io::Result<(EngineHandle, mpsc::Receiver<Event>)> {
-    let transport = Arc::new(UdpTransport::bind(local).await?);
+    let transport = Arc::new(BoundTransport::bind(local, peer, transport).await?);
     let local_addr = transport.local_addr()?;
     let reliability = transport.reliability();
 
@@ -212,7 +221,7 @@ impl Engine {
                 _ = cancel.cancelled() => break,
                 recvd = transport.recv() => match recvd {
                     Ok((msg, src)) => self.on_inbound(msg, src).await,
-                    Err(e) => { warn!(error = %e, "UDP receive failed; stopping engine"); break; }
+                    Err(e) => { warn!(error = %e, "SIP transport receive failed; stopping engine"); break; }
                 },
                 Some(fire) = timer_rx.recv() => self.on_timer_fire(fire).await,
                 Some(cmd) = cmd_rx.recv() => self.on_command(cmd).await,
@@ -499,8 +508,14 @@ mod tests {
     #[tokio::test]
     async fn client_transaction_delivers_response_then_terminates() {
         let cancel = CancellationToken::new();
+        let server = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
         let (handle, mut events) = start_with_timers(
             "127.0.0.1:0".parse().unwrap(),
+            server_addr,
+            Transport::Udp,
             fast_timers(),
             cancel.clone(),
         )
@@ -508,10 +523,6 @@ mod tests {
         .unwrap();
 
         // A fake peer that answers the OPTIONS.
-        let server = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let server_addr = server.local_addr().unwrap();
 
         assert!(
             handle
@@ -541,18 +552,20 @@ mod tests {
     #[tokio::test]
     async fn inbound_invite_opens_server_transaction_and_sends_response() {
         let cancel = CancellationToken::new();
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
         let (handle, mut events) = start_with_timers(
             "127.0.0.1:0".parse().unwrap(),
+            peer_addr,
+            Transport::Udp,
             fast_timers(),
             cancel.clone(),
         )
         .await
         .unwrap();
         let engine_addr = handle.local_addr();
-
-        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
 
         // Peer sends an INVITE into the engine.
         peer.send_to(&invite_to(engine_addr).into(), engine_addr)
@@ -580,20 +593,21 @@ mod tests {
     #[tokio::test]
     async fn no_final_response_times_out() {
         let cancel = CancellationToken::new();
+        // A bound-but-silent socket that never answers.
+        let sink = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let sink_addr = sink.local_addr().unwrap();
         // Short timers so Timer F fires quickly: 64·T1 with T1 = 1ms ≈ 64ms.
         let (handle, mut events) = start_with_timers(
             "127.0.0.1:0".parse().unwrap(),
+            sink_addr,
+            Transport::Udp,
             fast_timers(),
             cancel.clone(),
         )
         .await
         .unwrap();
-
-        // Send to a bound-but-silent socket that never answers.
-        let sink = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let sink_addr = sink.local_addr().unwrap();
 
         assert!(handle.start_client(options_to(sink_addr), sink_addr).await);
 

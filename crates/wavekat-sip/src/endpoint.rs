@@ -1,5 +1,6 @@
-//! Shared SIP endpoint: a bound UDP transport + the clean-room engine, with
-//! inbound requests routed to new calls or auto-answered in-dialog.
+//! Shared SIP endpoint: a bound SIP transport (UDP or TCP) + the clean-room
+//! engine, with inbound requests routed to new calls or auto-answered
+//! in-dialog.
 //!
 //! `SipEndpoint` owns the `Ua` (engine + router) and a
 //! background task that drains inbound requests:
@@ -93,17 +94,31 @@ impl SipEndpoint {
         product: Option<&str>,
         cancel: CancellationToken,
     ) -> Result<Arc<Self>, BoxError> {
+        // Resolution comes first, and must: a stream transport has no local
+        // address until it has connected, and it cannot connect without
+        // knowing the next hop. The datagram path does not care about the
+        // order, so both share this one.
+        let server = resolve_sip_server(account)
+            .await?
+            .ok_or("could not resolve SIP server address")?;
+        info!(%server, "resolved SIP server");
+
+        // Selects the outbound interface on the datagram path; ignored on the
+        // stream path, where connecting assigns the source address.
         let local_ip = detect_local_ip(account)?;
         let bind_addr = SocketAddr::new(local_ip, 0);
         info!("Binding SIP transport to {bind_addr}");
 
         let ua = Arc::new(
-            Ua::bind_with_app(bind_addr, product.map(String::from), cancel.clone()).await?,
+            Ua::bind_with_app(
+                bind_addr,
+                server,
+                account.transport,
+                product.map(String::from),
+                cancel.clone(),
+            )
+            .await?,
         );
-        let server = resolve_sip_server(account)
-            .await?
-            .ok_or("could not resolve SIP server address")?;
-        info!(%server, "resolved SIP server");
 
         let (calls_tx, calls_rx) = mpsc::channel(16);
         let dialogs: DialogRegistry = Arc::new(StdMutex::new(HashMap::new()));

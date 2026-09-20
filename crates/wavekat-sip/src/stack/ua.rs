@@ -26,6 +26,8 @@ use tokio_util::sync::CancellationToken;
 use super::auth;
 use super::call::{build_cancel, build_invite, cseq_of, CallConfig, CallOutcome};
 use super::dialog::Dialog;
+use crate::account::Transport;
+
 use super::engine::{self, EngineHandle, Event};
 use super::registration::{build_register, granted_expires, RegisterConfig, RegisterOutcome};
 use super::transaction::{Timers, TransactionKey};
@@ -55,36 +57,57 @@ pub(crate) struct Ua {
 }
 
 impl Ua {
-    /// Bind a UDP socket and start the engine + router with default timers.
-    pub(crate) async fn bind(local: SocketAddr, cancel: CancellationToken) -> io::Result<Self> {
-        Self::bind_full(local, Timers::default(), None, cancel).await
+    /// Bind for `transport` toward `peer` and start the engine + router with
+    /// default timers.
+    pub(crate) async fn bind(
+        local: SocketAddr,
+        peer: SocketAddr,
+        transport: Transport,
+        cancel: CancellationToken,
+    ) -> io::Result<Self> {
+        Self::bind_full(local, peer, transport, Timers::default(), None, cancel).await
     }
 
     /// Bind with explicit base timers (tests shrink them).
     pub(crate) async fn bind_with_timers(
         local: SocketAddr,
+        peer: SocketAddr,
+        transport: Transport,
         timers: Timers,
         cancel: CancellationToken,
     ) -> io::Result<Self> {
-        Self::bind_full(local, timers, None, cancel).await
+        Self::bind_full(local, peer, transport, timers, None, cancel).await
     }
 
     /// Bind advertising `user_agent` as the `User-Agent` on outbound requests.
     pub(crate) async fn bind_with_app(
         local: SocketAddr,
+        peer: SocketAddr,
+        transport: Transport,
         user_agent: Option<String>,
         cancel: CancellationToken,
     ) -> io::Result<Self> {
-        Self::bind_full(local, Timers::default(), user_agent, cancel).await
+        Self::bind_full(
+            local,
+            peer,
+            transport,
+            Timers::default(),
+            user_agent,
+            cancel,
+        )
+        .await
     }
 
     async fn bind_full(
         local: SocketAddr,
+        peer: SocketAddr,
+        transport: Transport,
         timers: Timers,
         user_agent: Option<String>,
         cancel: CancellationToken,
     ) -> io::Result<Self> {
-        let (engine, events) = engine::start_with_timers(local, timers, cancel).await?;
+        let (engine, events) =
+            engine::start_with_timers(local, peer, transport, timers, cancel).await?;
         let (subscribe_tx, subscribe_rx) = mpsc::channel(32);
         let (incoming_tx, incoming_rx) = mpsc::channel(32);
         tokio::spawn(router(events, subscribe_rx, incoming_tx));
@@ -518,8 +541,14 @@ mod tests {
     #[tokio::test]
     async fn register_then_call_share_one_engine() {
         let cancel = CancellationToken::new();
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
         let ua = Ua::bind_with_timers(
             "127.0.0.1:0".parse().unwrap(),
+            peer_addr,
+            Transport::Udp,
             fast_timers(),
             cancel.clone(),
         )
@@ -527,10 +556,6 @@ mod tests {
         .unwrap();
 
         // One peer plays registrar then callee.
-        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let peer_addr = peer.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             // REGISTER → 401 then 200.
@@ -585,8 +610,14 @@ mod tests {
     #[tokio::test]
     async fn inbound_invite_reaches_incoming_and_can_be_answered() {
         let cancel = CancellationToken::new();
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
         let ua = Ua::bind_with_timers(
             "127.0.0.1:0".parse().unwrap(),
+            peer_addr,
+            Transport::Udp,
             fast_timers(),
             cancel.clone(),
         )
@@ -642,16 +673,27 @@ mod tests {
     #[tokio::test]
     async fn user_agent_injected_only_when_configured() {
         let cancel = CancellationToken::new();
+        // This test never puts a message on the wire, so the next hop is
+        // only a bind-time argument. UDP does not connect, so the discard
+        // port is never contacted.
+        let nowhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let with_app = Ua::bind_with_app(
             "127.0.0.1:0".parse().unwrap(),
+            nowhere,
+            Transport::Udp,
             Some("wavekat-test/9.9".into()),
             cancel.clone(),
         )
         .await
         .unwrap();
-        let plain = Ua::bind("127.0.0.1:0".parse().unwrap(), cancel.clone())
-            .await
-            .unwrap();
+        let plain = Ua::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            nowhere,
+            Transport::Udp,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
 
         let mut req = build_invite(&call_config(), 1, with_app.local_addr());
         with_app.apply_user_agent(&mut req);
@@ -679,18 +721,19 @@ mod tests {
     #[tokio::test]
     async fn reinvite_acks_the_2xx() {
         let cancel = CancellationToken::new();
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
         let ua = Ua::bind_with_timers(
             "127.0.0.1:0".parse().unwrap(),
+            peer_addr,
+            Transport::Udp,
             fast_timers(),
             cancel.clone(),
         )
         .await
         .unwrap();
-
-        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let peer_addr = peer.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             // Initial INVITE → 200 → ACK.
@@ -749,18 +792,19 @@ mod tests {
     #[tokio::test]
     async fn refer_sends_in_dialog_and_returns_202() {
         let cancel = CancellationToken::new();
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
         let ua = Ua::bind_with_timers(
             "127.0.0.1:0".parse().unwrap(),
+            peer_addr,
+            Transport::Udp,
             fast_timers(),
             cancel.clone(),
         )
         .await
         .unwrap();
-
-        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let peer_addr = peer.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             // Initial INVITE → 200 → ACK.
@@ -821,18 +865,19 @@ mod tests {
         // Same as the blind REFER path, but the Refer-To embeds a Replaces
         // (RFC 3891) naming a consultation dialog — the attended-transfer wire.
         let cancel = CancellationToken::new();
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
         let ua = Ua::bind_with_timers(
             "127.0.0.1:0".parse().unwrap(),
+            peer_addr,
+            Transport::Udp,
             fast_timers(),
             cancel.clone(),
         )
         .await
         .unwrap();
-
-        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let peer_addr = peer.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let (m, src) = peer.recv().await.unwrap();
@@ -898,18 +943,19 @@ mod tests {
     #[tokio::test]
     async fn cancel_after_ringing_terminates_call() {
         let shutdown = CancellationToken::new();
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
         let ua = Ua::bind_with_timers(
             "127.0.0.1:0".parse().unwrap(),
+            peer_addr,
+            Transport::Udp,
             fast_timers(),
             shutdown.clone(),
         )
         .await
         .unwrap();
-
-        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let peer_addr = peer.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let mut invite_echo: Option<String> = None;
