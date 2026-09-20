@@ -36,3 +36,4 @@ Two kinds of documents live here:
 | [16-drop-rsipstack.md](16-drop-rsipstack.md) | `stack` engine Phase 8 (final): re-point the public wrappers onto the engine and remove the `rsipstack` dependency |
 | [17-reinstate-deferred-features.md](17-reinstate-deferred-features.md) | Re-add the call features deferred by the cutover (re-INVITE seam, User-Agent, DTMF INFO, hold/resume, session timers, inbound surfacing + CANCEL) on the engine |
 | [18-secure-transport-tls-and-srtp.md](18-secure-transport-tls-and-srtp.md) | Stream transports (making `Transport::Tcp` real), SIP over TLS with RFC 5922 identity checks and certificate pinning, and SRTP via SDES keying |
+| [19-sip-over-tls.md](19-sip-over-tls.md) | SIP over TLS: `Transport::Tls`, RFC 5922 domain identity checks, and certificate pinning (phase 2 of doc 18) |
