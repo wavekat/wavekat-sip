@@ -11,12 +11,13 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use rsip::SipMessage;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, trace, warn};
@@ -24,6 +25,53 @@ use tracing::{debug, trace, warn};
 use super::framing::Framer;
 use super::transaction::Reliability;
 use super::transport::serialize;
+
+/// The byte stream underneath a [`StreamTransport`].
+///
+/// An enum rather than a generic parameter or a trait object: a generic would
+/// leak up through `BoundTransport` into the engine, and `transport.rs` already
+/// states the crate's preference for dispatch that stays visible. The framer
+/// and the read task above this are identical for both arms — a TLS connection
+/// is a TCP connection with a handshake in front of it.
+pub(crate) enum SipStream {
+    Tcp(TcpStream),
+}
+
+impl AsyncRead for SipStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for SipStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Read buffer size. TCP hands us whatever it has; the framer reassembles.
 const READ_CHUNK: usize = 8 * 1024;
@@ -33,7 +81,7 @@ const INBOUND_DEPTH: usize = 64;
 
 /// A connected SIP transport over a byte stream.
 pub(crate) struct StreamTransport {
-    write: Arc<Mutex<OwnedWriteHalf>>,
+    write: Arc<Mutex<WriteHalf<SipStream>>>,
     inbound: Mutex<mpsc::Receiver<(SipMessage, SocketAddr)>>,
     local: SocketAddr,
     peer: SocketAddr,
@@ -48,7 +96,7 @@ impl StreamTransport {
         // coming.
         sock.set_nodelay(true)?;
         let local = sock.local_addr()?;
-        let (read, write) = sock.into_split();
+        let (read, write) = tokio::io::split(SipStream::Tcp(sock));
 
         let (tx, rx) = mpsc::channel(INBOUND_DEPTH);
         tokio::spawn(read_task(read, peer, tx));
@@ -106,7 +154,7 @@ impl StreamTransport {
 /// design: once message boundaries are lost there is no way to find the next
 /// one, so continuing would feed the engine garbage.
 async fn read_task(
-    mut read: OwnedReadHalf,
+    mut read: ReadHalf<SipStream>,
     peer: SocketAddr,
     tx: mpsc::Sender<(SipMessage, SocketAddr)>,
 ) {
@@ -284,5 +332,40 @@ Content-Length: 0\r\n\r\n"
         let addr = listener.local_addr().expect("addr");
         drop(listener);
         assert!(StreamTransport::connect(addr).await.is_err());
+    }
+
+    /// `SipStream` must delegate reads and writes to its inner transport
+    /// unchanged — the framer and read task above it depend on that, and a
+    /// future `Tls` arm has to satisfy the same contract.
+    #[tokio::test]
+    async fn sip_stream_delegates_reads_and_writes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            sock.write_all(b"hello through the enum")
+                .await
+                .expect("write");
+            let mut buf = vec![0u8; 64];
+            let n = sock.read(&mut buf).await.expect("read");
+            buf.truncate(n);
+            buf
+        });
+
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = SipStream::Tcp(client);
+
+        let mut buf = vec![0u8; 64];
+        let n = stream.read(&mut buf).await.expect("read through SipStream");
+        assert_eq!(&buf[..n], b"hello through the enum");
+
+        stream
+            .write_all(b"back through the enum")
+            .await
+            .expect("write through SipStream");
+        stream.flush().await.expect("flush through SipStream");
+
+        let got = server.await.expect("server task");
+        assert_eq!(got, b"back through the enum");
     }
 }
