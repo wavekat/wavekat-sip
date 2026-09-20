@@ -179,10 +179,12 @@ today.
   3263 §4.1, above), `sips:` URIs accepted wherever a URI is parsed,
   `Via` emits `SIP/2.0/TLS`, `Contact` carries `;transport=tls` —
   `Transport::Tls`, `SipAccount::tls_policy`, `SipAccount::port`.
-- Certificate verification checks the **account's SIP domain**, never
-  the host an SRV lookup resolved to — RFC 5922 §7.1's requirement, and
-  the reason this crate names the domain (not the resolved
-  `SocketAddr`) as both the verified name and the SNI sent.
+- Certificate verification checks the **original domain used as input
+  to the RFC 3263 server location procedures** (`account.domain`),
+  never the host an SRV lookup resolved it to — RFC 5922 §7.3's Client
+  Behavior requirement, and the reason this crate names that domain
+  (not the resolved `SocketAddr`) as both the verified name and the SNI
+  sent.
 - Two verification policies, no way to disable verification:
   `TlsPolicy::SystemRoots` validates against the OS trust store via
   `rustls-platform-verifier`; `TlsPolicy::Pinned { sha256 }` trusts

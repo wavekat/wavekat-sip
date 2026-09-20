@@ -113,7 +113,7 @@ impl SipEndpoint {
             transport: account.transport,
             #[cfg(feature = "tls")]
             tls: match account.transport {
-                // RFC 5922 §7.1: verify the account's SIP domain, never the
+                // RFC 5922 §7.3: verify the account's SIP domain, never the
                 // host an SRV record named. `server` may be an SRV target or a
                 // bare IP; neither is the identity the certificate must match.
                 Transport::Tls => Some(crate::stack::transport::TlsSetup {

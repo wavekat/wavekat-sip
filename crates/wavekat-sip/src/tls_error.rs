@@ -15,7 +15,7 @@ pub enum CertFailure {
     Expired,
     /// The certificate's validity period has not begun.
     NotYetValid,
-    /// The certificate is valid, but for other names. RFC 5922 §7.1 requires
+    /// The certificate is valid, but for other names. RFC 5922 §7.3 requires
     /// the account's SIP domain, not the host an SRV record named.
     NameMismatch {
         /// The names the certificate did present.

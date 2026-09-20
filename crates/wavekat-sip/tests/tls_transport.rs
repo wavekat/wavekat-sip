@@ -165,7 +165,7 @@ impl Drop for TrustedCaOverride {
     }
 }
 
-/// `TlsPolicy::SystemRoots` end to end: the RFC 5922 §7.1 domain check (the
+/// `TlsPolicy::SystemRoots` end to end: the RFC 5922 §7.3 domain check (the
 /// property this whole feature exists for), and an untrusted chain being
 /// refused with its fingerprint reported. One function, not two, so this is
 /// the only place in the binary that ever touches `SSL_CERT_FILE` — see
@@ -183,7 +183,7 @@ impl Drop for TrustedCaOverride {
 async fn system_roots_checks_the_domain_and_rejects_untrusted_chains() {
     let _lock = CERT_ENV_LOCK.lock().expect("lock");
 
-    // --- RFC 5922 §7.1: the account's domain is what gets verified, never
+    // --- RFC 5922 §7.3: the account's domain is what gets verified, never
     // the resolved target. ---
     //
     // The leaf's only SAN is an IP SAN for 127.0.0.1 — the address the

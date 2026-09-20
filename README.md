@@ -115,7 +115,7 @@ Set `transport: Transport::Tls` on the account. Unless an explicit
 `server` isn't an IP literal, locates it via `_sips._tcp` SRV records
 (RFC 3263 §4.1) rather than `_sip._tcp`. Certificate verification checks
 the account's `domain` — never the host an SRV lookup happened to
-return — per RFC 5922 §7.1; verifying the resolved target instead would
+return — per RFC 5922 §7.3; verifying the resolved target instead would
 let whoever answers the DNS query pick which name the certificate has
 to match.
 

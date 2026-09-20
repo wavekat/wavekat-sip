@@ -122,7 +122,13 @@ This is the detail that, done wrong, leaves a connection that looks
 exactly like a working one and protects nothing. It gets a named
 regression test.
 
-**RFC 5922 §7.1**: the identity to check is the domain from the SIP
+> **Corrected after review:** this section originally cited RFC 5922
+> §7.1. §7.1 is "Finding SIP Identities in a Certificate" — how to
+> extract identities from the certificate, not our rule. The client
+> obligation this design relies on is §7.3, "Client Behavior." See
+> "Amendments after review" at the end of this doc.
+
+**RFC 5922 §7.3**: the identity to check is the domain from the SIP
 URI, not the hostname SRV returned. If `sip.example.com` has an SRV
 record naming `edge-3.some-provider.net`, the certificate must match
 `sip.example.com`.
@@ -413,3 +419,20 @@ system-roots verifier with
 to a specific call, so there is no correction to make here — noted for
 completeness since the other three amendments are all API-shape
 changes from what was planned.
+
+**5. Wrong RFC 5922 section cited throughout.** Every citation in this
+doc, and every one it was copied into (source doc comments, tests,
+`README.md`, `RFC-COVERAGE.md`), read "RFC 5922 §7.1." That section is
+"Finding SIP Identities in a Certificate" — how to extract identities
+from a certificate's `subjectAltName`/`CN`, not the rule this design
+relies on. The correct citation is **§7.3, "Client Behavior,"** which
+requires the client to "compare the original domain portion of the SIP
+AOR used as input to the RFC 3263 server location procedures to the SIP
+domain identities obtained from the certificate" — precisely the
+domain-not-resolved-target property this doc's "Verify the SIP domain,
+not the resolved target" section (above) exists to guarantee. The error
+originated in `docs/18-secure-transport-tls-and-srtp.md` (not corrected
+there — it is superseded by this doc and, like this doc, a point-in-time
+record) and was carried into every downstream citation; all of the
+latter have been corrected to §7.3 as plain fixes, since they simply
+repeat a citation rather than record a design decision that changed.

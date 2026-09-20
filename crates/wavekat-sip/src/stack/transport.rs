@@ -51,7 +51,7 @@ pub(crate) struct TransportSetup {
 #[cfg(feature = "tls")]
 #[derive(Debug, Clone)]
 pub(crate) struct TlsSetup {
-    /// The account's SIP domain — RFC 5922 §7.1. Never the SRV target.
+    /// The account's SIP domain — RFC 5922 §7.3. Never the SRV target.
     pub(crate) server_name: String,
     /// How to trust the server's certificate.
     pub(crate) policy: crate::account::TlsPolicy,

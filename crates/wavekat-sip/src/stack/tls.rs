@@ -232,7 +232,7 @@ fn client_config(policy: &TlsPolicy) -> io::Result<rustls::ClientConfig> {
 /// Perform the TLS handshake on an established TCP connection.
 ///
 /// `server_name` is the **account's SIP domain**, never the host an SRV lookup
-/// returned — RFC 5922 §7.1. It is both the name verified and the SNI sent. If
+/// returned — RFC 5922 §7.3. It is both the name verified and the SNI sent. If
 /// the SRV target were verified instead, whoever can answer the DNS query would
 /// also choose which name the certificate has to match, and could point it at a
 /// host whose certificate they legitimately hold.
