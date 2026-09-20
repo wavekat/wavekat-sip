@@ -57,10 +57,15 @@ fn cert_failure(err: &rustls::Error) -> CertFailure {
             },
             CertificateError::UnknownIssuer => CertFailure::UnknownIssuer,
             CertificateError::BadEncoding => CertFailure::Malformed,
+            CertificateError::Revoked => CertFailure::Revoked,
+            CertificateError::BadSignature => CertFailure::BadSignature,
             // What `PinnedVerifier` returns on a mismatch; nothing else in this
             // crate's configuration produces it.
             CertificateError::ApplicationVerificationFailure => CertFailure::PinMismatch,
-            other => CertFailure::Other(other.to_string()),
+            // Still a certificate problem — one of `CertificateError`'s less
+            // common variants this crate has not given its own case — so the
+            // message says so, unlike the outer arm below.
+            other => CertFailure::Other(format!("certificate: {other}")),
         },
         other => CertFailure::Other(other.to_string()),
     }
@@ -249,13 +254,18 @@ pub(crate) async fn connect(
         .await
         .map_err(|e| {
             // A TLS error wraps the rustls error as its source; anything that
-            // reached the verifier has a fingerprint recorded for it.
+            // reached the verifier has a fingerprint recorded for it. Only
+            // `InvalidCertificate` is a verdict on the certificate itself —
+            // the fingerprint is recorded the moment the verifier is entered,
+            // so it is `Some` for later, non-certificate failures too (a bad
+            // Finished MAC, a fatal alert, `PeerMisbehaved`), and those must
+            // not be reported as a refused certificate.
             let rustls_err = e
                 .get_ref()
                 .and_then(|inner| inner.downcast_ref::<rustls::Error>());
             let fingerprint = seen.lock().ok().and_then(|s| *s);
             match (rustls_err, fingerprint) {
-                (Some(re), Some(sha256)) => io::Error::new(
+                (Some(re @ rustls::Error::InvalidCertificate(_)), Some(sha256)) => io::Error::new(
                     io::ErrorKind::InvalidData,
                     UntrustedCertificate {
                         sha256,
@@ -363,6 +373,32 @@ mod tests {
     }
 
     #[test]
+    fn maps_revoked_to_its_own_failure() {
+        let err = rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked);
+        assert_eq!(cert_failure(&err), CertFailure::Revoked);
+    }
+
+    #[test]
+    fn maps_bad_signature_to_its_own_failure() {
+        let err = rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature);
+        assert_eq!(cert_failure(&err), CertFailure::BadSignature);
+    }
+
+    /// An unmapped `CertificateError` is still reported as a certificate
+    /// problem — distinguishable from the non-certificate catch-all below by
+    /// the `"certificate: "` prefix on the message, per `CertFailure::Other`'s
+    /// doc.
+    #[test]
+    fn an_unmapped_certificate_error_is_still_reported_as_a_certificate_problem() {
+        let err =
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnhandledCriticalExtension);
+        match cert_failure(&err) {
+            CertFailure::Other(msg) => assert!(msg.starts_with("certificate: "), "{msg}"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn pin_mismatch_has_its_own_failure() {
         let err = rustls::Error::InvalidCertificate(
             rustls::CertificateError::ApplicationVerificationFailure,
@@ -412,6 +448,39 @@ mod tests {
             .is_ok());
     }
 
+    /// Build a `DigitallySignedStruct` from raw wire bytes: its constructor is
+    /// private to rustls, so tests go through the same `Codec` encoding rustls
+    /// itself parses a handshake message with (`rustls::internal` is exposed
+    /// by rustls specifically for this).
+    fn digitally_signed(scheme: SignatureScheme, sig: &[u8]) -> DigitallySignedStruct {
+        use rustls::internal::msgs::codec::{Codec, Reader};
+        let mut bytes = Vec::new();
+        scheme.encode(&mut bytes);
+        bytes.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(sig);
+        let mut reader = Reader::init(&bytes);
+        DigitallySignedStruct::read(&mut reader).expect("well-formed test signature")
+    }
+
+    /// `verify_tls12_signature`/`verify_tls13_signature` are the half of the
+    /// verifier that actually proves the peer holds the certificate's private
+    /// key. Every other test here drives `verify_server_cert` only, so
+    /// nothing would catch either signature method regressing to a blanket
+    /// `Ok(HandshakeSignatureValid::assertion())` — which would let an
+    /// attacker with no private key complete the handshake.
+    #[test]
+    fn pinned_verifier_rejects_a_signature_that_does_not_verify() {
+        let (_ca, leaf, _key) = chain(&["sip.example.com"]);
+        let der = rustls::pki_types::CertificateDer::from(leaf.clone());
+        let v = PinnedVerifier::new(sha256(&leaf), provider());
+
+        // Garbage signature bytes over an arbitrary transcript: they cannot
+        // validate against the leaf's real public key.
+        let dss = digitally_signed(SignatureScheme::ECDSA_NISTP256_SHA256, &[0u8; 64]);
+        assert!(v.verify_tls12_signature(b"transcript", &der, &dss).is_err());
+        assert!(v.verify_tls13_signature(b"transcript", &der, &dss).is_err());
+    }
+
     /// The recorder is the only way `connect` can attach a fingerprint to a
     /// refused certificate's error, so it must capture it even when the
     /// wrapped verifier goes on to reject the certificate.
@@ -439,5 +508,72 @@ mod tests {
             Some(sha256(&leaf)),
             "the fingerprint of the certificate actually presented was recorded"
         );
+    }
+
+    /// `connect` is the module's only product: everything above this test
+    /// exercises its pieces (`sha256`, `cert_failure`, `PinnedVerifier`,
+    /// `RecordingVerifier`) in isolation, but nothing before this test drives
+    /// the place they meet — a real handshake over a real socket, the
+    /// `io::Error` → `rustls::Error` downcast in `connect`'s error mapping,
+    /// and the recorded-fingerprint read-back.
+    #[tokio::test]
+    async fn connect_accepts_the_pinned_certificate_and_reports_a_mismatch_honestly() {
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let (_ca, leaf_der, key_der) = chain(&["sip.example.com"]);
+        let leaf_fingerprint = sha256(&leaf_der);
+
+        let server_provider = provider();
+        let cert = rustls::pki_types::CertificateDer::from(leaf_der.clone());
+        let key = rustls::pki_types::PrivateKeyDer::from(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+        );
+        let server_config = rustls::ServerConfig::builder_with_provider(server_provider)
+            .with_safe_default_protocol_versions()
+            .expect("server protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("server config");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        // Accepts exactly the two connections this test makes, then stops.
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // The client rejects on the second connection before the
+                    // handshake finishes; the server side erroring too is
+                    // expected and not asserted on.
+                    let _ = acceptor.accept(tcp).await;
+                });
+            }
+        });
+
+        // The pinned fingerprint matches: the handshake completes.
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        let right_policy = TlsPolicy::Pinned {
+            sha256: leaf_fingerprint,
+        };
+        let ok = connect(tcp, "sip.example.com", &right_policy).await;
+        assert!(ok.is_ok(), "{:?}", ok.err());
+
+        // A different pin: the handshake fails, and the error names exactly
+        // the certificate that was actually presented, not a protocol error.
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        let wrong_policy = TlsPolicy::Pinned { sha256: [0u8; 32] };
+        let err = connect(tcp, "sip.example.com", &wrong_policy)
+            .await
+            .expect_err("wrong pin must fail");
+        let found = crate::tls_error::untrusted_certificate(&err)
+            .expect("a certificate rejection carries an UntrustedCertificate");
+        assert_eq!(found.reason, CertFailure::PinMismatch);
+        assert_eq!(found.sha256, leaf_fingerprint);
+
+        server.await.expect("server task");
     }
 }

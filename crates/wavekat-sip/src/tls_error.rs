@@ -23,12 +23,21 @@ pub enum CertFailure {
     },
     /// The chain did not reach a trusted root.
     UnknownIssuer,
+    /// The issuer has revoked the certificate.
+    Revoked,
+    /// The certificate's signature does not verify against its issuer's key.
+    BadSignature,
     /// The chain was fine, but the leaf is not the certificate pinned by
     /// [`TlsPolicy::Pinned`](crate::TlsPolicy::Pinned).
     PinMismatch,
     /// The certificate could not be parsed.
     Malformed,
-    /// A TLS failure that is not about the certificate at all.
+    /// A TLS failure this enum has no dedicated variant for. This can still
+    /// be a certificate problem — one of the less common
+    /// `rustls::CertificateError` variants this crate has not given its own
+    /// case — in which case the message is prefixed `"certificate: "`, or it
+    /// can be a non-certificate TLS failure (a protocol error, no shared
+    /// cipher suite) reported as-is.
     Other(String),
 }
 
@@ -45,6 +54,8 @@ impl fmt::Display for CertFailure {
                 Ok(())
             }
             Self::UnknownIssuer => write!(f, "certificate is not signed by a trusted issuer"),
+            Self::Revoked => write!(f, "certificate has been revoked"),
+            Self::BadSignature => write!(f, "certificate signature does not verify"),
             Self::PinMismatch => write!(f, "certificate does not match the pinned fingerprint"),
             Self::Malformed => write!(f, "certificate could not be parsed"),
             Self::Other(msg) => write!(f, "TLS failure: {msg}"),
