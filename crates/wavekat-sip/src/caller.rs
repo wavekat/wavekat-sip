@@ -30,7 +30,7 @@ use crate::session_timer::{
 };
 use crate::stack::call::{CallConfig, CallOutcome};
 use crate::stack::dialog::{Dialog, DialogId};
-use crate::stack::transaction::gen_tag;
+use crate::stack::transaction::{contact_uri, gen_tag};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -480,10 +480,13 @@ impl Caller {
 
         let from: Uri =
             format!("sip:{}@{}", self.account.username, self.account.domain).try_into()?;
-        let contact: Uri = format!(
-            "sip:{}@{}",
-            self.account.username,
-            self.endpoint.local_addr()
+        // Carries `;transport=` for anything but UDP: it tells the peer where
+        // to send in-dialog requests, and our own `Via` transport is read back
+        // off it (see `transport_of`).
+        let contact: Uri = contact_uri(
+            &self.account.username,
+            self.endpoint.local_addr(),
+            self.endpoint.transport(),
         )
         .try_into()?;
 
