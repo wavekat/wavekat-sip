@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/wavekat/wavekat-sip/compare/v0.2.2...v0.2.3) - 2026-09-20
+
+### Fixed
+
+- advertise the real transport on calls, not just REGISTER ([#56](https://github.com/wavekat/wavekat-sip/pull/56))
+
 ## [0.2.2](https://github.com/wavekat/wavekat-sip/compare/v0.2.1...v0.2.2) - 2026-09-20
 
 ### Added
