@@ -143,12 +143,14 @@ fn location_plan(account: &SipAccount) -> LocationPlan {
             port: account.port(),
         };
     }
-    let proto = match account.transport {
-        Transport::Udp => "udp",
-        Transport::Tcp => "tcp",
+    // RFC 3263 §4.1. Note the TLS name is `_sips._tcp`, not `_sip._tls`.
+    let service = match account.transport {
+        Transport::Udp => "_sip._udp",
+        Transport::Tcp => "_sip._tcp",
+        Transport::Tls => "_sips._tcp",
     };
     LocationPlan::Srv {
-        name: format!("_sip._{proto}.{host}"),
+        name: format!("{service}.{host}"),
         host,
         port: account.port(),
     }
@@ -450,6 +452,33 @@ mod tests {
                 name: "_sip._tcp.pbx.example.com".to_string(),
                 host: "pbx.example.com".to_string(),
                 port: 5060,
+            }
+        );
+    }
+
+    #[test]
+    fn tls_queries_the_sips_service() {
+        let acct = account(Some("pbx.example.com"), None, Transport::Tls);
+        assert_eq!(
+            location_plan(&acct),
+            LocationPlan::Srv {
+                name: "_sips._tcp.pbx.example.com".to_string(),
+                host: "pbx.example.com".to_string(),
+                port: 5061,
+            }
+        );
+    }
+
+    /// An explicit port still skips SRV under TLS, same as UDP/TCP — and the
+    /// port given wins over the 5061 default.
+    #[test]
+    fn tls_with_explicit_port_skips_srv() {
+        let acct = account(Some("pbx.example.com"), Some(5061), Transport::Tls);
+        assert_eq!(
+            location_plan(&acct),
+            LocationPlan::Direct {
+                host: "pbx.example.com".to_string(),
+                port: 5061,
             }
         );
     }

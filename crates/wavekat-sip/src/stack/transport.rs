@@ -126,6 +126,10 @@ impl BoundTransport {
         match transport {
             Transport::Udp => Ok(Self::Datagram(UdpTransport::bind(local).await?)),
             Transport::Tcp => Ok(Self::Stream(StreamTransport::connect(peer).await?)),
+            Transport::Tls => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS transport requires the `tls` feature",
+            )),
         }
     }
 
@@ -294,5 +298,18 @@ mod tests {
             seen_by_server,
             "local_addr must be the TCP connection's address"
         );
+    }
+
+    /// TLS isn't implemented until a later phase; `bind` must fail loudly
+    /// rather than silently falling back to a cleartext transport.
+    #[tokio::test]
+    async fn tls_kind_is_rejected_until_implemented() {
+        let peer: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let result =
+            BoundTransport::bind("127.0.0.1:0".parse().expect("addr"), peer, Transport::Tls).await;
+        match result {
+            Ok(_) => panic!("TLS must not silently downgrade to another transport"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::Unsupported),
+        }
     }
 }

@@ -72,7 +72,9 @@ impl From<crate::account::Transport> for Reliability {
     fn from(transport: crate::account::Transport) -> Self {
         match transport {
             crate::account::Transport::Udp => Reliability::Unreliable,
-            crate::account::Transport::Tcp => Reliability::Reliable,
+            crate::account::Transport::Tcp | crate::account::Transport::Tls => {
+                Reliability::Reliable
+            }
         }
     }
 }
@@ -303,6 +305,7 @@ pub(crate) fn contact_uri(
     match transport {
         crate::account::Transport::Udp => format!("sip:{username}@{local}"),
         crate::account::Transport::Tcp => format!("sip:{username}@{local};transport=tcp"),
+        crate::account::Transport::Tls => format!("sip:{username}@{local};transport=tls"),
     }
 }
 
@@ -317,12 +320,19 @@ pub(crate) fn transport_of(uri: &rsip::Uri) -> crate::account::Transport {
     for param in &uri.params {
         if let rsip::common::uri::param::Param::Transport(t) = param {
             return match t {
-                rsip::transport::Transport::Tcp
-                | rsip::transport::Transport::Tls
-                | rsip::transport::Transport::TlsSctp => Transport::Tcp,
+                rsip::transport::Transport::Tls | rsip::transport::Transport::TlsSctp => {
+                    Transport::Tls
+                }
+                rsip::transport::Transport::Tcp | rsip::transport::Transport::Sctp => {
+                    Transport::Tcp
+                }
                 _ => Transport::Udp,
             };
         }
+    }
+    // RFC 3261 §19.1.2: `sips:` implies TLS when no parameter says otherwise.
+    if matches!(uri.scheme, Some(rsip::common::uri::Scheme::Sips)) {
+        return Transport::Tls;
     }
     Transport::Udp
 }
@@ -350,6 +360,7 @@ pub(crate) fn via_value(
     let proto = match transport {
         crate::account::Transport::Udp => "UDP",
         crate::account::Transport::Tcp => "TCP",
+        crate::account::Transport::Tls => "TLS",
     };
     format!("SIP/2.0/{proto} {sent_by};rport;branch={branch}")
 }
@@ -667,5 +678,58 @@ mod tests {
             .try_into()
             .expect("uri");
         assert_eq!(transport_of(&uri), Transport::Tcp);
+    }
+
+    #[test]
+    fn via_value_names_tls() {
+        let local: std::net::SocketAddr = "10.0.0.1:5061".parse().expect("addr");
+        assert!(via_value(crate::account::Transport::Tls, local, "b").starts_with("SIP/2.0/TLS "));
+    }
+
+    #[test]
+    fn contact_uri_names_tls_transport() {
+        let local: std::net::SocketAddr = "10.0.0.1:5061".parse().expect("addr");
+        let c = contact_uri("1001", local, crate::account::Transport::Tls);
+        assert_eq!(c, "sip:1001@10.0.0.1:5061;transport=tls");
+    }
+
+    /// The round trip that guarantees the Via we emit agrees with the Contact we
+    /// published: a TLS Contact read back must not degrade to TCP.
+    #[test]
+    fn transport_of_reads_tls_back_as_tls() {
+        let local: std::net::SocketAddr = "10.0.0.1:5061".parse().expect("addr");
+        let uri: rsip::Uri = contact_uri("1001", local, crate::account::Transport::Tls)
+            .try_into()
+            .expect("parses");
+        assert_eq!(transport_of(&uri), crate::account::Transport::Tls);
+        assert!(via_value(transport_of(&uri), local, "b").starts_with("SIP/2.0/TLS "));
+    }
+
+    /// RFC 3261 §19.1.2: a `sips:` URI means TLS even with no `transport`
+    /// parameter. A peer is entitled to send us one, and reading it as UDP would
+    /// route an in-dialog request onto a transport nobody is listening on.
+    #[test]
+    fn transport_of_reads_the_sips_scheme_as_tls() {
+        let uri: rsip::Uri = "sips:1001@10.0.0.1:5061".try_into().expect("parses");
+        assert_eq!(transport_of(&uri), crate::account::Transport::Tls);
+    }
+
+    /// The parameter still wins where both are present.
+    #[test]
+    fn an_explicit_transport_param_beats_the_scheme() {
+        let uri: rsip::Uri = "sip:1001@10.0.0.1:5060;transport=tcp"
+            .try_into()
+            .expect("parses");
+        assert_eq!(transport_of(&uri), crate::account::Transport::Tcp);
+    }
+
+    /// `Reliability::from` groups TLS with TCP: both are streams, so
+    /// retransmission timers do not apply.
+    #[test]
+    fn tls_transport_is_reliable() {
+        assert_eq!(
+            Reliability::from(crate::account::Transport::Tls),
+            Reliability::Reliable
+        );
     }
 }

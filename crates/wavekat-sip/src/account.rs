@@ -13,6 +13,9 @@ pub enum Transport {
     #[default]
     Udp,
     Tcp,
+    /// SIP over TLS (RFC 3261 §26.2.1). Defaults to port 5061 and is located
+    /// via `_sips._tcp` SRV records.
+    Tls,
 }
 
 /// Runtime SIP account. The password is held in memory while the endpoint
@@ -50,9 +53,16 @@ impl SipAccount {
         self.server.as_deref().unwrap_or(&self.domain)
     }
 
-    /// SIP port: defaults to 5060.
+    /// SIP port: defaults to 5061 under TLS, 5060 otherwise.
+    ///
+    /// RFC 3261 §26.2.1 assigns TLS its own default port; a TLS account that
+    /// fell back to 5060 would connect to the cleartext port and fail the
+    /// handshake.
     pub fn port(&self) -> u16 {
-        self.port.unwrap_or(5060)
+        self.port.unwrap_or(match self.transport {
+            Transport::Tls => 5061,
+            Transport::Udp | Transport::Tcp => 5060,
+        })
     }
 }
 
@@ -115,5 +125,29 @@ mod tests {
     #[test]
     fn default_transport_is_udp() {
         assert_eq!(Transport::default(), Transport::Udp);
+    }
+
+    #[test]
+    fn tls_port_defaults_to_5061() {
+        let mut acct = make_account();
+        acct.transport = Transport::Tls;
+        assert_eq!(acct.port(), 5061);
+    }
+
+    #[test]
+    fn explicit_port_still_wins_under_tls() {
+        let mut acct = make_account();
+        acct.transport = Transport::Tls;
+        acct.port = Some(5080);
+        assert_eq!(acct.port(), 5080);
+    }
+
+    #[test]
+    fn udp_and_tcp_ports_are_unchanged() {
+        let mut acct = make_account();
+        acct.transport = Transport::Tcp;
+        assert_eq!(acct.port(), 5060);
+        acct.transport = Transport::Udp;
+        assert_eq!(acct.port(), 5060);
     }
 }
