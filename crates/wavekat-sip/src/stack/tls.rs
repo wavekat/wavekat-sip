@@ -224,11 +224,6 @@ fn config_with_recorder(policy: &TlsPolicy) -> io::Result<(rustls::ClientConfig,
     Ok((config, seen))
 }
 
-/// Build the client config for `policy`.
-fn client_config(policy: &TlsPolicy) -> io::Result<rustls::ClientConfig> {
-    config_with_recorder(policy).map(|(c, _)| c)
-}
-
 /// Perform the TLS handshake on an established TCP connection.
 ///
 /// `server_name` is the **account's SIP domain**, never the host an SRV lookup
@@ -414,8 +409,8 @@ mod tests {
 
     #[test]
     fn both_policies_build_a_usable_client_config() {
-        assert!(client_config(&TlsPolicy::SystemRoots).is_ok());
-        assert!(client_config(&TlsPolicy::Pinned { sha256: [7u8; 32] }).is_ok());
+        assert!(config_with_recorder(&TlsPolicy::SystemRoots).is_ok());
+        assert!(config_with_recorder(&TlsPolicy::Pinned { sha256: [7u8; 32] }).is_ok());
     }
 
     #[test]
