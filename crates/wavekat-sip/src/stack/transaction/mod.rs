@@ -732,4 +732,16 @@ mod tests {
             Reliability::Reliable
         );
     }
+
+    /// `transport_of` folds `;transport=sctp` down to `Transport::Tcp` — there
+    /// is no `Transport::Sctp` in our account-facing enum, and SCTP is a
+    /// stream transport like TCP, so that is the closer of the two. Pins the
+    /// behaviour this branch's `transport_of` fix left unchanged.
+    #[test]
+    fn transport_of_reads_sctp_as_tcp() {
+        let uri: rsip::Uri = "sip:1001@10.0.0.1:5060;transport=sctp"
+            .try_into()
+            .expect("parses");
+        assert_eq!(transport_of(&uri), crate::account::Transport::Tcp);
+    }
 }

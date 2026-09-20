@@ -413,6 +413,27 @@ Content-Length: 0\r\n\r\n"
         }
     }
 
+    /// Without the `tls` feature at all, `Transport::Tls` must fail clearly —
+    /// `io::ErrorKind::Unsupported` — rather than silently connecting in
+    /// cleartext or panicking. `account.rs`'s `Transport::Tls` doc comment
+    /// makes this contract explicit for a consumer who enables it without the
+    /// feature.
+    #[cfg(not(feature = "tls"))]
+    #[tokio::test]
+    async fn tls_transport_without_the_feature_is_unsupported() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let result = StreamTransport::connect(addr, &Transport::Tls.into()).await;
+        match result {
+            Ok(_) => panic!("must not connect without the tls feature"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::Unsupported),
+        }
+    }
+
     /// `SipStream` must delegate reads and writes to its inner transport
     /// unchanged — the framer and read task above it depend on that, and a
     /// future `Tls` arm has to satisfy the same contract.
