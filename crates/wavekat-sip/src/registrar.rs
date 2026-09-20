@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::account::SipAccount;
 use crate::endpoint::SipEndpoint;
 use crate::stack::registration::{RegisterConfig, RegisterOutcome};
-use crate::stack::transaction::gen_tag;
+use crate::stack::transaction::{contact_uri, gen_tag};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -59,23 +59,6 @@ pub struct Registrar {
     from_tag: String,
     contact: String,
     state: Mutex<State>,
-}
-
-/// Build the `Contact` URI the registrar advertises.
-///
-/// The `transport` parameter is required for anything but UDP: RFC 3261
-/// §19.1.1 makes UDP the default when it is absent, so a bare URI on a TCP
-/// endpoint tells the registrar to reach us for inbound calls over a
-/// transport we are not listening on.
-pub(crate) fn contact_uri(
-    username: &str,
-    local: std::net::SocketAddr,
-    transport: crate::account::Transport,
-) -> String {
-    match transport {
-        crate::account::Transport::Udp => format!("sip:{username}@{local}"),
-        crate::account::Transport::Tcp => format!("sip:{username}@{local};transport=tcp"),
-    }
 }
 
 impl Registrar {

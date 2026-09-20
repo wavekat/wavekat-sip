@@ -24,7 +24,7 @@ use crate::sdp::{
 use crate::session_timer::{negotiate_uas, require_timer_header, supported_timer_header};
 use crate::stack::dialog::Dialog;
 use crate::stack::response::{build_response, ResponseBody};
-use crate::stack::transaction::{gen_tag, TransactionKey};
+use crate::stack::transaction::{contact_uri, gen_tag, TransactionKey};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -167,10 +167,11 @@ impl IncomingCall {
         debug!("SDP answer:\n{}", String::from_utf8_lossy(&answer));
 
         let to_tag = self.local_tag.clone();
-        let contact: Uri = format!(
-            "sip:{}@{}",
-            self.endpoint.account().username,
-            self.endpoint.local_addr()
+        // Carries `;transport=` for anything but UDP — see `contact_uri`.
+        let contact: Uri = contact_uri(
+            &self.endpoint.account().username,
+            self.endpoint.local_addr(),
+            self.endpoint.transport(),
         )
         .try_into()?;
 

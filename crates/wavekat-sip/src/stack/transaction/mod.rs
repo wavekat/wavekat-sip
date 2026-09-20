@@ -287,6 +287,25 @@ pub(crate) fn gen_branch() -> String {
     format!("{MAGIC_COOKIE}{n:x}{seed:x}")
 }
 
+/// Build the `Contact` URI we advertise: where the peer should reach us for
+/// in-dialog requests and inbound calls.
+///
+/// The `transport` parameter is required for anything but UDP. RFC 3261
+/// §19.1.1 makes UDP the default when it is absent, so a bare URI on a TCP
+/// endpoint asks the peer to reach us over a transport we are not listening
+/// on — and, because [`transport_of`] reads this URI back, it would also make
+/// our own `Via` claim UDP.
+pub(crate) fn contact_uri(
+    username: &str,
+    local: std::net::SocketAddr,
+    transport: crate::account::Transport,
+) -> String {
+    match transport {
+        crate::account::Transport::Udp => format!("sip:{username}@{local}"),
+        crate::account::Transport::Tcp => format!("sip:{username}@{local};transport=tcp"),
+    }
+}
+
 /// The transport a URI names, defaulting to UDP when it says nothing.
 ///
 /// RFC 3261 §19.1.1: a SIP URI with no `transport` parameter means UDP. Our

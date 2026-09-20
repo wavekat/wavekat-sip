@@ -13,7 +13,8 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use wavekat_sip::{Registrar, SipAccount, SipEndpoint, Transport};
+use wavekat_sip::re_exports::Uri;
+use wavekat_sip::{Caller, Registrar, SipAccount, SipEndpoint, Transport};
 
 fn account(port: u16) -> SipAccount {
     SipAccount {
@@ -123,6 +124,64 @@ async fn registers_over_tcp() {
     assert!(
         register.to_ascii_lowercase().contains("content-length:"),
         "stream framing requires Content-Length:\n{register}"
+    );
+
+    endpoint.shutdown();
+    cancel.cancel();
+}
+
+/// An outbound INVITE must advertise TCP too.
+///
+/// Regression test: the `Via` transport is read back off the `Contact` we
+/// build, and `Caller` built a bare `sip:user@addr` with no transport
+/// parameter — so a REGISTER correctly said TCP while the INVITE on the same
+/// connection claimed UDP. A stream peer happens to answer on the connection
+/// anyway, which is exactly why this went unnoticed; a proxy that honours the
+/// `Via` would send the response to a UDP socket that does not exist.
+#[tokio::test]
+async fn invite_over_tcp_advertises_tcp() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    let (seen_tx, seen_rx) = oneshot::channel::<String>();
+
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.expect("accept");
+        let invite = read_message(&mut sock).await;
+        // 486 Busy Here — enough to finish the transaction; we only care
+        // about the request we were sent.
+        let busy = ok_for(&invite).replace("SIP/2.0 200 OK", "SIP/2.0 486 Busy Here");
+        sock.write_all(busy.as_bytes()).await.expect("write 486");
+        let _ = seen_tx.send(invite);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+
+    let cancel = CancellationToken::new();
+    let endpoint = SipEndpoint::new(&account(addr.port()), cancel.clone())
+        .await
+        .expect("binds a TCP endpoint");
+    let caller = Caller::new(account(addr.port()), endpoint.clone());
+
+    let target: Uri = format!("sip:601@127.0.0.1:{}", addr.port())
+        .try_into()
+        .expect("target uri");
+    let _ = timeout(Duration::from_secs(5), caller.dial(target)).await;
+
+    let invite = timeout(Duration::from_secs(5), seen_rx)
+        .await
+        .expect("server saw an INVITE")
+        .expect("channel");
+
+    assert!(
+        invite.starts_with("INVITE "),
+        "server received an INVITE:\n{invite}"
+    );
+    assert!(
+        invite.contains("Via: SIP/2.0/TCP "),
+        "INVITE Via must name TCP, not UDP:\n{invite}"
+    );
+    assert!(
+        invite.to_ascii_lowercase().contains("transport=tcp"),
+        "INVITE Contact must carry the transport, or in-dialog requests go to UDP:\n{invite}"
     );
 
     endpoint.shutdown();
