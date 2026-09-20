@@ -287,9 +287,34 @@ pub(crate) fn gen_branch() -> String {
     format!("{MAGIC_COOKIE}{n:x}{seed:x}")
 }
 
-/// Build the `Via` header value for one of our outgoing requests: a UDP
-/// sent-by of `sent_by`, the given transaction `branch`, and a bare `;rport`
-/// (RFC 3581).
+/// The transport a URI names, defaulting to UDP when it says nothing.
+///
+/// RFC 3261 §19.1.1: a SIP URI with no `transport` parameter means UDP. Our
+/// own `Contact` carries the parameter whenever we are on anything else, so
+/// reading it back is how the `Via` we emit is guaranteed to agree with the
+/// `Contact` we published — rather than two code paths each remembering.
+pub(crate) fn transport_of(uri: &rsip::Uri) -> crate::account::Transport {
+    use crate::account::Transport;
+    for param in &uri.params {
+        if let rsip::common::uri::param::Param::Transport(t) = param {
+            return match t {
+                rsip::transport::Transport::Tcp
+                | rsip::transport::Transport::Tls
+                | rsip::transport::Transport::TlsSctp => Transport::Tcp,
+                _ => Transport::Udp,
+            };
+        }
+    }
+    Transport::Udp
+}
+
+/// Build the `Via` header value for one of our outgoing requests: the
+/// sent-by, the transport we will actually use, the given transaction
+/// `branch`, and a bare `;rport` (RFC 3581).
+///
+/// The transport name is not cosmetic — it tells the server which transport
+/// to send the response back over. Naming UDP on a stream connection asks for
+/// a reply on a socket we are not listening on.
 ///
 /// `rport` is what lets us be reached behind NAT. Without it, a proxy records
 /// our private sent-by / `Contact` and routes a later in-dialog request (most
@@ -298,8 +323,16 @@ pub(crate) fn gen_branch() -> String {
 /// `rport` from the packet's real source and routes back there instead. The
 /// value is empty in a request (RFC 3581 §3); the server fills it in its
 /// response.
-pub(crate) fn via_value(sent_by: impl std::fmt::Display, branch: &str) -> String {
-    format!("SIP/2.0/UDP {sent_by};rport;branch={branch}")
+pub(crate) fn via_value(
+    transport: crate::account::Transport,
+    sent_by: impl std::fmt::Display,
+    branch: &str,
+) -> String {
+    let proto = match transport {
+        crate::account::Transport::Udp => "UDP",
+        crate::account::Transport::Tcp => "TCP",
+    };
+    format!("SIP/2.0/{proto} {sent_by};rport;branch={branch}")
 }
 
 /// Generate a unique dialog tag (`From`/`To` tag). Like [`gen_branch`] but
@@ -440,7 +473,11 @@ mod tests {
 
     #[test]
     fn via_value_advertises_rport_and_keeps_branch_parseable() {
-        let v = via_value("192.168.1.46:54991", "z9hG4bK-rp");
+        let v = via_value(
+            crate::account::Transport::Udp,
+            "192.168.1.46:54991",
+            "z9hG4bK-rp",
+        );
         // RFC 3581: the request carries a bare `rport` (no value).
         assert!(v.contains(";rport"), "Via must advertise rport: {v}");
         assert!(
@@ -581,5 +618,35 @@ mod tests {
             to.tag().map(|t| t.value().to_string()),
             Some("bob".to_string())
         );
+    }
+
+    #[test]
+    fn via_value_names_the_transport() {
+        use crate::account::Transport;
+        assert!(
+            via_value(Transport::Udp, "10.0.0.1:5060", "b").starts_with("SIP/2.0/UDP "),
+            "UDP"
+        );
+        assert!(
+            via_value(Transport::Tcp, "10.0.0.1:5060", "b").starts_with("SIP/2.0/TCP "),
+            "TCP must not advertise UDP — the server would answer on a socket \
+             we are not listening on"
+        );
+    }
+
+    #[test]
+    fn transport_of_defaults_to_udp_when_unstated() {
+        use crate::account::Transport;
+        let uri: rsip::Uri = "sip:1001@10.0.0.1:5060".try_into().expect("uri");
+        assert_eq!(transport_of(&uri), Transport::Udp);
+    }
+
+    #[test]
+    fn transport_of_reads_the_uri_parameter() {
+        use crate::account::Transport;
+        let uri: rsip::Uri = "sip:1001@10.0.0.1:5060;transport=tcp"
+            .try_into()
+            .expect("uri");
+        assert_eq!(transport_of(&uri), Transport::Tcp);
     }
 }

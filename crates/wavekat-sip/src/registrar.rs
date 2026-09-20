@@ -61,6 +61,23 @@ pub struct Registrar {
     state: Mutex<State>,
 }
 
+/// Build the `Contact` URI the registrar advertises.
+///
+/// The `transport` parameter is required for anything but UDP: RFC 3261
+/// §19.1.1 makes UDP the default when it is absent, so a bare URI on a TCP
+/// endpoint tells the registrar to reach us for inbound calls over a
+/// transport we are not listening on.
+pub(crate) fn contact_uri(
+    username: &str,
+    local: std::net::SocketAddr,
+    transport: crate::account::Transport,
+) -> String {
+    match transport {
+        crate::account::Transport::Udp => format!("sip:{username}@{local}"),
+        crate::account::Transport::Tcp => format!("sip:{username}@{local};transport=tcp"),
+    }
+}
+
 impl Registrar {
     /// Build a registrar. `expires` is the requested lifetime; `refresh_secs`
     /// is how often [`keepalive_loop`](Self::keepalive_loop) re-registers.
@@ -71,7 +88,11 @@ impl Registrar {
         expires: u32,
         refresh_secs: u64,
     ) -> Result<Self, BoxError> {
-        let contact = format!("sip:{}@{}", account.username, endpoint.local_addr());
+        let contact = contact_uri(
+            &account.username,
+            endpoint.local_addr(),
+            endpoint.transport(),
+        );
         Ok(Self {
             account,
             endpoint,
@@ -235,5 +256,34 @@ mod tests {
         assert_eq!(cfg.registrar_uri.to_string(), "sip:example.com");
         assert_eq!(cfg.aor.to_string(), "sip:1001@example.com");
         assert_eq!(cfg.username, "1001");
+    }
+
+    #[test]
+    fn contact_uri_omits_transport_param_for_udp() {
+        let local: std::net::SocketAddr = "10.0.0.1:5060".parse().expect("addr");
+        let c = contact_uri("1001", local, crate::account::Transport::Udp);
+        assert_eq!(c, "sip:1001@10.0.0.1:5060");
+    }
+
+    /// RFC 3261 §19.1.1: a Contact URI with no transport parameter means UDP.
+    /// Without this the registrar routes inbound INVITEs to a UDP socket that
+    /// does not exist on a TCP endpoint.
+    #[test]
+    fn contact_uri_names_tcp_transport() {
+        let local: std::net::SocketAddr = "10.0.0.1:5060".parse().expect("addr");
+        let c = contact_uri("1001", local, crate::account::Transport::Tcp);
+        assert_eq!(c, "sip:1001@10.0.0.1:5060;transport=tcp");
+    }
+
+    /// The Contact we publish is what the Via transport is read back from, so
+    /// a TCP contact must round-trip to a TCP Via.
+    #[test]
+    fn tcp_contact_round_trips_to_a_tcp_via() {
+        use crate::stack::transaction::{transport_of, via_value};
+        let local: std::net::SocketAddr = "10.0.0.1:5060".parse().expect("addr");
+        let uri: rsip::Uri = contact_uri("1001", local, crate::account::Transport::Tcp)
+            .try_into()
+            .expect("uri");
+        assert!(via_value(transport_of(&uri), local, "b").starts_with("SIP/2.0/TCP "));
     }
 }

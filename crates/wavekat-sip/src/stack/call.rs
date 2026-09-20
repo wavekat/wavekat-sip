@@ -13,7 +13,7 @@ use rsip::{Header, Headers, Method, Request, StatusCode, Uri};
 
 use super::auth::Credentials;
 use super::dialog::Dialog;
-use super::transaction::{gen_branch, via_value};
+use super::transaction::{gen_branch, transport_of, via_value};
 
 /// Everything needed to place a call and answer a challenge.
 pub(crate) struct CallConfig {
@@ -70,6 +70,7 @@ pub(crate) enum CallOutcome {
 pub(crate) fn build_invite(cfg: &CallConfig, cseq: u32, local_addr: SocketAddr) -> Request {
     let mut headers = Headers::default();
     headers.push(Header::Via(rsip::headers::Via::new(via_value(
+        transport_of(&cfg.contact),
         local_addr,
         &gen_branch(),
     ))));

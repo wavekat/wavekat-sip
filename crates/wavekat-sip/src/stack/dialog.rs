@@ -27,7 +27,7 @@ use rsip::headers::{ToTypedHeader, UntypedHeader};
 use rsip::message::HeadersExt;
 use rsip::{Header, Headers, Method, Request, Response, Uri};
 
-use super::transaction::{gen_branch, via_value};
+use super::transaction::{gen_branch, transport_of, via_value};
 
 /// One end of a dialog: identity (display name + URI) plus its dialog tag.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,10 +213,13 @@ impl Dialog {
         let branch = gen_branch();
 
         let mut headers = Headers::default();
-        // Via sent-by is our own contact address; UDP is our only transport.
+        // Via sent-by is our own contact address, and the transport is read
+        // back off that same Contact so the two can never disagree.
         let host = self.local_contact.host_with_port.to_string();
         headers.push(Header::Via(rsip::headers::Via::new(via_value(
-            &host, &branch,
+            transport_of(&self.local_contact),
+            &host,
+            &branch,
         ))));
         headers.push(Header::MaxForwards(rsip::headers::MaxForwards::default()));
 
