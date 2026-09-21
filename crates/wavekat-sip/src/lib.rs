@@ -28,6 +28,14 @@
 //!   the consumer.
 //! - **RTP** — header parser ([`RtpHeader`]), a debug-friendly receive loop
 //!   ([`receive_rtp`]), and a codec-agnostic send loop ([`send_loop`]).
+//! - **TLS** — SIP over TLS ([`Transport::Tls`]), gated behind the `tls`
+//!   cargo feature (off by default). Certificate verification against the
+//!   account's SIP domain, optional SHA-256 pinning ([`TlsPolicy`]), and a
+//!   typed error surface ([`CertFailure`], [`UntrustedCertificate`]).
+//!   `docs.rs` builds with all features, so this surface is always visible
+//!   here even when a consumer has not enabled it; see the crate README's
+//!   TLS section for the feature flag and the `Unsupported` error a
+//!   consumer gets if they select [`Transport::Tls`] without it.
 //!
 //! Explicitly out of scope (push these to the consuming application): audio
 //! device I/O, codec encode/decode, jitter buffering, recording; account
@@ -37,7 +45,7 @@
 //!
 //! ```no_run
 //! use tokio_util::sync::CancellationToken;
-//! use wavekat_sip::{Registrar, SipAccount, SipEndpoint, Transport};
+//! use wavekat_sip::{Registrar, SipAccount, SipEndpoint, TlsPolicy, Transport};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //! let account = SipAccount {
@@ -49,6 +57,7 @@
 //!     server: None,
 //!     port: None,
 //!     transport: Transport::Udp,
+//!     tls_policy: TlsPolicy::default(),
 //! };
 //!
 //! let cancel = CancellationToken::new();
@@ -166,8 +175,9 @@ pub mod session_timer;
 // Internal clean-room SIP engine (see `docs/08-own-sip-stack.md`). Entirely
 // `pub(crate)`: it never appears in this crate's public API.
 pub(crate) mod stack;
+pub mod tls_error;
 
-pub use account::{SipAccount, Transport};
+pub use account::{SipAccount, TlsPolicy, Transport};
 pub use callee::IncomingCall;
 pub use caller::{Call, CallSession, Caller, InboundRequests};
 pub use dtmf_info::{build_info_body, content_type_header, InfoOutcome};
@@ -195,6 +205,7 @@ pub use session_timer::{
     SessionExpires, SessionTimer, SessionTimerOutcome, UasSessionTimer,
     DEFAULT_SESSION_EXPIRES_SECS, MIN_SESSION_EXPIRES_SECS,
 };
+pub use tls_error::{untrusted_certificate, CertFailure, UntrustedCertificate};
 
 /// Re-exports of the [`rsip`] message types that appear in our public API.
 /// Pinning them here lets consumers depend only on `wavekat-sip`.

@@ -10,7 +10,7 @@
 //! `_sip._udp` SRV records to exercise the SRV path against your own
 //! provider.
 
-use wavekat_sip::{resolve_sip_server, SipAccount, Transport};
+use wavekat_sip::{resolve_sip_server, SipAccount, TlsPolicy, Transport};
 
 fn account(domain: &str) -> SipAccount {
     SipAccount {
@@ -22,6 +22,7 @@ fn account(domain: &str) -> SipAccount {
         server: None,
         port: None,
         transport: Transport::Udp,
+        tls_policy: TlsPolicy::default(),
     }
 }
 

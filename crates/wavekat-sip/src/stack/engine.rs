@@ -37,11 +37,9 @@ use super::transaction::client_non_invite::ClientNonInvite;
 use super::transaction::server_invite::ServerInvite;
 use super::transaction::server_non_invite::ServerNonInvite;
 use super::transaction::{Reliability, TimerId, Timers, Transaction, TransactionKey, TxAction};
-use crate::account::Transport;
-
-use super::transport::BoundTransport;
 #[cfg(test)]
 use super::transport::UdpTransport;
+use super::transport::{BoundTransport, TransportSetup};
 
 /// A request from the transaction user (TU) to the engine.
 pub(crate) enum Command {
@@ -171,7 +169,7 @@ struct Engine {
 pub(crate) async fn start(
     local: SocketAddr,
     peer: SocketAddr,
-    transport: Transport,
+    transport: impl Into<TransportSetup>,
     cancel: CancellationToken,
 ) -> io::Result<(EngineHandle, mpsc::Receiver<Event>)> {
     start_with_timers(local, peer, transport, Timers::default(), cancel).await
@@ -182,11 +180,12 @@ pub(crate) async fn start(
 pub(crate) async fn start_with_timers(
     local: SocketAddr,
     peer: SocketAddr,
-    transport: Transport,
+    transport: impl Into<TransportSetup>,
     timers: Timers,
     cancel: CancellationToken,
 ) -> io::Result<(EngineHandle, mpsc::Receiver<Event>)> {
-    let transport = Arc::new(BoundTransport::bind(local, peer, transport).await?);
+    let setup = transport.into();
+    let transport = Arc::new(BoundTransport::bind(local, peer, &setup).await?);
     let local_addr = transport.local_addr()?;
     let reliability = transport.reliability();
 
@@ -445,6 +444,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::Transport;
     use tokio::time::{timeout, Duration};
 
     const BRANCH: &str = "z9hG4bK-engine";

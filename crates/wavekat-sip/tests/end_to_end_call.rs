@@ -14,7 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use wavekat_sip::re_exports::Uri;
-use wavekat_sip::{AudioCodec, Caller, DtmfDigit, SipAccount, SipEndpoint, Transport};
+use wavekat_sip::{AudioCodec, Caller, DtmfDigit, SipAccount, SipEndpoint, TlsPolicy, Transport};
 
 fn account(server: &str, port: u16) -> SipAccount {
     SipAccount {
@@ -26,6 +26,7 @@ fn account(server: &str, port: u16) -> SipAccount {
         server: Some(server.into()),
         port: Some(port),
         transport: Transport::Udp,
+        tls_policy: TlsPolicy::default(),
     }
 }
 

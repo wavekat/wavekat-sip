@@ -109,11 +109,26 @@ impl SipEndpoint {
         let bind_addr = SocketAddr::new(local_ip, 0);
         info!("Binding SIP transport to {bind_addr}");
 
+        let setup = crate::stack::transport::TransportSetup {
+            transport: account.transport,
+            #[cfg(feature = "tls")]
+            tls: match account.transport {
+                // RFC 5922 §7.3: verify the account's SIP domain, never the
+                // host an SRV record named. `server` may be an SRV target or a
+                // bare IP; neither is the identity the certificate must match.
+                Transport::Tls => Some(crate::stack::transport::TlsSetup {
+                    server_name: account.domain.clone(),
+                    policy: account.tls_policy.clone(),
+                }),
+                _ => None,
+            },
+        };
+
         let ua = Arc::new(
             Ua::bind_with_app(
                 bind_addr,
                 server,
-                account.transport,
+                setup,
                 product.map(String::from),
                 cancel.clone(),
             )
@@ -434,6 +449,7 @@ fn detect_local_ip(account: &SipAccount) -> Result<IpAddr, BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::TlsPolicy;
 
     fn make_account(server: Option<&str>, port: Option<u16>) -> SipAccount {
         SipAccount {
@@ -445,6 +461,7 @@ mod tests {
             server: server.map(|s| s.to_string()),
             port,
             transport: Transport::default(),
+            tls_policy: TlsPolicy::default(),
         }
     }
 

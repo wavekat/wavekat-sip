@@ -35,6 +35,38 @@ pub(crate) fn serialize(msg: &SipMessage) -> Vec<u8> {
     msg.clone().into()
 }
 
+/// Everything the transport needs in order to be established.
+///
+/// A bare [`Transport`] is not enough for TLS, which also needs the name to
+/// verify and the trust policy. `From<Transport>` exists so the many call sites
+/// that only ever speak UDP or TCP can keep passing the enum.
+#[derive(Debug, Clone)]
+pub(crate) struct TransportSetup {
+    pub(crate) transport: Transport,
+    #[cfg(feature = "tls")]
+    pub(crate) tls: Option<TlsSetup>,
+}
+
+/// The TLS-only half of [`TransportSetup`].
+#[cfg(feature = "tls")]
+#[derive(Debug, Clone)]
+pub(crate) struct TlsSetup {
+    /// The account's SIP domain — RFC 5922 §7.3. Never the SRV target.
+    pub(crate) server_name: String,
+    /// How to trust the server's certificate.
+    pub(crate) policy: crate::account::TlsPolicy,
+}
+
+impl From<Transport> for TransportSetup {
+    fn from(transport: Transport) -> Self {
+        Self {
+            transport,
+            #[cfg(feature = "tls")]
+            tls: None,
+        }
+    }
+}
+
 /// A bound UDP transport.
 pub(crate) struct UdpTransport {
     socket: Arc<UdpSocket>,
@@ -121,11 +153,25 @@ impl BoundTransport {
     pub(crate) async fn bind(
         local: SocketAddr,
         peer: SocketAddr,
-        transport: Transport,
+        setup: &TransportSetup,
     ) -> io::Result<Self> {
-        match transport {
+        match setup.transport {
             Transport::Udp => Ok(Self::Datagram(UdpTransport::bind(local).await?)),
-            Transport::Tcp => Ok(Self::Stream(StreamTransport::connect(peer).await?)),
+            // Rejected here, before any socket is touched — not folded into
+            // the `Tcp | Tls` arm below, which would open a real TCP
+            // connection (and only then reject it) for a transport this
+            // build cannot use at all.
+            #[cfg(not(feature = "tls"))]
+            Transport::Tls => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS transport requires the `tls` feature",
+            )),
+            #[cfg(not(feature = "tls"))]
+            Transport::Tcp => Ok(Self::Stream(StreamTransport::connect(peer, setup).await?)),
+            #[cfg(feature = "tls")]
+            Transport::Tcp | Transport::Tls => {
+                Ok(Self::Stream(StreamTransport::connect(peer, setup).await?))
+            }
         }
     }
 
@@ -191,6 +237,22 @@ mod tests {
         assert!(parse(b"not a sip message\r\n\r\n").is_none());
     }
 
+    /// `From<Transport>` is the compatibility shim every UDP/TCP call site
+    /// leans on: it must carry the transport through unchanged and, under the
+    /// `tls` feature, start with no TLS setup attached.
+    #[test]
+    fn transport_setup_from_transport_round_trips_udp_and_tcp() {
+        let udp: TransportSetup = Transport::Udp.into();
+        assert_eq!(udp.transport, Transport::Udp);
+        #[cfg(feature = "tls")]
+        assert!(udp.tls.is_none());
+
+        let tcp: TransportSetup = Transport::Tcp.into();
+        assert_eq!(tcp.transport, Transport::Tcp);
+        #[cfg(feature = "tls")]
+        assert!(tcp.tls.is_none());
+    }
+
     #[tokio::test]
     async fn udp_round_trip_between_two_sockets() {
         let a = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
@@ -245,9 +307,13 @@ mod tests {
     #[tokio::test]
     async fn udp_kind_binds_a_datagram_transport() {
         let peer: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let t = BoundTransport::bind("127.0.0.1:0".parse().expect("addr"), peer, Transport::Udp)
-            .await
-            .expect("binds");
+        let t = BoundTransport::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            peer,
+            &Transport::Udp.into(),
+        )
+        .await
+        .expect("binds");
         assert!(matches!(t, BoundTransport::Datagram(_)));
         assert!(!t.reliability().is_reliable(), "UDP is unreliable");
     }
@@ -262,9 +328,13 @@ mod tests {
             let _ = listener.accept().await;
         });
 
-        let t = BoundTransport::bind("127.0.0.1:0".parse().expect("addr"), peer, Transport::Tcp)
-            .await
-            .expect("binds");
+        let t = BoundTransport::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            peer,
+            &Transport::Tcp.into(),
+        )
+        .await
+        .expect("binds");
         assert!(
             matches!(t, BoundTransport::Stream(_)),
             "TCP must not silently bind UDP"
@@ -285,14 +355,39 @@ mod tests {
             sock.peer_addr().expect("peer addr")
         });
 
-        let t = BoundTransport::bind("127.0.0.1:0".parse().expect("addr"), peer, Transport::Tcp)
-            .await
-            .expect("binds");
+        let t = BoundTransport::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            peer,
+            &Transport::Tcp.into(),
+        )
+        .await
+        .expect("binds");
         let seen_by_server = accepted.await.expect("accept task");
         assert_eq!(
             t.local_addr().expect("local addr"),
             seen_by_server,
             "local_addr must be the TCP connection's address"
         );
+    }
+
+    /// Without the `tls` feature, `Transport::Tls` must fail loudly, and
+    /// without ever touching the network — `bind` rejects it directly rather
+    /// than routing it through `StreamTransport::connect` and opening a TCP
+    /// connection it can never use. With the feature on, this same selection
+    /// is exercised end-to-end in `tests/tls_transport.rs`.
+    #[cfg(not(feature = "tls"))]
+    #[tokio::test]
+    async fn tls_kind_is_rejected_without_the_tls_feature() {
+        let peer: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let result = BoundTransport::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            peer,
+            &Transport::Tls.into(),
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("TLS must not silently downgrade to another transport"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::Unsupported),
+        }
     }
 }

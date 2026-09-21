@@ -6,13 +6,13 @@
 //! - An explicit `port` on the account, or an IP-literal `server`,
 //!   skips SRV entirely and resolves A/AAAA directly (RFC 3263 §4.1) —
 //!   identical to the crate's historical behavior.
-//! - Otherwise `_sip._udp.<host>` / `_sip._tcp.<host>` is queried and
-//!   candidates are ordered by priority, then weighted-random within a
-//!   priority class (RFC 2782). The first target that resolves wins,
-//!   at the SRV-provided port.
+//! - Otherwise `_sip._udp.<host>` / `_sip._tcp.<host>` / `_sips._tcp.<host>`
+//!   (per the account's transport) is queried and candidates are ordered by
+//!   priority, then weighted-random within a priority class (RFC 2782). The
+//!   first target that resolves wins, at the SRV-provided port.
 //! - No SRV records (NXDOMAIN/empty, or a failed query) falls back to
 //!   A/AAAA on the bare host at the default port — today's behavior.
-//! - NAPTR and TLS (`_sips._tcp`) are not implemented.
+//! - NAPTR is not implemented.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -143,12 +143,14 @@ fn location_plan(account: &SipAccount) -> LocationPlan {
             port: account.port(),
         };
     }
-    let proto = match account.transport {
-        Transport::Udp => "udp",
-        Transport::Tcp => "tcp",
+    // RFC 3263 §4.1. Note the TLS name is `_sips._tcp`, not `_sip._tls`.
+    let service = match account.transport {
+        Transport::Udp => "_sip._udp",
+        Transport::Tcp => "_sip._tcp",
+        Transport::Tls => "_sips._tcp",
     };
     LocationPlan::Srv {
-        name: format!("_sip._{proto}.{host}"),
+        name: format!("{service}.{host}"),
         host,
         port: account.port(),
     }
@@ -267,6 +269,7 @@ async fn resolve_with<D: Dns>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::TlsPolicy;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -289,6 +292,7 @@ mod tests {
             server: server.map(str::to_string),
             port,
             transport,
+            tls_policy: TlsPolicy::default(),
         }
     }
 
@@ -450,6 +454,33 @@ mod tests {
                 name: "_sip._tcp.pbx.example.com".to_string(),
                 host: "pbx.example.com".to_string(),
                 port: 5060,
+            }
+        );
+    }
+
+    #[test]
+    fn tls_queries_the_sips_service() {
+        let acct = account(Some("pbx.example.com"), None, Transport::Tls);
+        assert_eq!(
+            location_plan(&acct),
+            LocationPlan::Srv {
+                name: "_sips._tcp.pbx.example.com".to_string(),
+                host: "pbx.example.com".to_string(),
+                port: 5061,
+            }
+        );
+    }
+
+    /// An explicit port still skips SRV under TLS, same as UDP/TCP — and the
+    /// port given wins over the 5061 default.
+    #[test]
+    fn tls_with_explicit_port_skips_srv() {
+        let acct = account(Some("pbx.example.com"), Some(5061), Transport::Tls);
+        assert_eq!(
+            location_plan(&acct),
+            LocationPlan::Direct {
+                host: "pbx.example.com".to_string(),
+                port: 5061,
             }
         );
     }

@@ -42,7 +42,7 @@ Register an account against your SIP server:
 
 ```rust,no_run
 use tokio_util::sync::CancellationToken;
-use wavekat_sip::{Registrar, SipAccount, SipEndpoint, Transport};
+use wavekat_sip::{Registrar, SipAccount, SipEndpoint, TlsPolicy, Transport};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 let account = SipAccount {
@@ -54,6 +54,7 @@ let account = SipAccount {
     server: None,
     port: None,
     transport: Transport::Udp,
+    tls_policy: TlsPolicy::default(),
 };
 
 let cancel = CancellationToken::new();
@@ -100,6 +101,93 @@ while let Some(incoming) = endpoint.next_incoming_call().await {
 # }
 ```
 
+## TLS
+
+SIP over TLS (`Transport::Tls`, RFC 3261 §26.2) is behind the `tls`
+feature, off by default:
+
+```sh
+cargo add wavekat-sip --features tls
+```
+
+Set `transport: Transport::Tls` on the account. Unless an explicit
+`port` is set, the account resolves against port **5061** and, when a
+`server` isn't an IP literal, locates it via `_sips._tcp` SRV records
+(RFC 3263 §4.1) rather than `_sip._tcp`. Certificate verification checks
+the account's `domain` — never the host an SRV lookup happened to
+return — per RFC 5922 §7.3; verifying the resolved target instead would
+let whoever answers the DNS query pick which name the certificate has
+to match.
+
+`tls_policy` selects how a server certificate is trusted. There are
+exactly two variants, and deliberately no third one that skips
+verification:
+
+- `TlsPolicy::SystemRoots` (the default) — validate against the
+  operating system's trust store.
+- `TlsPolicy::Pinned { sha256 }` — trust exactly one certificate, by
+  the SHA-256 of its DER encoding. This is the variant for the
+  legitimate case people usually want a bypass for: a self-signed
+  certificate on an on-premise server. It stays narrow on purpose — it
+  trusts *one* certificate, not every certificate a peer might present.
+
+There is no `Insecure` or `skip_verify` option, and there will not be
+one. It is the setting people reach for to make a certificate error
+message go away, and once it's on, the connection has all the ceremony
+of TLS and none of the security, permanently, with nothing on screen
+saying so. A rejected certificate always drops the connection; the way
+back in is `Pinned`, made with the actual fingerprint in hand — not a
+flag that silences the check.
+
+A failed connection carries an `UntrustedCertificate` (fingerprint +
+typed `CertFailure` reason) that [`untrusted_certificate`] can pull out
+of the returned error, so your own UI can offer to pin what it just
+saw:
+
+```rust,no_run
+use tokio_util::sync::CancellationToken;
+use wavekat_sip::{untrusted_certificate, SipAccount, SipEndpoint, TlsPolicy, Transport};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+let account = SipAccount {
+    display_name: "Office".into(),
+    username: "1001".into(),
+    password: "secret".into(),
+    domain: "sip.example.com".into(),
+    auth_username: None,
+    server: None,
+    port: None, // defaults to 5061 under TLS
+    transport: Transport::Tls,
+    tls_policy: TlsPolicy::SystemRoots,
+};
+
+let cancel = CancellationToken::new();
+match SipEndpoint::new(&account, cancel).await {
+    Ok(endpoint) => {
+        // ... register / place calls
+        # let _ = endpoint;
+    }
+    Err(err) => {
+        if let Some(cert) = untrusted_certificate(err.as_ref()) {
+            // Tell the operator plainly what they'd be trusting, and let
+            // them decide — this is a trust-on-first-use decision, made
+            // with the facts in front of them, not a setting flipped once
+            // to silence the error.
+            eprintln!(
+                "refused: {} — pin sha256:{}?",
+                cert.reason,
+                cert.fingerprint_hex()
+            );
+        }
+        return Err(err);
+    }
+}
+# Ok(())
+# }
+```
+
+[`untrusted_certificate`]: https://docs.rs/wavekat-sip/latest/wavekat_sip/fn.untrusted_certificate.html
+
 ## Status
 
 | Module      | State                                                  |
@@ -112,6 +200,7 @@ while let Some(incoming) = endpoint.next_incoming_call().await {
 | `callee`    | Working — inbound INVITE accept/reject.                |
 | `sdp`       | Working — Opus + G.711 offer/answer (negotiation only). |
 | `rtp`       | Working — header parser, receive loop, send loop.      |
+| `tls_error` | Working — typed `CertFailure` / `UntrustedCertificate` reporting for TLS. |
 
 ## Architecture
 

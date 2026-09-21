@@ -26,11 +26,11 @@ use tokio_util::sync::CancellationToken;
 use super::auth;
 use super::call::{build_cancel, build_invite, cseq_of, CallConfig, CallOutcome};
 use super::dialog::Dialog;
-use crate::account::Transport;
 
 use super::engine::{self, EngineHandle, Event};
 use super::registration::{build_register, granted_expires, RegisterConfig, RegisterOutcome};
 use super::transaction::{Timers, TransactionKey};
+use super::transport::TransportSetup;
 
 /// A request the router hands up because it matched no client transaction:
 /// a brand-new inbound request (INVITE/BYE/…) or the ACK for a 2xx we sent.
@@ -62,7 +62,7 @@ impl Ua {
     pub(crate) async fn bind(
         local: SocketAddr,
         peer: SocketAddr,
-        transport: Transport,
+        transport: impl Into<TransportSetup>,
         cancel: CancellationToken,
     ) -> io::Result<Self> {
         Self::bind_full(local, peer, transport, Timers::default(), None, cancel).await
@@ -72,7 +72,7 @@ impl Ua {
     pub(crate) async fn bind_with_timers(
         local: SocketAddr,
         peer: SocketAddr,
-        transport: Transport,
+        transport: impl Into<TransportSetup>,
         timers: Timers,
         cancel: CancellationToken,
     ) -> io::Result<Self> {
@@ -83,7 +83,7 @@ impl Ua {
     pub(crate) async fn bind_with_app(
         local: SocketAddr,
         peer: SocketAddr,
-        transport: Transport,
+        transport: impl Into<TransportSetup>,
         user_agent: Option<String>,
         cancel: CancellationToken,
     ) -> io::Result<Self> {
@@ -101,13 +101,13 @@ impl Ua {
     async fn bind_full(
         local: SocketAddr,
         peer: SocketAddr,
-        transport: Transport,
+        transport: impl Into<TransportSetup>,
         timers: Timers,
         user_agent: Option<String>,
         cancel: CancellationToken,
     ) -> io::Result<Self> {
         let (engine, events) =
-            engine::start_with_timers(local, peer, transport, timers, cancel).await?;
+            engine::start_with_timers(local, peer, transport.into(), timers, cancel).await?;
         let (subscribe_tx, subscribe_rx) = mpsc::channel(32);
         let (incoming_tx, incoming_rx) = mpsc::channel(32);
         tokio::spawn(router(events, subscribe_rx, incoming_tx));
@@ -487,6 +487,7 @@ async fn router(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::Transport;
     use crate::stack::transport::UdpTransport;
     use rsip::Uri;
     use std::time::Duration;
