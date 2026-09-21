@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/wavekat/wavekat-sip/compare/v0.2.3...v0.3.0) - 2026-09-21
+
+### Added
+
+- implement SIP over TLS ([#58](https://github.com/wavekat/wavekat-sip/pull/58))
+
 ### Added
 
 - [**breaking**] implement SIP over TLS: `Transport::Tls` (RFC 3261 §26.2),
