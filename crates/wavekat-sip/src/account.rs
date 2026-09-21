@@ -94,6 +94,11 @@ fn parse_hex_sha256(hex: &str) -> Result<[u8; 32], String> {
             hex.len()
         ));
     }
+    // Checked up front rather than left to `from_str_radix`, which accepts a
+    // leading `+`: `"+f"` would otherwise parse as 15.
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("`{hex}` is not valid hex"));
+    }
     let mut out = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
         let s = std::str::from_utf8(chunk).map_err(|_| format!("`{hex}` is not valid hex"))?;
@@ -393,6 +398,26 @@ mod tests {
         let json = r#"{"pinned":{"sha256":"abcd"}}"#;
         let err = serde_json::from_str::<TlsPolicy>(json).expect_err("too short must fail");
         assert!(err.to_string().contains("64"), "{err}");
+    }
+
+    #[test]
+    fn pinned_from_hex_rejects_a_sign_prefixed_chunk() {
+        // `u8::from_str_radix` accepts a leading `+`, so `"+f"` parses as 15.
+        // Repeated 32 times it is exactly 64 characters, so the length check
+        // passes too — and without a digit guard the result is a pin of
+        // `[15; 32]`, silently built from input that is not a fingerprint.
+        let bad = "+f".repeat(32);
+        assert_eq!(bad.len(), 64);
+        let err = TlsPolicy::pinned_from_hex(&bad).expect_err("a `+` is not a hex digit");
+        assert!(err.contains("hex"), "{err}");
+    }
+
+    #[test]
+    fn a_sign_prefixed_pin_in_config_is_rejected() {
+        let bad = "+f".repeat(32);
+        let json = format!(r#"{{"pinned":{{"sha256":"{bad}"}}}}"#);
+        let err = serde_json::from_str::<TlsPolicy>(&json).expect_err("a `+` is not a hex digit");
+        assert!(err.to_string().contains("hex"), "{err}");
     }
 
     #[test]
