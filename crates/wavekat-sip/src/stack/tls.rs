@@ -49,7 +49,7 @@ fn cert_failure(err: &rustls::Error) -> CertFailure {
             }
             CertificateError::NotValidForNameContext { presented, .. } => {
                 CertFailure::NameMismatch {
-                    presented: presented.clone(),
+                    presented: presented.iter().map(|n| presented_name(n)).collect(),
                 }
             }
             CertificateError::NotValidForName => CertFailure::NameMismatch {
@@ -69,6 +69,30 @@ fn cert_failure(err: &rustls::Error) -> CertFailure {
         },
         other => CertFailure::Other(other.to_string()),
     }
+}
+
+/// One presented name as the bare name.
+///
+/// webpki hands the certificate's names over in its `Debug` form —
+/// `DnsName("sip.example.com")`, `IpAddress(192.0.2.1)` — which would reach
+/// the consumer's error text as Rust syntax. Unwrap the three kinds that are
+/// names; anything else (`DirectoryName`, `Unsupported(0x..)`) is left as
+/// webpki wrote it rather than guessed at.
+fn presented_name(raw: &str) -> String {
+    for kind in ["DnsName", "IpAddress", "UniformResourceIdentifier"] {
+        let inner = raw
+            .strip_prefix(kind)
+            .and_then(|r| r.strip_prefix('('))
+            .and_then(|r| r.strip_suffix(')'));
+        if let Some(inner) = inner {
+            let inner = inner
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+                .unwrap_or(inner);
+            return inner.to_string();
+        }
+    }
+    raw.to_string()
 }
 
 /// Accept exactly one certificate, by fingerprint.
@@ -357,14 +381,45 @@ mod tests {
                 expected: rustls::pki_types::ServerName::try_from("sip.example.com")
                     .expect("name")
                     .to_owned(),
-                presented: vec!["edge-3.example.net".to_string()],
+                // The shape webpki really produces (its `GeneralName` Debug).
+                presented: vec![
+                    "DnsName(\"edge-3.example.net\")".to_string(),
+                    "IpAddress(192.0.2.7)".to_string(),
+                ],
             });
         assert_eq!(
             cert_failure(&err),
             CertFailure::NameMismatch {
-                presented: vec!["edge-3.example.net".to_string()]
+                presented: vec!["edge-3.example.net".to_string(), "192.0.2.7".to_string()]
             }
         );
+    }
+
+    #[test]
+    fn presented_names_are_unwrapped_to_the_bare_name() {
+        assert_eq!(
+            presented_name("DnsName(\"sip.example.com\")"),
+            "sip.example.com"
+        );
+        assert_eq!(
+            presented_name("DnsName(\"*.example.com\")"),
+            "*.example.com"
+        );
+        assert_eq!(presented_name("IpAddress(192.0.2.1)"), "192.0.2.1");
+        assert_eq!(presented_name("IpAddress(2001:db8::1)"), "2001:db8::1");
+        assert_eq!(
+            presented_name("UniformResourceIdentifier(\"sip:pbx.example.com\")"),
+            "sip:pbx.example.com"
+        );
+    }
+
+    #[test]
+    fn presented_names_that_are_not_names_are_left_alone() {
+        // Nothing to unwrap, and nothing safe to guess.
+        assert_eq!(presented_name("DirectoryName"), "DirectoryName");
+        assert_eq!(presented_name("Unsupported(0x88)"), "Unsupported(0x88)");
+        // Already bare (a future webpki, or a test double).
+        assert_eq!(presented_name("sip.example.com"), "sip.example.com");
     }
 
     #[test]
