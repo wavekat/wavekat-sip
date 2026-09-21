@@ -177,7 +177,7 @@ impl StreamTransport {
             self.peer,
             String::from_utf8_lossy(&bytes).trim_end(),
         );
-        self.write.lock().await.write_all(&bytes).await
+        write_message(&mut *self.write.lock().await, &bytes).await
     }
 
     /// Await the next framed message from the connection.
@@ -186,6 +186,18 @@ impl StreamTransport {
             io::Error::new(io::ErrorKind::ConnectionReset, "stream connection closed")
         })
     }
+}
+
+/// Write one serialized SIP message and flush it.
+///
+/// The flush is a no-op for TCP and load-bearing for TLS: tokio-rustls reports
+/// a write complete once the bytes are in the session's buffer, and under
+/// socket backpressure they stay there until something flushes. Without it a
+/// request can "send" successfully, never reach the wire, and surface only as
+/// a transaction timeout.
+async fn write_message<W: AsyncWrite + Unpin + ?Sized>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+    w.write_all(bytes).await?;
+    w.flush().await
 }
 
 /// Own the read half, frame it, and publish whole messages.
@@ -376,6 +388,49 @@ Content-Length: 0\r\n\r\n"
             .expect("connects");
         assert!(t.recv().await.is_ok(), "first message");
         assert!(t.recv().await.is_ok(), "second message");
+    }
+
+    /// Models the one property of a TLS session that matters here: a write
+    /// is "accepted" once the bytes are in its buffer, and they only reach
+    /// the socket on flush. tokio-rustls' `poll_write` behaves exactly this
+    /// way when the socket is under backpressure.
+    #[derive(Default)]
+    struct BufferedUntilFlush {
+        pending: Vec<u8>,
+        wire: Vec<u8>,
+    }
+
+    impl AsyncWrite for BufferedUntilFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.get_mut().pending.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.wire.append(&mut this.pending);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sent_message_is_flushed_out_of_a_buffering_stream() {
+        let mut w = BufferedUntilFlush::default();
+        write_message(&mut w, b"OPTIONS sip:bob@example.com SIP/2.0\r\n\r\n")
+            .await
+            .expect("writes");
+        assert_eq!(
+            w.wire, b"OPTIONS sip:bob@example.com SIP/2.0\r\n\r\n",
+            "the message must reach the wire, not sit in the session buffer"
+        );
     }
 
     #[tokio::test]
