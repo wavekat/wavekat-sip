@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
 use super::framing::Framer;
@@ -95,8 +96,29 @@ const INBOUND_DEPTH: usize = 64;
 pub(crate) struct StreamTransport {
     write: Arc<Mutex<WriteHalf<SipStream>>>,
     inbound: Mutex<mpsc::Receiver<(SipMessage, SocketAddr)>>,
+    /// Aborted on drop. See the `Drop` impl.
+    reader: JoinHandle<()>,
     local: SocketAddr,
     peer: SocketAddr,
+}
+
+/// Closes the connection when the transport goes away.
+///
+/// `tokio::io::split` shares the stream between the two halves, and the
+/// socket closes only once both are gone. The write half drops with `self`;
+/// the read half lives in the read task, which is parked in `read()` on an
+/// idle connection and has no other reason to wake. Aborting it drops that
+/// half, the stream goes with it, and the peer sees the close.
+///
+/// TCP's `into_split` did this implicitly — its `OwnedWriteHalf` shuts down
+/// the write direction on drop, and the peer's answering close ended the read
+/// task. `tokio::io::split`'s `WriteHalf` has no such `Drop`, which is why
+/// this has to be explicit. It is also abrupt for TLS: no `close_notify` is
+/// sent, because `Drop` cannot await one.
+impl Drop for StreamTransport {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 impl StreamTransport {
@@ -139,11 +161,12 @@ impl StreamTransport {
 
         let (read, write) = tokio::io::split(stream);
         let (tx, rx) = mpsc::channel(INBOUND_DEPTH);
-        tokio::spawn(read_task(read, peer, tx));
+        let reader = tokio::spawn(read_task(read, peer, tx));
 
         Ok(Self {
             write: Arc::new(Mutex::new(write)),
             inbound: Mutex::new(rx),
+            reader,
             local,
             peer,
         })
@@ -431,6 +454,32 @@ Content-Length: 0\r\n\r\n"
             w.wire, b"OPTIONS sip:bob@example.com SIP/2.0\r\n\r\n",
             "the message must reach the wire, not sit in the session buffer"
         );
+    }
+
+    /// The peer is idle, so the read task is parked in `read()` with nothing
+    /// to wake it. Dropping the transport must still close the connection —
+    /// otherwise that task holds the read half, and with it the socket, for
+    /// the life of the process.
+    #[tokio::test]
+    async fn dropping_the_transport_closes_an_idle_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 64];
+            tokio::time::timeout(std::time::Duration::from_secs(2), sock.read(&mut buf)).await
+        });
+
+        let t = StreamTransport::connect(addr, &Transport::Tcp.into())
+            .await
+            .expect("connects");
+        drop(t);
+
+        let read = server
+            .await
+            .expect("server task")
+            .expect("the peer must see the connection close, not wait forever");
+        assert_eq!(read.expect("read"), 0, "EOF");
     }
 
     #[tokio::test]
