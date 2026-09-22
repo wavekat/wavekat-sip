@@ -97,10 +97,14 @@ fn system_roots_checks_the_domain_and_rejects_untrusted_chains() {
                 ),
             };
             let u = untrusted_certificate(err.as_ref()).expect("reports the certificate");
-            assert!(
-                matches!(u.reason, CertFailure::NameMismatch { .. }),
-                "expected a name mismatch, got {:?}",
-                u.reason
+            // The presented name is the bare address, not webpki's Debug
+            // form `IpAddress(127.0.0.1)`, which reads as Rust syntax in a
+            // consumer's error text.
+            assert_eq!(
+                u.reason,
+                CertFailure::NameMismatch {
+                    presented: vec!["127.0.0.1".to_string()]
+                },
             );
         }
 
