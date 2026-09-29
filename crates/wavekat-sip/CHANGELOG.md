@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/wavekat/wavekat-sip/compare/v0.2.5...v0.3.0) - 2026-09-29
+
+### Fixed
+
+- honour 423 Min-Expires on REGISTER ([#62](https://github.com/wavekat/wavekat-sip/pull/62))
+
 ## [0.2.5](https://github.com/wavekat/wavekat-sip/compare/v0.2.4...v0.2.5) - 2026-09-22
 
 ### Fixed
