@@ -1,7 +1,10 @@
 //! REGISTER + digest auth + keepalive re-registration, over the engine.
 //!
 //! [`Registrar::register`] composes a REGISTER, sends it through the engine,
-//! answers a `401`/`407` digest challenge, and records the outcome.
+//! answers a `401`/`407` digest challenge, and records the outcome. A
+//! registrar that rejects the lifetime as too brief (`423`, RFC 3261 §10.2.8)
+//! is answered with one retry at the `Min-Expires` it named, and that floor is
+//! remembered so later refreshes ask for it outright.
 //! [`Registrar::keepalive_loop`] re-registers on an interval until cancelled;
 //! [`Registrar::unregister`] sends `Expires: 0`.
 
@@ -28,6 +31,7 @@ pub struct RegistrarDiagnostics {
     pub cseq: u32,
     pub configured_expires: u32,
     pub negotiated_expires: Option<u32>,
+    pub min_expires: Option<u32>,
     pub last_status: Option<u16>,
     pub last_attempt_at: Option<SystemTime>,
     pub last_success_at: Option<SystemTime>,
@@ -40,12 +44,41 @@ pub struct RegistrarDiagnostics {
 struct State {
     cseq: u32,
     negotiated_expires: Option<u32>,
+    /// Shortest lifetime this registrar has said it accepts, learned from a
+    /// `423`'s `Min-Expires`.
+    min_expires: Option<u32>,
     last_status: Option<u16>,
     last_attempt_at: Option<SystemTime>,
     last_success_at: Option<SystemTime>,
     last_error: Option<String>,
     register_count: u64,
     failure_count: u64,
+}
+
+/// The lifetime to request: the configured one, raised to a `Min-Expires`
+/// floor the registrar has already named. Asking below a floor we have been
+/// told about only earns another `423`.
+fn requested_expires(configured: u32, floor: Option<u32>) -> u32 {
+    match floor {
+        Some(floor) => configured.max(floor),
+        None => configured,
+    }
+}
+
+/// The lifetime to retry a `423` at, or `None` to let the rejection stand.
+///
+/// `requested` is what was just asked for, `min_expires` what the registrar
+/// answered with. There is no retry when one has already been made (a
+/// registrar that refuses its own minimum keeps its answer rather than
+/// spinning us), when the request was an unregister (`Expires: 0` — RFC 3261
+/// §10.3 step 7 only rejects a non-zero interval, and obeying such a `423`
+/// would re-create the binding we asked to remove), or when the named minimum
+/// is not an increase and the retry would repeat the same request.
+fn retry_expires(requested: u32, min_expires: u32, retried: bool) -> Option<u32> {
+    if retried || requested == 0 || min_expires <= requested {
+        return None;
+    }
+    Some(min_expires)
 }
 
 /// Registers an account and keeps the registration fresh.
@@ -88,6 +121,7 @@ impl Registrar {
             state: Mutex::new(State {
                 cseq: 0,
                 negotiated_expires: None,
+                min_expires: None,
                 last_status: None,
                 last_attempt_at: None,
                 last_success_at: None,
@@ -111,12 +145,18 @@ impl Registrar {
         })
     }
 
-    /// Register once with the configured lifetime.
+    /// Register once, at the configured lifetime — raised to this registrar's
+    /// minimum if a `423` has already named one.
     pub async fn register(&self) -> Result<(), BoxError> {
-        self.register_with(self.expires).await
+        let expires = {
+            let state = self.state.lock().await;
+            requested_expires(self.expires, state.min_expires)
+        };
+        self.register_with(expires).await
     }
 
-    async fn register_with(&self, expires: u32) -> Result<(), BoxError> {
+    /// Send one REGISTER, its `CSeq` taken from the registration state.
+    async fn attempt(&self, expires: u32) -> Result<RegisterOutcome, BoxError> {
         let cseq = {
             let mut state = self.state.lock().await;
             state.cseq += 1;
@@ -125,41 +165,90 @@ impl Registrar {
         };
 
         let cfg = self.config(expires)?;
-        let outcome = self
+        let attempt = self
             .endpoint
             .ua()
             .register(&cfg, self.endpoint.server(), cseq)
             .await;
 
-        let mut state = self.state.lock().await;
-        match outcome {
-            RegisterOutcome::Registered { expires } => {
-                state.negotiated_expires = Some(expires);
-                state.last_status = Some(200);
-                state.last_success_at = Some(SystemTime::now());
-                state.last_error = None;
-                state.register_count += 1;
-                info!(expires, "registered");
-                Ok(())
+        // Answering a digest challenge puts a second REGISTER on the wire at
+        // the next sequence number. RFC 3261 §10.2 forbids reusing a `CSeq`
+        // within one `Call-ID`, so carry the wire's number forward instead of
+        // our own — otherwise the next refresh replays a number the registrar
+        // has already seen, and a registrar that checks rejects it.
+        {
+            let mut state = self.state.lock().await;
+            state.cseq = state.cseq.max(attempt.last_cseq);
+        }
+        Ok(attempt.outcome)
+    }
+
+    /// Register for `requested` seconds, answering a `423 Interval Too Brief`
+    /// with one fresh REGISTER at the lifetime the registrar named (RFC 3261
+    /// §10.2.8) — a new transaction with its own `CSeq` and its own challenge
+    /// cycle, not a replay of the refused one.
+    async fn register_with(&self, requested: u32) -> Result<(), BoxError> {
+        let mut requested = requested;
+        let mut retried = false;
+        loop {
+            let outcome = self.attempt(requested).await?;
+            let mut state = self.state.lock().await;
+            match outcome {
+                RegisterOutcome::Registered { expires } => {
+                    state.negotiated_expires = Some(expires);
+                    state.last_status = Some(200);
+                    state.last_success_at = Some(SystemTime::now());
+                    state.last_error = None;
+                    state.register_count += 1;
+                    info!(expires, "registered");
+                    return Ok(());
+                }
+                RegisterOutcome::IntervalTooBrief { min_expires } => {
+                    // Learn the floor even when this attempt is not retried:
+                    // the next refresh then asks for it outright instead of
+                    // spending a round trip on the same rejection.
+                    state.min_expires = Some(min_expires);
+                    state.last_status = Some(423);
+                    match retry_expires(requested, min_expires, retried) {
+                        Some(next) => {
+                            drop(state);
+                            info!(
+                                requested,
+                                min_expires, "registrar wants a longer registration; retrying"
+                            );
+                            requested = next;
+                            retried = true;
+                        }
+                        None => {
+                            state.last_error =
+                                Some(format!("registrar requires Expires >= {min_expires}"));
+                            state.failure_count += 1;
+                            return Err(format!(
+                                "registration failed: interval too brief (registrar minimum {min_expires}s)"
+                            )
+                            .into());
+                        }
+                    }
+                }
+                RegisterOutcome::Unauthorized => {
+                    state.last_status = Some(401);
+                    state.last_error = Some("authentication failed".into());
+                    state.failure_count += 1;
+                    return Err("registration rejected: authentication failed".into());
+                }
+                RegisterOutcome::Failed(status) => {
+                    state.last_status = Some(status.code());
+                    state.last_error = Some(format!("server returned {status}"));
+                    state.failure_count += 1;
+                    return Err(format!("registration failed: {status}").into());
+                }
+                RegisterOutcome::TimedOut => {
+                    state.last_error = Some("timed out".into());
+                    state.failure_count += 1;
+                    return Err("registration timed out".into());
+                }
+                RegisterOutcome::EngineStopped => return Err("engine stopped".into()),
             }
-            RegisterOutcome::Unauthorized => {
-                state.last_status = Some(401);
-                state.last_error = Some("authentication failed".into());
-                state.failure_count += 1;
-                Err("registration rejected: authentication failed".into())
-            }
-            RegisterOutcome::Failed(status) => {
-                state.last_status = Some(status.code());
-                state.last_error = Some(format!("server returned {status}"));
-                state.failure_count += 1;
-                Err(format!("registration failed: {status}").into())
-            }
-            RegisterOutcome::TimedOut => {
-                state.last_error = Some("timed out".into());
-                state.failure_count += 1;
-                Err("registration timed out".into())
-            }
-            RegisterOutcome::EngineStopped => Err("engine stopped".into()),
         }
     }
 
@@ -193,6 +282,7 @@ impl Registrar {
             cseq: state.cseq,
             configured_expires: self.expires,
             negotiated_expires: state.negotiated_expires,
+            min_expires: state.min_expires,
             last_status: state.last_status,
             last_attempt_at: state.last_attempt_at,
             last_success_at: state.last_success_at,
@@ -257,6 +347,49 @@ mod tests {
         let local: std::net::SocketAddr = "10.0.0.1:5060".parse().expect("addr");
         let c = contact_uri("1001", local, crate::account::Transport::Tcp);
         assert_eq!(c, "sip:1001@10.0.0.1:5060;transport=tcp");
+    }
+
+    /// RFC 3261 §10.2.8: once a registrar has named its minimum, every later
+    /// REGISTER asks for at least that much — otherwise each refresh would
+    /// earn another `423` and burn a round trip re-learning the same number.
+    #[test]
+    fn a_learned_floor_raises_the_requested_lifetime() {
+        assert_eq!(requested_expires(60, None), 60);
+        assert_eq!(requested_expires(60, Some(3600)), 3600);
+    }
+
+    /// A floor below what the account already asks for changes nothing.
+    #[test]
+    fn a_lower_floor_does_not_shorten_the_requested_lifetime() {
+        assert_eq!(requested_expires(3600, Some(60)), 3600);
+    }
+
+    /// The retry the `423` asks for: ask again at the registrar's minimum.
+    #[test]
+    fn a_423_retries_at_the_named_minimum() {
+        assert_eq!(retry_expires(60, 3600, false), Some(3600));
+    }
+
+    /// Only once. A registrar that `423`s the retry too gets to keep its
+    /// answer rather than spinning us.
+    #[test]
+    fn a_second_423_is_not_retried_again() {
+        assert_eq!(retry_expires(60, 3600, true), None);
+    }
+
+    /// `unregister` sends `Expires: 0`. RFC 3261 §10.3 step 7 only rejects a
+    /// *non-zero* interval, so a `423` here is nonsense — and honouring it
+    /// would re-create the binding we asked to remove.
+    #[test]
+    fn a_423_never_bumps_an_unregister() {
+        assert_eq!(retry_expires(0, 3600, false), None);
+    }
+
+    /// A `Min-Expires` that is not an increase would resend the same request.
+    #[test]
+    fn a_423_naming_no_increase_is_not_retried() {
+        assert_eq!(retry_expires(3600, 3600, false), None);
+        assert_eq!(retry_expires(3600, 60, false), None);
     }
 
     /// The Contact we publish is what the Via transport is read back from, so

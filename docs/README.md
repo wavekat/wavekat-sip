@@ -37,3 +37,5 @@ Two kinds of documents live here:
 | [17-reinstate-deferred-features.md](17-reinstate-deferred-features.md) | Re-add the call features deferred by the cutover (re-INVITE seam, User-Agent, DTMF INFO, hold/resume, session timers, inbound surfacing + CANCEL) on the engine |
 | [18-secure-transport-tls-and-srtp.md](18-secure-transport-tls-and-srtp.md) | Stream transports (making `Transport::Tcp` real), SIP over TLS with RFC 5922 identity checks and certificate pinning, and SRTP via SDES keying |
 | [19-sip-over-tls.md](19-sip-over-tls.md) | SIP over TLS: `Transport::Tls`, RFC 5922 domain identity checks, and certificate pinning (phase 2 of doc 18) |
+| [20-register-interval-too-brief.md](20-register-interval-too-brief.md) | Honour `423 Interval Too Brief` on REGISTER: read `Min-Expires`, retry, and remember the registrar's floor |
+| [21-register-cseq-continuity.md](21-register-cseq-continuity.md) | REGISTER `CSeq` continuity: carry the sequence number a digest retry consumed into the next refresh |
