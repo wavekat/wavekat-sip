@@ -53,12 +53,31 @@ pub(crate) enum RegisterOutcome {
     Registered { expires: u32 },
     /// Credentials rejected (a second challenge, or an unanswerable one).
     Unauthorized,
+    /// `423 Interval Too Brief`: the requested lifetime is below the
+    /// registrar's minimum, which it named in `Min-Expires` (RFC 3261 §10.3
+    /// step 7). Retrying at that interval is the caller's call — RFC 3261
+    /// §10.2.8.
+    IntervalTooBrief { min_expires: u32 },
     /// The server returned a non-2xx, non-auth final response.
     Failed(StatusCode),
     /// No final response before the transaction timed out.
     TimedOut,
     /// The engine stopped before a result was reached.
     EngineStopped,
+}
+
+/// One register attempt: what it reached, and the `CSeq` of the last REGISTER
+/// it actually put on the wire.
+///
+/// Answering a challenge sends a second REGISTER at the next sequence number
+/// (RFC 3261 §8.1.3.5), so the `CSeq` handed in is not necessarily the one the
+/// registrar last saw. §10.2 requires every REGISTER sharing a `Call-ID` to
+/// increment it, so the caller has to resume from where the wire left off, not
+/// from where it started.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RegisterAttempt {
+    pub outcome: RegisterOutcome,
+    pub last_cseq: u32,
 }
 
 /// Build a REGISTER request bound to `local_addr` (for the `Via` sent-by) with
@@ -121,6 +140,13 @@ pub(crate) fn granted_expires(response: &rsip::Response) -> Option<u32> {
     response.expires_header()?.seconds().ok()
 }
 
+/// The shortest lifetime the registrar will accept, from a `423`'s
+/// `Min-Expires` header (RFC 3261 §20.23). `None` when the header is missing —
+/// mandatory on a `423`, but a header we cannot read is one we cannot obey.
+pub(crate) fn min_expires(response: &rsip::Response) -> Option<u32> {
+    response.min_expires_header()?.seconds().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +188,35 @@ mod tests {
         // requests are routed through.
         let via = req.via_header().unwrap().to_string();
         assert!(via.contains(";rport"), "REGISTER Via lacks rport: {via}");
+    }
+
+    /// RFC 3261 §10.3 step 7: a `423` names the shortest lifetime the
+    /// registrar will accept, which §10.2.8 says to retry at.
+    #[test]
+    fn min_expires_reads_the_header() {
+        let raw =
+            "SIP/2.0 423 Interval Too Brief\r\nVia: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-x\r\n\
+             From: <sip:a@b>;tag=a\r\nTo: <sip:a@b>;tag=s\r\nCall-ID: c\r\nCSeq: 1 REGISTER\r\n\
+             Min-Expires: 3600\r\nContent-Length: 0\r\n\r\n";
+        let resp = rsip::Response::try_from(raw.as_bytes()).unwrap();
+        assert_eq!(min_expires(&resp), Some(3600));
+    }
+
+    /// A `423` without the mandatory header names nothing to adjust to, and a
+    /// non-numeric one is no better — both must read as absent rather than
+    /// being guessed at.
+    #[test]
+    fn min_expires_is_none_when_absent_or_unparsable() {
+        let response = |extra: &str| {
+            let raw = format!(
+                "SIP/2.0 423 Interval Too Brief\r\nVia: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-x\r\n\
+                 From: <sip:a@b>;tag=a\r\nTo: <sip:a@b>;tag=s\r\nCall-ID: c\r\nCSeq: 1 REGISTER\r\n\
+                 {extra}Content-Length: 0\r\n\r\n"
+            );
+            rsip::Response::try_from(raw.as_bytes()).unwrap()
+        };
+        assert_eq!(min_expires(&response("")), None);
+        assert_eq!(min_expires(&response("Min-Expires: soon\r\n")), None);
     }
 
     #[test]

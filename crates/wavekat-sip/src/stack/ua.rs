@@ -28,7 +28,9 @@ use super::call::{build_cancel, build_invite, cseq_of, CallConfig, CallOutcome};
 use super::dialog::Dialog;
 
 use super::engine::{self, EngineHandle, Event};
-use super::registration::{build_register, granted_expires, RegisterConfig, RegisterOutcome};
+use super::registration::{
+    build_register, granted_expires, min_expires, RegisterAttempt, RegisterConfig, RegisterOutcome,
+};
 use super::transaction::{Timers, TransactionKey};
 use super::transport::TransportSetup;
 
@@ -123,24 +125,27 @@ impl Ua {
         self.engine.local_addr()
     }
 
-    /// Register, answering a single `401`/`407` digest challenge.
+    /// Register, answering a single `401`/`407` digest challenge. A `423
+    /// Interval Too Brief` is reported as
+    /// [`RegisterOutcome::IntervalTooBrief`] and not retried here — see
+    /// `Registrar`.
     pub(crate) async fn register(
         &self,
         cfg: &RegisterConfig,
         peer: SocketAddr,
         first_cseq: u32,
-    ) -> RegisterOutcome {
+    ) -> RegisterAttempt {
         let mut request = build_register(cfg, first_cseq, self.local_addr());
         let mut challenged = false;
-        loop {
+        let outcome = 'attempt: loop {
             let Some(mut rx) = self.start_client(&request, peer).await else {
-                return RegisterOutcome::EngineStopped;
+                break 'attempt RegisterOutcome::EngineStopped;
             };
             match self.await_final(&mut rx).await {
                 Some(response) => {
                     let code = response.status_code().code();
                     if (200..300).contains(&code) {
-                        return RegisterOutcome::Registered {
+                        break 'attempt RegisterOutcome::Registered {
                             expires: granted_expires(&response).unwrap_or(cfg.expires),
                         };
                     }
@@ -151,16 +156,32 @@ impl Ua {
                                 challenged = true;
                                 continue;
                             }
-                            None => return RegisterOutcome::Unauthorized,
+                            None => break 'attempt RegisterOutcome::Unauthorized,
                         }
                     }
                     if code == 401 || code == 407 {
-                        return RegisterOutcome::Unauthorized;
+                        break 'attempt RegisterOutcome::Unauthorized;
                     }
-                    return RegisterOutcome::Failed(response.status_code().clone());
+                    // RFC 3261 §10.2.8: a `423` names the interval to retry
+                    // at. Report it rather than the status — deciding whether
+                    // to ask again, and remembering the floor for the next
+                    // refresh, belongs to whoever owns the registration.
+                    if code == 423 {
+                        if let Some(min_expires) = min_expires(&response) {
+                            break 'attempt RegisterOutcome::IntervalTooBrief { min_expires };
+                        }
+                    }
+                    break 'attempt RegisterOutcome::Failed(response.status_code().clone());
                 }
-                None => return RegisterOutcome::TimedOut,
+                None => break 'attempt RegisterOutcome::TimedOut,
             }
+        };
+        // `request` is the last REGISTER sent — one CSeq past `first_cseq` when
+        // a challenge was answered. The caller needs that number to keep §10.2
+        // sequencing intact on its next refresh.
+        RegisterAttempt {
+            outcome,
+            last_cseq: cseq_of(&request),
         }
     }
 
@@ -594,7 +615,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(reg, RegisterOutcome::Registered { expires: 60 });
+        assert_eq!(reg.outcome, RegisterOutcome::Registered { expires: 60 });
+        // Answering the 401 sent a second REGISTER at the next sequence number
+        // (RFC 3261 §8.1.3.5). The attempt has to report *that* number: §10.2
+        // forbids the next REGISTER in this Call-ID from reusing it, and only
+        // the caller can carry it forward.
+        assert_eq!(
+            reg.last_cseq, 2,
+            "the challenged retry's CSeq must be reported, not the one handed in"
+        );
 
         let call = timeout(
             Duration::from_secs(3),
@@ -606,6 +635,72 @@ mod tests {
 
         server.await.unwrap();
         cancel.cancel();
+    }
+
+    /// Answer one REGISTER with `status_line` + `extra` headers and report the
+    /// outcome the UA reached.
+    async fn register_against(status_line: &str, extra: &str) -> RegisterOutcome {
+        let cancel = CancellationToken::new();
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let ua = Ua::bind_with_timers(
+            "127.0.0.1:0".parse().unwrap(),
+            peer_addr,
+            Transport::Udp,
+            fast_timers(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+        let (status_line, extra) = (status_line.to_string(), extra.to_string());
+        let server = tokio::spawn(async move {
+            let (m, src) = peer.recv().await.unwrap();
+            let SipMessage::Request(r) = m else { panic!() };
+            let h = echo(&r);
+            let resp = format!(
+                "{status_line}\r\n{h}To: <sip:alice@example.com>;tag=s\r\n{extra}Content-Length: 0\r\n\r\n"
+            );
+            peer.send_to(&SipMessage::try_from(resp.as_bytes()).unwrap(), src)
+                .await
+                .unwrap();
+        });
+
+        let outcome = timeout(
+            Duration::from_secs(3),
+            ua.register(&reg_config(), peer_addr, 1),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        cancel.cancel();
+        outcome.outcome
+    }
+
+    /// RFC 3261 §10.2.8: a `423` is not an opaque failure — it carries the
+    /// lifetime to retry at, and the caller needs that number, not the status.
+    #[tokio::test]
+    async fn a_423_reports_the_registrars_minimum() {
+        let outcome =
+            register_against("SIP/2.0 423 Interval Too Brief", "Min-Expires: 3600\r\n").await;
+        assert_eq!(
+            outcome,
+            RegisterOutcome::IntervalTooBrief { min_expires: 3600 }
+        );
+    }
+
+    /// `Min-Expires` is mandatory on a `423` (§10.3 step 7). Without it there
+    /// is no interval to adjust to, so the rejection has to stand as a plain
+    /// failure rather than being retried at a guess.
+    #[tokio::test]
+    async fn a_423_without_min_expires_stays_a_failure() {
+        let outcome = register_against("SIP/2.0 423 Interval Too Brief", "").await;
+        assert!(
+            matches!(&outcome, RegisterOutcome::Failed(s) if s.code() == 423),
+            "expected a plain failure, got {outcome:?}"
+        );
     }
 
     #[tokio::test]
