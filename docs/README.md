@@ -39,3 +39,4 @@ Two kinds of documents live here:
 | [19-sip-over-tls.md](19-sip-over-tls.md) | SIP over TLS: `Transport::Tls`, RFC 5922 domain identity checks, and certificate pinning (phase 2 of doc 18) |
 | [20-register-interval-too-brief.md](20-register-interval-too-brief.md) | Honour `423 Interval Too Brief` on REGISTER: read `Min-Expires`, retry, and remember the registrar's floor |
 | [21-register-cseq-continuity.md](21-register-cseq-continuity.md) | REGISTER `CSeq` continuity: carry the sequence number a digest retry consumed into the next refresh |
+| [22-register-probe.md](22-register-probe.md) | `Registrar::probe`: a credential-free REGISTER binding query (RFC 3261 §10.2.3) to check a registrar is listening on a transport without signing in |
