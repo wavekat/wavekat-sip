@@ -29,7 +29,8 @@ use super::dialog::Dialog;
 
 use super::engine::{self, EngineHandle, Event};
 use super::registration::{
-    build_register, granted_expires, min_expires, RegisterAttempt, RegisterConfig, RegisterOutcome,
+    build_register, build_register_query, granted_expires, min_expires, RegisterAttempt,
+    RegisterConfig, RegisterOutcome, RegisterProbe,
 };
 use super::transaction::{Timers, TransactionKey};
 use super::transport::TransportSetup;
@@ -182,6 +183,28 @@ impl Ua {
         RegisterAttempt {
             outcome,
             last_cseq: cseq_of(&request),
+        }
+    }
+
+    /// Send one REGISTER binding query (no `Contact`, no `Expires`, no
+    /// credentials) and report the first final response. A `401`/`407`
+    /// challenge is reported like any other final response and is **not**
+    /// answered, so no credentials ever go on the wire.
+    pub(crate) async fn register_query(
+        &self,
+        cfg: &RegisterConfig,
+        peer: SocketAddr,
+        cseq: u32,
+    ) -> RegisterProbe {
+        let request = build_register_query(cfg, cseq, self.local_addr());
+        let Some(mut rx) = self.start_client(&request, peer).await else {
+            return RegisterProbe::EngineStopped;
+        };
+        match self.await_final(&mut rx).await {
+            Some(response) => RegisterProbe::Answered {
+                status: response.status_code().code(),
+            },
+            None => RegisterProbe::TimedOut,
         }
     }
 
@@ -677,6 +700,104 @@ mod tests {
         server.await.unwrap();
         cancel.cancel();
         outcome.outcome
+    }
+
+    /// Bind a UA against a fresh UDP peer with fast timers.
+    async fn query_rig() -> (Ua, UdpTransport, SocketAddr, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let peer = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let ua = Ua::bind_with_timers(
+            "127.0.0.1:0".parse().unwrap(),
+            peer_addr,
+            Transport::Udp,
+            fast_timers(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        (ua, peer, peer_addr, cancel)
+    }
+
+    /// A binding query reports the registrar's challenge instead of
+    /// answering it: one request on the wire, no credentials, no Contact.
+    #[tokio::test]
+    async fn register_query_reports_a_challenge_without_answering_it() {
+        let (ua, peer, peer_addr, cancel) = query_rig().await;
+        let server = tokio::spawn(async move {
+            let (m, src) = peer.recv().await.unwrap();
+            let SipMessage::Request(r) = m else { panic!() };
+            let raw = r.to_string().to_ascii_lowercase();
+            let h = echo(&r);
+            let c = format!("SIP/2.0 401 Unauthorized\r\n{h}To: <sip:alice@example.com>;tag=s\r\nWWW-Authenticate: Digest realm=\"example.com\", nonce=\"n\", qop=\"auth\"\r\nContent-Length: 0\r\n\r\n");
+            peer.send_to(&SipMessage::try_from(c.as_bytes()).unwrap(), src)
+                .await
+                .unwrap();
+            // Nothing else may follow: the challenge is not answered.
+            let second = timeout(Duration::from_millis(300), peer.recv()).await;
+            (raw, second.is_err())
+        });
+
+        let outcome = timeout(
+            Duration::from_secs(3),
+            ua.register_query(&reg_config(), peer_addr, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, RegisterProbe::Answered { status: 401 });
+
+        let (raw, no_second) = server.await.unwrap();
+        assert!(no_second, "the challenge must not be answered");
+        assert!(raw.starts_with("register "), "{raw}");
+        assert!(!raw.contains("\r\nauthorization:"), "{raw}");
+        assert!(!raw.contains("\r\ncontact:"), "{raw}");
+        assert!(!raw.contains("\r\nexpires:"), "{raw}");
+        cancel.cancel();
+    }
+
+    /// Any final response counts as "answered": a registrar that accepts the
+    /// query outright, or refuses it, is still a registrar listening here.
+    #[tokio::test]
+    async fn register_query_reports_any_final_status() {
+        for (line, code) in [("SIP/2.0 200 OK", 200), ("SIP/2.0 403 Forbidden", 403)] {
+            let (ua, peer, peer_addr, cancel) = query_rig().await;
+            let server = tokio::spawn(async move {
+                let (m, src) = peer.recv().await.unwrap();
+                let SipMessage::Request(r) = m else { panic!() };
+                let h = echo(&r);
+                let resp = format!(
+                    "{line}\r\n{h}To: <sip:alice@example.com>;tag=s\r\nContent-Length: 0\r\n\r\n"
+                );
+                peer.send_to(&SipMessage::try_from(resp.as_bytes()).unwrap(), src)
+                    .await
+                    .unwrap();
+            });
+            let outcome = timeout(
+                Duration::from_secs(3),
+                ua.register_query(&reg_config(), peer_addr, 1),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            assert_eq!(outcome, RegisterProbe::Answered { status: code });
+            cancel.cancel();
+        }
+    }
+
+    /// Nobody answering: the query times out rather than hanging.
+    #[tokio::test]
+    async fn register_query_times_out_when_nothing_answers() {
+        let (ua, _peer, peer_addr, cancel) = query_rig().await;
+        let outcome = timeout(
+            Duration::from_secs(3),
+            ua.register_query(&reg_config(), peer_addr, 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, RegisterProbe::TimedOut);
+        cancel.cancel();
     }
 
     /// RFC 3261 §10.2.8: a `423` is not an opaque failure — it carries the

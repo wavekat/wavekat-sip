@@ -186,7 +186,7 @@ pub use inbound::InboundRequest;
 pub use refer::{
     is_final_sipfrag, parse_sipfrag_status, refer_to_header, refer_to_with_replaces, DialogTriplet,
 };
-pub use registrar::{Registrar, RegistrarDiagnostics};
+pub use registrar::{RegisterProbe, Registrar, RegistrarDiagnostics};
 pub use resolve::{order_candidates, resolve_sip_server, SrvRecord};
 pub use rtp::dtmf::{
     build_event_payload, build_rtp_dtmf_packet, send_dtmf_burst, DtmfBurstConfig, DtmfDigit,

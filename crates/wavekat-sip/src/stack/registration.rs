@@ -135,6 +135,41 @@ pub(crate) fn build_register(cfg: &RegisterConfig, cseq: u32, local_addr: Socket
     }
 }
 
+/// Build a REGISTER binding *query* (RFC 3261 §10.2.3): the same request as
+/// [`build_register`] but with no `Contact` and no `Expires`. A registrar
+/// answers a query with the current bindings and cannot add or remove one
+/// because of it, which makes it a side-effect-free way to ask "is a SIP
+/// registrar listening here?".
+pub(crate) fn build_register_query(
+    cfg: &RegisterConfig,
+    cseq: u32,
+    local_addr: SocketAddr,
+) -> Request {
+    let mut request = build_register(cfg, cseq, local_addr);
+    request
+        .headers
+        .retain(|h| !matches!(h, Header::Contact(_) | Header::Expires(_)));
+    request
+}
+
+/// The answer to an unauthenticated binding query — see
+/// [`Registrar::probe`](crate::Registrar::probe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterProbe {
+    /// A final response arrived, so a SIP server is listening on this
+    /// transport. A `401`/`407` challenge is the usual answer; it is
+    /// reported, never answered.
+    Answered {
+        /// The final response's status code.
+        status: u16,
+    },
+    /// No final response before the transaction timed out.
+    TimedOut,
+    /// The engine stopped before a response arrived (cancelled, or the
+    /// stream transport closed).
+    EngineStopped,
+}
+
 /// The lifetime the server granted, from the response `Expires` header.
 pub(crate) fn granted_expires(response: &rsip::Response) -> Option<u32> {
     response.expires_header()?.seconds().ok()
@@ -188,6 +223,30 @@ mod tests {
         // requests are routed through.
         let via = req.via_header().unwrap().to_string();
         assert!(via.contains(";rport"), "REGISTER Via lacks rport: {via}");
+    }
+
+    /// A binding query carries neither `Contact` nor `Expires` — RFC 3261
+    /// §10.2.3 — so it cannot create or remove a binding. Everything else
+    /// (Via with rport, From tag, Call-ID, CSeq) matches a normal REGISTER.
+    #[test]
+    fn build_register_query_omits_contact_and_expires() {
+        let cfg = config();
+        let req = build_register_query(&cfg, 7, "10.0.0.1:5060".parse().unwrap());
+        assert_eq!(*req.method(), Method::Register);
+        assert!(
+            req.contact_header().is_err(),
+            "query must not carry Contact"
+        );
+        assert!(
+            req.expires_header().is_none(),
+            "query must not carry Expires"
+        );
+        assert_eq!(req.cseq_header().unwrap().typed().unwrap().seq, 7);
+        assert_eq!(
+            req.call_id_header().unwrap().to_string(),
+            "Call-ID: reg-call"
+        );
+        assert!(req.via_header().unwrap().to_string().contains(";rport"));
     }
 
     /// RFC 3261 §10.3 step 7: a `423` names the shortest lifetime the

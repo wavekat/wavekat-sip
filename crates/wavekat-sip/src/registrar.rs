@@ -6,7 +6,9 @@
 //! is answered with one retry at the `Min-Expires` it named, and that floor is
 //! remembered so later refreshes ask for it outright.
 //! [`Registrar::keepalive_loop`] re-registers on an interval until cancelled;
-//! [`Registrar::unregister`] sends `Expires: 0`.
+//! [`Registrar::unregister`] sends `Expires: 0`. [`Registrar::probe`] sends a
+//! binding query with no credentials, to check that a registrar is listening
+//! without signing in.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -17,6 +19,7 @@ use tracing::{info, warn};
 
 use crate::account::SipAccount;
 use crate::endpoint::SipEndpoint;
+pub use crate::stack::registration::RegisterProbe;
 use crate::stack::registration::{RegisterConfig, RegisterOutcome};
 use crate::stack::transaction::{contact_uri, gen_tag};
 
@@ -250,6 +253,33 @@ impl Registrar {
                 RegisterOutcome::EngineStopped => return Err("engine stopped".into()),
             }
         }
+    }
+
+    /// Ask whether a registrar is listening, without signing in.
+    ///
+    /// Sends one REGISTER with no `Contact` and no credentials — a binding
+    /// query (RFC 3261 §10.2.3), which cannot add or remove a binding — and
+    /// reports the first final response. A `401`/`407` challenge is reported
+    /// as [`RegisterProbe::Answered`] and is **not** answered, so the password
+    /// never goes on the wire and nothing a registrar could count as a failed
+    /// login happens.
+    ///
+    /// Useful for checking which transport reaches a server before a real
+    /// [`register`](Self::register). The query uses this registrar's `Call-ID`
+    /// and the next `CSeq`, so a later `register()` keeps RFC 3261 §10.2
+    /// sequencing intact. It does not change [`diagnostics`](Self::diagnostics).
+    pub async fn probe(&self) -> Result<RegisterProbe, BoxError> {
+        let cseq = {
+            let mut state = self.state.lock().await;
+            state.cseq += 1;
+            state.cseq
+        };
+        let cfg = self.config(self.expires)?;
+        Ok(self
+            .endpoint
+            .ua()
+            .register_query(&cfg, self.endpoint.server(), cseq)
+            .await)
     }
 
     /// Re-register every `refresh_secs` until the cancel token fires.
