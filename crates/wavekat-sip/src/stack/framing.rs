@@ -40,12 +40,17 @@ pub(crate) enum FramingError {
 /// Accumulates stream bytes and yields whole SIP messages.
 pub(crate) struct Framer {
     buf: Vec<u8>,
+    /// Bare CRLFs skipped since the last [`Framer::take_keepalives`].
+    keepalives: u64,
 }
 
 impl Framer {
     /// A framer with an empty buffer.
     pub(crate) fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            keepalives: 0,
+        }
     }
 
     /// Add freshly read bytes to the buffer.
@@ -63,6 +68,7 @@ impl Framer {
         // never part of the message that follows.
         while self.buf.starts_with(b"\r\n") {
             self.buf.drain(..2);
+            self.keepalives += 1;
         }
 
         let Some(end) = find_header_end(&self.buf) else {
@@ -84,6 +90,13 @@ impl Framer {
             Some(msg) => Ok(Some(msg)),
             None => Err(FramingError::Malformed),
         }
+    }
+
+    /// How many keepalive CRLFs have been skipped since the last call, and
+    /// reset the count. A pong is one; a peer's own ping is two. Either says
+    /// the connection is alive — see `stack::keepalive`.
+    pub(crate) fn take_keepalives(&mut self) -> u64 {
+        std::mem::take(&mut self.keepalives)
     }
 }
 
@@ -265,5 +278,30 @@ Content-Length: 0\r\n\r\n";
         let mut f = Framer::new();
         f.push(raw);
         assert_eq!(f.next_message(), Err(FramingError::Malformed));
+    }
+
+    #[test]
+    fn counts_the_keepalives_it_skips() {
+        let mut f = Framer::new();
+        // A pong, a message, then a ping from the peer.
+        f.push(b"\r\n");
+        f.push(&register());
+        f.push(b"\r\n\r\n");
+        assert!(f.next_message().expect("frames").is_some());
+        assert_eq!(f.take_keepalives(), 1, "the pong before the message");
+        assert!(f.next_message().expect("frames").is_none());
+        assert_eq!(f.take_keepalives(), 2, "the ping after it");
+        assert_eq!(f.take_keepalives(), 0, "taking resets the count");
+    }
+
+    #[test]
+    fn half_a_crlf_is_not_counted_until_it_completes() {
+        let mut f = Framer::new();
+        f.push(b"\r");
+        assert!(f.next_message().expect("frames").is_none());
+        assert_eq!(f.take_keepalives(), 0);
+        f.push(b"\n");
+        assert!(f.next_message().expect("frames").is_none());
+        assert_eq!(f.take_keepalives(), 1);
     }
 }

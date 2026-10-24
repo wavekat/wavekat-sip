@@ -40,3 +40,4 @@ Two kinds of documents live here:
 | [20-register-interval-too-brief.md](20-register-interval-too-brief.md) | Honour `423 Interval Too Brief` on REGISTER: read `Min-Expires`, retry, and remember the registrar's floor |
 | [21-register-cseq-continuity.md](21-register-cseq-continuity.md) | REGISTER `CSeq` continuity: carry the sequence number a digest retry consumed into the next refresh |
 | [22-register-probe.md](22-register-probe.md) | `Registrar::probe`: a credential-free REGISTER binding query (RFC 3261 §10.2.3) to check a registrar is listening on a transport without signing in |
+| [23-stream-keepalive.md](23-stream-keepalive.md) | RFC 5626 §3.5.1 CRLF keepalive on TCP/TLS: ping idle connections, and close one that fails a write or stops answering |

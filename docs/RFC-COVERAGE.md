@@ -272,7 +272,7 @@ typically a PBX/SBC on the same network or a trunk that latches):
 | 3428 | MESSAGE (pager-mode IM) | Not implemented |
 | 6665 (ex-3265) | SUBSCRIBE/NOTIFY event framework | Not implemented |
 | 3856 / 3863 | Presence, PIDF | Not implemented |
-| 5626 / 5627 | Outbound connection reuse, GRUU | Not implemented |
+| 5626 / 5627 | Outbound connection reuse, GRUU | Only §3.5.1 CRLF keepalive on TCP/TLS (see Transports); no `Flow-Timer`, `reg-id` or GRUU |
 | 3711 / 5763 / 5764 | SRTP, DTLS-SRTP | No media encryption |
 | 8489 / 8445 / 8656 | STUN, ICE, TURN | No NAT traversal; local address discovery is a UDP-connect trick only |
 | 3605 / 5761 | RTCP attribute in SDP, RTP/RTCP mux | No RTCP at all |
@@ -289,10 +289,17 @@ themselves reliable so the §17 retransmission timers collapse as they should.
 "RFC 3261 §26.2 & RFC 5922", above) — the framer and read task do not know the
 difference. `Via` names the transport actually in use and the registrar's
 `Contact` carries `;transport=tcp` / `;transport=tls`, so a registrar routes
-inbound requests back over the connection we opened. RFC 5626 §3.5.1 CRLF
-keepalives are accepted on the stream path (we do not yet send them, and do
-not yet reconnect a dropped connection — TCP or TLS). WebSocket is not
-implemented.
+inbound requests back over the connection we opened.
+
+RFC 5626 §3.5.1 CRLF keepalive runs on the stream path
+(`docs/23-stream-keepalive.md`). The client pings with a double CRLF every
+30 s, and the server's single-CRLF pongs (and its own pings) are counted. A
+ping that can't be written closes the connection. So does a missed pong
+(10 s), but only from a server that has ponged before. A closed connection
+stops the engine, which a consumer sees as `next_incoming_call()` returning
+`None`. A dropped connection is still not re-established in place: the
+consumer rebuilds the endpoint. We don't answer a server's pings, and the
+`Flow-Timer` header is ignored. WebSocket is not implemented.
 
 ## Known gaps worth closing first
 
@@ -300,10 +307,12 @@ Ranked by how soon a real deployment trips over them:
 
 1. **`rport` (RFC 3581)** — needed for responses to come back through NAT/PAT;
    add `;rport` to outgoing Via and honor it on responses.
-2. **Stream reconnect + keepalive** — a dropped TCP or TLS connection is not
-   re-established and we do not send RFC 5626 §3.5.1 CRLF keepalives, so a
-   NAT that times the connection out silently ends inbound reachability until
-   the endpoint is rebuilt.
+2. **Stream reconnect** — a dropped TCP or TLS connection is not
+   re-established in place. Since `docs/23-stream-keepalive.md`, CRLF
+   keepalives keep NAT mappings alive and a dead connection stops the engine
+   promptly, so a consumer that rebuilds its endpoint on that signal recovers.
+   Reconnecting inside the crate (re-registering and re-targeting dialogs on
+   the new connection) is still open.
 3. **RTCP receiver reports** — without them, neither side gets loss or jitter
    feedback; fine on a LAN, blind over the open internet.
 4. ~~**TLS transport (SIPS)** — credentials currently ride plaintext except

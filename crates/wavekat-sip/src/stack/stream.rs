@@ -7,11 +7,18 @@
 //!
 //! A write half behind a mutex serialises concurrent sends; a read task owns
 //! the read half, frames it with [`Framer`], and publishes whole messages on a
-//! channel that [`StreamTransport::recv`] drains.
+//! channel that [`StreamTransport::recv`] drains. A keepalive task pings the
+//! peer while the connection is idle (see [`super::keepalive`]).
+//!
+//! A connection found dead — by a failed write, or a keepalive the peer
+//! stopped answering — cancels `closed`. The read task stops on it, `recv()`
+//! then reports the connection closed, and the engine stops just as it does
+//! when the peer closes the connection.
 
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -21,9 +28,11 @@ use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use super::framing::Framer;
+use super::keepalive;
 use super::transaction::Reliability;
 use super::transport::serialize;
 
@@ -98,6 +107,11 @@ pub(crate) struct StreamTransport {
     inbound: Mutex<mpsc::Receiver<(SipMessage, SocketAddr)>>,
     /// Aborted on drop. See the `Drop` impl.
     reader: JoinHandle<()>,
+    /// The keepalive task, when the setup asked for one. Aborted on drop.
+    pinger: Option<JoinHandle<()>>,
+    /// Cancelled once the connection is known to be dead; the read task
+    /// stops on it.
+    closed: CancellationToken,
     local: SocketAddr,
     peer: SocketAddr,
 }
@@ -117,7 +131,11 @@ pub(crate) struct StreamTransport {
 /// sent, because `Drop` cannot await one.
 impl Drop for StreamTransport {
     fn drop(&mut self) {
+        self.closed.cancel();
         self.reader.abort();
+        if let Some(pinger) = &self.pinger {
+            pinger.abort();
+        }
     }
 }
 
@@ -160,13 +178,33 @@ impl StreamTransport {
         };
 
         let (read, write) = tokio::io::split(stream);
+        let write = Arc::new(Mutex::new(write));
         let (tx, rx) = mpsc::channel(INBOUND_DEPTH);
-        let reader = tokio::spawn(read_task(read, peer, tx));
+        let closed = CancellationToken::new();
+        let keepalives = Arc::new(AtomicU64::new(0));
+        let reader = tokio::spawn(read_task(
+            read,
+            peer,
+            tx,
+            keepalives.clone(),
+            closed.clone(),
+        ));
+        let pinger = setup.keepalive.map(|cfg| {
+            tokio::spawn(keepalive::run(
+                write.clone(),
+                peer,
+                keepalives,
+                closed.clone(),
+                cfg,
+            ))
+        });
 
         Ok(Self {
-            write: Arc::new(Mutex::new(write)),
+            write,
             inbound: Mutex::new(rx),
             reader,
+            pinger,
+            closed,
             local,
             peer,
         })
@@ -200,7 +238,14 @@ impl StreamTransport {
             self.peer,
             String::from_utf8_lossy(&bytes).trim_end(),
         );
-        write_message(&mut *self.write.lock().await, &bytes).await
+        let written = write_message(&mut *self.write.lock().await, &bytes).await;
+        if let Err(e) = &written {
+            // A write that fails means the connection is gone. Close it so
+            // the engine finds out now, not when a transaction times out.
+            warn!(dst = %self.peer, error = %e, "stream write failed; closing the connection");
+            self.closed.cancel();
+        }
+        written
     }
 
     /// Await the next framed message from the connection.
@@ -218,25 +263,41 @@ impl StreamTransport {
 /// socket backpressure they stay there until something flushes. Without it a
 /// request can "send" successfully, never reach the wire, and surface only as
 /// a transaction timeout.
-async fn write_message<W: AsyncWrite + Unpin + ?Sized>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+pub(crate) async fn write_message<W: AsyncWrite + Unpin + ?Sized>(
+    w: &mut W,
+    bytes: &[u8],
+) -> io::Result<()> {
     w.write_all(bytes).await?;
     w.flush().await
 }
 
 /// Own the read half, frame it, and publish whole messages.
 ///
-/// Ends on EOF, a read error, or a framing error. A framing error is fatal by
-/// design: once message boundaries are lost there is no way to find the next
-/// one, so continuing would feed the engine garbage.
+/// Ends on EOF, a read error, a framing error, or `closed` being cancelled
+/// (the connection was found dead from the write side). A framing error is
+/// fatal by design: once message boundaries are lost there is no way to find
+/// the next one, so continuing would feed the engine garbage.
+///
+/// Counts the keepalive CRLFs the framer skips into `keepalives`, for the
+/// keepalive task.
 async fn read_task(
     mut read: ReadHalf<SipStream>,
     peer: SocketAddr,
     tx: mpsc::Sender<(SipMessage, SocketAddr)>,
+    keepalives: Arc<AtomicU64>,
+    closed: CancellationToken,
 ) {
     let mut framer = Framer::new();
     let mut chunk = vec![0u8; READ_CHUNK];
     loop {
-        let n = match read.read(&mut chunk).await {
+        let read_result = tokio::select! {
+            _ = closed.cancelled() => {
+                debug!(%peer, "stream closed: connection found dead");
+                return;
+            }
+            r = read.read(&mut chunk) => r,
+        };
+        let n = match read_result {
             Ok(0) => {
                 debug!(%peer, "stream closed by peer");
                 return;
@@ -268,6 +329,11 @@ async fn read_task(
                     return;
                 }
             }
+        }
+        let skipped = framer.take_keepalives();
+        if skipped > 0 {
+            trace!(%peer, skipped, "keepalive received");
+            keepalives.fetch_add(skipped, Ordering::Release);
         }
     }
 }
@@ -571,5 +637,161 @@ Content-Length: 0\r\n\r\n"
 
         let got = server.await.expect("server task");
         assert_eq!(got, b"back through the enum");
+    }
+
+    /// A TCP setup that pings every `interval_ms` and gives a pong
+    /// `timeout_ms`, so the keepalive tests run in milliseconds.
+    fn tcp_pinging(interval_ms: u64, timeout_ms: u64) -> super::super::transport::TransportSetup {
+        let mut setup: super::super::transport::TransportSetup = Transport::Tcp.into();
+        setup.keepalive = Some(keepalive::StreamKeepalive {
+            interval: std::time::Duration::from_millis(interval_ms),
+            pong_timeout: std::time::Duration::from_millis(timeout_ms),
+        });
+        setup
+    }
+
+    /// Read from `sock` until `want` bytes have arrived or it closes.
+    async fn read_at_least(sock: &mut TcpStream, want: usize) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        while got.len() < want {
+            let n = sock.read(&mut buf).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_is_pinged() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            read_at_least(&mut sock, 8).await
+        });
+
+        let _t = StreamTransport::connect(addr, &tcp_pinging(20, 1_000))
+            .await
+            .expect("connects");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("pings arrive")
+            .expect("server task");
+        // At least two pings and nothing else. A server task that wakes late
+        // reads a third in the same read, so the length isn't pinned.
+        assert!(got.len() >= 8, "{got:?}");
+        assert_eq!(got.len() % 4, 0, "whole pings only: {got:?}");
+        assert!(got.chunks(4).all(|c| c == keepalive::PING), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_pings_has_its_connection_closed() {
+        // A registrar that answered pings, then went quiet without closing
+        // anything — what a NAT that forgot the connection looks like from
+        // this end. Before keepalives, nothing noticed until the next
+        // REGISTER refresh timed out.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            // Answer the first ping, then never again.
+            read_at_least(&mut sock, 4).await;
+            sock.write_all(b"\r\n").await.expect("pong");
+            loop {
+                if read_at_least(&mut sock, 4).await.is_empty() {
+                    return;
+                }
+            }
+        });
+
+        let t = StreamTransport::connect(addr, &tcp_pinging(30, 60))
+            .await
+            .expect("connects");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), t.recv())
+            .await
+            .expect("the connection is closed, so recv() ends");
+        let err = ended.expect_err("no message, just the close");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_never_answers_pings_keeps_its_connection() {
+        // Plenty of registrars don't implement the pong. Their silence is
+        // not a dead connection.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            loop {
+                if read_at_least(&mut sock, 4).await.is_empty() {
+                    return;
+                }
+            }
+        });
+
+        let t = StreamTransport::connect(addr, &tcp_pinging(20, 20))
+            .await
+            .expect("connects");
+        // Many ping intervals and pong timeouts later, still open.
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(1), t.recv()).await;
+        assert!(waited.is_err(), "recv() is still waiting: {waited:?}");
+        assert!(!t.closed.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_pong_keeps_the_connection_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            loop {
+                if read_at_least(&mut sock, 4).await.is_empty() {
+                    return;
+                }
+                if sock.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        // A pong gets 500 ms, so a busy machine that is slow to schedule the
+        // server doesn't read as a dead connection; the 2 s window still
+        // holds several checked pings.
+        let t = StreamTransport::connect(addr, &tcp_pinging(50, 500))
+            .await
+            .expect("connects");
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(2), t.recv()).await;
+        assert!(waited.is_err(), "recv() is still waiting: {waited:?}");
+        assert!(!t.closed.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_transport_stops_the_pings() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut all = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return all,
+                    Ok(n) => all.extend_from_slice(&buf[..n]),
+                }
+            }
+        });
+
+        let t = StreamTransport::connect(addr, &tcp_pinging(10_000, 1_000))
+            .await
+            .expect("connects");
+        drop(t);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("the connection closes")
+            .expect("server task");
+        assert!(got.is_empty(), "no ping after the drop: {got:?}");
     }
 }

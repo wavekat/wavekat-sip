@@ -45,6 +45,9 @@ pub(crate) struct TransportSetup {
     pub(crate) transport: Transport,
     #[cfg(feature = "tls")]
     pub(crate) tls: Option<TlsSetup>,
+    /// RFC 5626 keepalive for a stream transport; ignored on UDP. `None`
+    /// turns it off, which only tests do.
+    pub(crate) keepalive: Option<super::keepalive::StreamKeepalive>,
 }
 
 /// The TLS-only half of [`TransportSetup`].
@@ -63,6 +66,7 @@ impl From<Transport> for TransportSetup {
             transport,
             #[cfg(feature = "tls")]
             tls: None,
+            keepalive: Some(Default::default()),
         }
     }
 }
