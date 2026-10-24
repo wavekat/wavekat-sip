@@ -122,6 +122,7 @@ impl SipEndpoint {
                 }),
                 _ => None,
             },
+            keepalive: Some(Default::default()),
         };
 
         let ua = Arc::new(
