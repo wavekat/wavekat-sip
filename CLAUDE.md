@@ -40,6 +40,10 @@ Planned (see `docs/01-port-plan.md`):
 - Test pure functions first: parsers, builders, helpers.
 - Round-trip tests where applicable (e.g. `build_sdp` ↔ `parse_sdp`).
 - Integration tests requiring a SIP server go in `tests/` and are `#[ignore]`.
+- `tests/asterisk.rs` runs against a real Asterisk in Docker: `make e2e-asterisk`
+  (only Docker needed; CI runs it on every PR, see `docs/24-asterisk-e2e.md`).
+  A change to how we register, call, or handle a stream connection should
+  pass it before it lands.
 - No `unwrap()` in library code — only in tests.
 
 ## Code quality

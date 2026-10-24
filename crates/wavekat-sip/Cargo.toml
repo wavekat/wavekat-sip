@@ -37,7 +37,7 @@ rustls-platform-verifier = { version = "0.7", optional = true }
 sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "io-util", "process"] }
 # Test certificates are generated in-test, so nothing is checked into the repo
 # and nothing has to be rotated.
 rcgen = "0.14"
