@@ -680,7 +680,11 @@ Content-Length: 0\r\n\r\n"
             .await
             .expect("pings arrive")
             .expect("server task");
-        assert_eq!(got, b"\r\n\r\n\r\n\r\n", "two pings, nothing else");
+        // At least two pings and nothing else. A server task that wakes late
+        // reads a third in the same read, so the length isn't pinned.
+        assert!(got.len() >= 8, "{got:?}");
+        assert_eq!(got.len() % 4, 0, "whole pings only: {got:?}");
+        assert!(got.chunks(4).all(|c| c == keepalive::PING), "{got:?}");
     }
 
     #[tokio::test]
@@ -732,7 +736,7 @@ Content-Length: 0\r\n\r\n"
             .await
             .expect("connects");
         // Many ping intervals and pong timeouts later, still open.
-        let waited = tokio::time::timeout(std::time::Duration::from_millis(400), t.recv()).await;
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(1), t.recv()).await;
         assert!(waited.is_err(), "recv() is still waiting: {waited:?}");
         assert!(!t.closed.is_cancelled());
     }
@@ -753,10 +757,13 @@ Content-Length: 0\r\n\r\n"
             }
         });
 
-        let t = StreamTransport::connect(addr, &tcp_pinging(20, 200))
+        // A pong gets 500 ms, so a busy machine that is slow to schedule the
+        // server doesn't read as a dead connection; the 2 s window still
+        // holds several checked pings.
+        let t = StreamTransport::connect(addr, &tcp_pinging(50, 500))
             .await
             .expect("connects");
-        let waited = tokio::time::timeout(std::time::Duration::from_millis(400), t.recv()).await;
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(2), t.recv()).await;
         assert!(waited.is_err(), "recv() is still waiting: {waited:?}");
         assert!(!t.closed.is_cancelled());
     }
