@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/wavekat/wavekat-sip/compare/v0.3.1...v0.3.2) - 2026-10-24
+
+### Fixed
+
+- ping idle TCP/TLS connections ([#66](https://github.com/wavekat/wavekat-sip/pull/66))
+
 ## [0.3.1](https://github.com/wavekat/wavekat-sip/compare/v0.3.0...v0.3.1) - 2026-10-06
 
 ### Added
