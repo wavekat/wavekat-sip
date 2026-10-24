@@ -1,0 +1,29 @@
+name: E2E (Asterisk)
+
+# The end-to-end tests in crates/wavekat-sip/tests/asterisk.rs, against a real
+# Asterisk in Docker (see `make e2e-asterisk`).
+#
+# On a GitHub-hosted runner rather than the self-hosted pool the main CI uses:
+# those runners are themselves containers with no Docker daemon to start
+# Asterisk in, and this repo is public, so hosted minutes cost nothing.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  asterisk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tests
+        run: cargo test -p wavekat-sip --all-features --test asterisk --no-run
+      - name: Run against Asterisk
+        run: make e2e-asterisk
