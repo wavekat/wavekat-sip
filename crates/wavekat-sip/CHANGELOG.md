@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/wavekat/wavekat-sip/compare/v0.3.3...v0.4.0) - 2026-11-13
+
+### Added
+
+- [**breaking**] let apps choose their codecs ([#72](https://github.com/wavekat/wavekat-sip/pull/72))
+- [**breaking**] offer and negotiate G.722 ([#70](https://github.com/wavekat/wavekat-sip/pull/70))
+
 ## [0.3.3](https://github.com/wavekat/wavekat-sip/compare/v0.3.2...v0.3.3) - 2026-10-24
 
 ### Other
