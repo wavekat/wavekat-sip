@@ -50,6 +50,14 @@ default list that means:
 Opus still wins wherever it appears. A consumer that wants the peer's
 G.711 variant can list only that one.
 
+Why our order and not the peer's (both are allowed by RFC 3264, and
+stacks differ: PJSIP and FreeSWITCH default to the peer's): the order
+the application chooses is the call quality its users get. If a peer
+that lists G.711 first could override it, an app that put G.722 first
+would still sound narrowband on many lines, and "most preferred first"
+would not mean what it says. There is no switch for the peer's order;
+add one only if a consumer needs it.
+
 ## Not done
 
 - `AudioCodec` stays exhaustive. `#[non_exhaustive]` would let future
