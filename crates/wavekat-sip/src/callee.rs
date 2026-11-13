@@ -120,7 +120,7 @@ impl IncomingCall {
     ///
     /// The answer is a real RFC 3264 intersection of the offer: Opus wherever
     /// the offer contains it (at the offer's payload type), else the offer's
-    /// first G.711 — echoed back as a [`CodecMenu::Pinned`] body, never the
+    /// first G.722 or G.711 — echoed back as a [`CodecMenu::Pinned`] body, never the
     /// full menu. The returned call's [`RemoteMedia::codec`] is rewritten to
     /// that selection, so it is always the *negotiated* codec, not the peer's
     /// first preference.
