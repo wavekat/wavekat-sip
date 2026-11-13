@@ -1,5 +1,5 @@
 //! SDP offer/answer for telephony audio — Opus (RFC 7587) preferred,
-//! G.711 fallback — plus RFC 4733 `telephone-event` (DTMF) negotiation.
+//! then G.722 (wideband), G.711 fallback — plus RFC 4733 `telephone-event` (DTMF) negotiation.
 //!
 //! The crate stays codec-agnostic: nothing here encodes or decodes
 //! audio. This module only *negotiates* — which codec, at which payload
@@ -9,7 +9,7 @@
 //! ## Offer, answer, re-offer
 //!
 //! - **Initial offer** ([`build_sdp_offer`]): the full menu, Opus first
-//!   (`opus/48000/2` with `useinbandfec=1`), then PCMU/PCMA, plus
+//!   (`opus/48000/2` with `useinbandfec=1`), then G.722, then PCMU/PCMA, plus
 //!   `telephone-event` at both the 8 kHz and 48 kHz clocks so whichever
 //!   codec the peer picks it finds a matching-clock DTMF entry.
 //! - **Answer**: a real RFC 3264 intersection — echo back *only* the
@@ -30,6 +30,15 @@
 //! wideband). Opus also has no static payload type: it rides the
 //! dynamic range, [`OPUS_DEFAULT_PT`] (111) being only what *we* offer.
 //! The negotiated number comes out of [`parse_sdp`] per call.
+//!
+//! ## The G.722 clock
+//!
+//! G.722 is 16 kHz audio, but its rtpmap is `G722/8000` and its RTP
+//! timestamp runs at 8 kHz (RFC 3551 §4.5.2 keeps a historical error
+//! for compatibility). [`AudioCodec::rtp_clock_rate`] therefore reports
+//! 8000 for it: 160 timestamp units per 20 ms frame, and
+//! `telephone-event/8000` is its matching DTMF clock. The consumer
+//! encodes 320 samples per frame.
 
 use std::net::IpAddr;
 
@@ -55,10 +64,18 @@ pub const DTMF_WIDEBAND_DEFAULT_PT: u8 = 110;
 pub const OPUS_DEFAULT_PT: u8 = 111;
 
 /// RTP timestamp clock for Opus — pinned to 48 kHz by RFC 7587 §4.1
-/// regardless of the actual encode rate. (G.711's clock is 8 kHz.)
+/// regardless of the actual encode rate. (G.711's and G.722's clock is
+/// 8 kHz.)
 pub const OPUS_RTP_CLOCK_RATE: u32 = 48_000;
 
 const G711_RTP_CLOCK_RATE: u32 = 8_000;
+
+/// The static RTP payload type for G.722 (RFC 3551).
+pub const G722_PT: u8 = 9;
+
+/// RTP timestamp clock for G.722: 8 kHz although the audio is sampled
+/// at 16 kHz (RFC 3551 §4.5.2).
+pub const G722_RTP_CLOCK_RATE: u32 = 8_000;
 
 /// Media direction (RFC 4566 `a=` attribute), used to put a call on hold
 /// and take it off again per RFC 3264 §8.4.
@@ -86,14 +103,17 @@ impl MediaDirection {
 /// An audio codec this stack can negotiate, with its wire identity.
 ///
 /// This is negotiation metadata, not a codec implementation — encode
-/// and decode stay with the consumer (`wavekat-core` provides G.711 and
-/// Opus codecs).
+/// and decode stay with the consumer (`wavekat-core` provides G.711,
+/// G.722 and Opus codecs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioCodec {
     /// G.711 μ-law — static RTP payload type 0.
     Pcmu,
     /// G.711 A-law — static RTP payload type 8.
     Pcma,
+    /// G.722 wideband (16 kHz audio at 64 kbit/s) — static RTP payload
+    /// type 9. The RTP clock is 8 kHz all the same; see the module docs.
+    G722,
     /// Opus at a **dynamic** payload type — whatever this side of the
     /// negotiation chose. The number alone is not self-describing the
     /// way 0/8 are; it only means Opus in the context of the SDP body
@@ -110,15 +130,18 @@ impl AudioCodec {
         match self {
             AudioCodec::Pcmu => 0,
             AudioCodec::Pcma => 8,
+            AudioCodec::G722 => G722_PT,
             AudioCodec::Opus { payload_type } => *payload_type,
         }
     }
 
-    /// The RTP timestamp clock rate: 8 kHz for G.711, always 48 kHz for
-    /// Opus (a wire constant — see the module docs).
+    /// The RTP timestamp clock rate: 8 kHz for G.711 and for G.722
+    /// (whose audio is 16 kHz), always 48 kHz for Opus. These are wire
+    /// constants, not the encode rate — see the module docs.
     pub fn rtp_clock_rate(&self) -> u32 {
         match self {
             AudioCodec::Pcmu | AudioCodec::Pcma => G711_RTP_CLOCK_RATE,
+            AudioCodec::G722 => G722_RTP_CLOCK_RATE,
             AudioCodec::Opus { .. } => OPUS_RTP_CLOCK_RATE,
         }
     }
@@ -128,6 +151,7 @@ impl AudioCodec {
         match self {
             AudioCodec::Pcmu => "PCMU/8000",
             AudioCodec::Pcma => "PCMA/8000",
+            AudioCodec::G722 => "G722/8000",
             AudioCodec::Opus { .. } => "opus/48000/2",
         }
     }
@@ -152,8 +176,8 @@ pub struct DtmfSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecMenu {
     /// The full initial-offer menu: Opus (preferred, at
-    /// [`OPUS_DEFAULT_PT`]) then PCMU/PCMA, with `telephone-event` at
-    /// both clocks. Use for initial offers only.
+    /// [`OPUS_DEFAULT_PT`]), then G.722, then PCMU/PCMA, with
+    /// `telephone-event` at both clocks. Use for initial offers only.
     Full,
     /// Exactly one codec (plus optionally one `telephone-event` entry)
     /// — the shape of every answer and every post-negotiation re-offer.
@@ -207,6 +231,7 @@ pub fn build_sdp_with(
         CodecMenu::Full => {
             pts.extend([
                 OPUS_DEFAULT_PT.to_string(),
+                G722_PT.to_string(),
                 "0".into(),
                 "8".into(),
                 DTMF_DEFAULT_PT.to_string(),
@@ -214,6 +239,7 @@ pub fn build_sdp_with(
             ]);
             attrs.push(format!("a=rtpmap:{OPUS_DEFAULT_PT} opus/48000/2"));
             attrs.push(format!("a=fmtp:{OPUS_DEFAULT_PT} useinbandfec=1"));
+            attrs.push(format!("a=rtpmap:{G722_PT} G722/8000"));
             attrs.push("a=rtpmap:0 PCMU/8000".into());
             attrs.push("a=rtpmap:8 PCMA/8000".into());
             attrs.push(format!("a=rtpmap:{DTMF_DEFAULT_PT} telephone-event/8000"));
@@ -272,8 +298,8 @@ pub struct RemoteMedia {
     /// (`Self::codec`), which resolves dynamic payload types.
     pub payload_type: u8,
     /// The first payload type on the `m=audio` line that resolves to a
-    /// codec this stack knows (static 0/8, or a dynamic PT whose rtpmap
-    /// names `opus/48000` or PCMU/PCMA). `None` when the body offers
+    /// codec this stack knows (static 0/8/9, or a PT whose rtpmap
+    /// names `opus/48000`, `G722/8000` or PCMU/PCMA). `None` when the body offers
     /// nothing we understand.
     ///
     /// When parsed from an **answer** this *is* the negotiated codec.
@@ -307,7 +333,8 @@ impl RemoteMedia {
 }
 
 /// Pick the audio codec for an answer, per the WaveKat policy: **prefer
-/// Opus wherever it appears in the offer, else the peer's first G.711**.
+/// Opus wherever it appears in the offer, else the peer's first codec
+/// we know (G.722 or G.711, in the peer's order of preference)**.
 /// Returns `None` when the offer contains nothing this stack knows —
 /// the SIP-correct response then is `488 Not Acceptable Here`.
 pub fn select_codec(offer: &RemoteMedia) -> Option<AudioCodec> {
@@ -387,18 +414,20 @@ pub fn parse_sdp(sdp_bytes: &[u8]) -> Result<RemoteMedia, String> {
 
     // Resolve one m=-line payload type to a codec. An explicit rtpmap
     // wins over the static assignment (RFC 8866 allows remapping);
-    // without one, only the static 0/8 numbers are self-describing.
+    // without one, only the static 0/8/9 numbers are self-describing.
     let resolve = |pt: u8| -> Option<AudioCodec> {
         match rtpmap_for(pt) {
             Some((_, name, rate)) => match (name.as_str(), *rate) {
                 ("opus", OPUS_RTP_CLOCK_RATE) => Some(AudioCodec::Opus { payload_type: pt }),
                 ("pcmu", G711_RTP_CLOCK_RATE) => Some(AudioCodec::Pcmu),
                 ("pcma", G711_RTP_CLOCK_RATE) => Some(AudioCodec::Pcma),
+                ("g722", G722_RTP_CLOCK_RATE) => Some(AudioCodec::G722),
                 _ => None,
             },
             None => match pt {
                 0 => Some(AudioCodec::Pcmu),
                 8 => Some(AudioCodec::Pcma),
+                G722_PT => Some(AudioCodec::G722),
                 _ => None,
             },
         }
@@ -459,9 +488,10 @@ mod tests {
 
         assert!(text.contains("v=0\r\n"));
         assert!(text.contains("c=IN IP4 10.0.0.1\r\n"));
-        // Opus leads the menu; G.711 follows for fallback; both DTMF
-        // clocks are on the table.
-        assert!(text.contains("m=audio 5004 RTP/AVP 111 0 8 101 110\r\n"));
+        // Opus leads the menu; G.722 is the wideband fallback, G.711
+        // the universal one; both DTMF clocks are on the table.
+        assert!(text.contains("m=audio 5004 RTP/AVP 111 9 0 8 101 110\r\n"));
+        assert!(text.contains("a=rtpmap:9 G722/8000\r\n"));
         assert!(text.contains("a=rtpmap:111 opus/48000/2\r\n"));
         assert!(text.contains("a=fmtp:111 useinbandfec=1\r\n"));
         assert!(text.contains("a=rtpmap:0 PCMU/8000\r\n"));
@@ -739,6 +769,87 @@ mod tests {
         // No Opus in the offer → the peer's first G.711, no Opus in the
         // answer.
         assert_eq!(select_codec(&media), Some(AudioCodec::Pcma));
+    }
+
+    #[test]
+    fn g722_has_its_static_payload_type_and_an_8k_rtp_clock() {
+        // RFC 3551 §4.5.2: 16 kHz audio, but `G722/8000` on the wire
+        // and an 8 kHz RTP timestamp.
+        assert_eq!(AudioCodec::G722.payload_type(), 9);
+        assert_eq!(AudioCodec::G722.payload_type(), G722_PT);
+        assert_eq!(AudioCodec::G722.rtp_clock_rate(), 8000);
+    }
+
+    #[test]
+    fn an_answer_choosing_g722_parses_as_g722() {
+        // What a provider that refuses Opus but speaks G.722 answers
+        // to our full offer.
+        let sdp = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 9 101\r\n\
+                    a=rtpmap:9 G722/8000\r\n\
+                    a=rtpmap:101 telephone-event/8000\r\n";
+        let media = parse_sdp(sdp).unwrap();
+        assert_eq!(media.codec, Some(AudioCodec::G722));
+        assert_eq!(media.opus_payload_type, None);
+        // The DTMF entry at G.722's 8 kHz RTP clock goes with it.
+        assert_eq!(
+            media.dtmf(),
+            Some(DtmfSpec {
+                payload_type: 101,
+                clock_rate: 8000
+            })
+        );
+    }
+
+    #[test]
+    fn g722_is_recognised_by_static_number_or_by_rtpmap() {
+        // Static 9 with no rtpmap at all.
+        let bare = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 9 0\r\n";
+        assert_eq!(parse_sdp(bare).unwrap().codec, Some(AudioCodec::G722));
+        // Case-insensitive name; a 16 kHz rtpmap is not G.722's wire
+        // form, so that entry is skipped in favour of the next one.
+        let named =
+            b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 9 0\r\na=rtpmap:9 g722/8000\r\n";
+        assert_eq!(parse_sdp(named).unwrap().codec, Some(AudioCodec::G722));
+        let wrong =
+            b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 9 0\r\na=rtpmap:9 G722/16000\r\n";
+        assert_eq!(parse_sdp(wrong).unwrap().codec, Some(AudioCodec::Pcmu));
+    }
+
+    #[test]
+    fn select_codec_follows_the_peers_order_between_g722_and_g711() {
+        let wide_first = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 9 8 0\r\n";
+        assert_eq!(
+            select_codec(&parse_sdp(wide_first).unwrap()),
+            Some(AudioCodec::G722)
+        );
+        let narrow_first = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 8 9\r\n";
+        assert_eq!(
+            select_codec(&parse_sdp(narrow_first).unwrap()),
+            Some(AudioCodec::Pcma)
+        );
+        // Opus still wins wherever it sits.
+        let with_opus = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 9 0 111\r\na=rtpmap:111 opus/48000/2\r\n";
+        assert_eq!(
+            select_codec(&parse_sdp(with_opus).unwrap()),
+            Some(AudioCodec::Opus { payload_type: 111 })
+        );
+    }
+
+    #[test]
+    fn a_pinned_g722_body_round_trips() {
+        let menu = CodecMenu::Pinned {
+            codec: AudioCodec::G722,
+            dtmf: Some(DtmfSpec {
+                payload_type: 101,
+                clock_rate: 8000,
+            }),
+        };
+        let body = build_sdp_with(ip(), 5004, menu, MediaDirection::SendRecv, 1);
+        let text = String::from_utf8(body.clone()).unwrap();
+        assert!(text.contains("m=audio 5004 RTP/AVP 9 101\r\n"));
+        assert!(text.contains("a=rtpmap:9 G722/8000\r\n"));
+        assert!(!text.contains("fmtp:9"));
+        assert_eq!(parse_sdp(&body).unwrap().codec, Some(AudioCodec::G722));
     }
 
     #[test]

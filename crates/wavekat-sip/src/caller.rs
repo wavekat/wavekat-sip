@@ -427,7 +427,7 @@ impl Caller {
     /// Place an outbound call to `target` and wait for it to be answered.
     ///
     /// Binds a local RTP socket, offers the full codec menu (Opus preferred,
-    /// G.711 fallback — see [`crate::sdp::CodecMenu::Full`]), sends the INVITE
+    /// then G.722, G.711 fallback — see [`crate::sdp::CodecMenu::Full`]), sends the INVITE
     /// to the account's resolved server, follows provisional responses, and
     /// answers a single `401`/`407` challenge. Returns the [`Call`] on a 2xx,
     /// or an error if the call was rejected, timed out, or had no usable SDP
