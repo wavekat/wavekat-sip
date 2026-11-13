@@ -19,7 +19,8 @@ Single-crate workspace at `crates/wavekat-sip/`. Modules:
 
 - `account.rs` — runtime `SipAccount` + `Transport`.
 - `endpoint.rs` — shared `SipEndpoint` (transport + dialog layer).
-- `sdp.rs` — SDP offer/answer: Opus (preferred), G.722 + G.711, pinned re-offers,
+- `sdp.rs` — SDP offer/answer: Opus (preferred), G.722 + G.711, a chosen
+  `CodecList`, pinned re-offers,
   telephone-event at both clocks. Negotiation only, still codec-agnostic.
 - `rtp.rs` — `RtpHeader` parser + receive loop.
 - `registrar.rs` — REGISTER + digest auth + keepalive.

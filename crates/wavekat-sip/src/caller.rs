@@ -22,7 +22,7 @@ use crate::endpoint::SipEndpoint;
 use crate::inbound::InboundRequest;
 use crate::rtp::dtmf::DtmfDigit;
 use crate::sdp::{
-    build_sdp_offer, build_sdp_with, parse_sdp, CodecMenu, MediaDirection, RemoteMedia,
+    build_sdp_offer_with, build_sdp_with, parse_sdp, CodecMenu, MediaDirection, RemoteMedia,
 };
 use crate::session_timer::{
     negotiate_uac, supported_timer_header, SessionDialogOps, SessionExpires, SessionTimer,
@@ -426,8 +426,8 @@ impl Caller {
 
     /// Place an outbound call to `target` and wait for it to be answered.
     ///
-    /// Binds a local RTP socket, offers the full codec menu (Opus preferred,
-    /// then G.722, G.711 fallback — see [`crate::sdp::CodecMenu::Full`]), sends the INVITE
+    /// Binds a local RTP socket, offers the endpoint's codecs
+    /// ([`SipEndpoint::codecs`]; by default Opus, then G.722, then G.711), sends the INVITE
     /// to the account's resolved server, follows provisional responses, and
     /// answers a single `401`/`407` challenge. Returns the [`Call`] on a 2xx,
     /// or an error if the call was rejected, timed out, or had no usable SDP
@@ -475,7 +475,7 @@ impl Caller {
         let local_ip = self.endpoint.local_ip();
         info!(%local_ip, rtp_port = local_rtp_addr.port(), "bound RTP socket for outbound dial");
 
-        let offer = build_sdp_offer(local_ip, local_rtp_addr.port());
+        let offer = build_sdp_offer_with(local_ip, local_rtp_addr.port(), &self.endpoint.codecs());
         debug!("SDP offer:\n{}", String::from_utf8_lossy(&offer));
 
         let from: Uri =

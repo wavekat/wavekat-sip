@@ -24,7 +24,8 @@ recording bridges in Rust. It owns the wire-level concerns —
   calls (`Caller` / `IncomingCall`), in-dialog hold/resume, DTMF (RFC 4733 +
   INFO fallback), and RFC 4028 session timers.
 - **SDP**: offer/answer for Opus (preferred, with in-band FEC), G.722
-  (wideband) and G.711 (PCMU + PCMA) fallback; answers and mid-call re-offers pin the negotiated
+  (wideband) and G.711 (PCMU + PCMA) fallback, or any list of them you
+  choose (`CodecList`); answers and mid-call re-offers pin the negotiated
   codec. Negotiation only — encode/decode stays with the consumer.
 - **RTP**: header parser, a debug-friendly receive loop, and a codec-agnostic
   send loop.
@@ -100,6 +101,34 @@ while let Some(incoming) = endpoint.next_incoming_call().await {
 # Ok(())
 # }
 ```
+
+### Choosing codecs
+
+By default calls offer and accept Opus, G.722, PCMU and PCMA, in that
+order of preference. If your application can't encode all of them, or
+prefers another order, give the endpoint its own list before placing or
+answering calls:
+
+```rust,no_run
+# use std::sync::Arc;
+# use wavekat_sip::SipEndpoint;
+use wavekat_sip::{AudioCodec, CodecList};
+
+# fn run(endpoint: Arc<SipEndpoint>) -> Result<(), String> {
+// G.722 if the other side has it, else G.711. No Opus.
+endpoint.set_codecs(CodecList::new([
+    AudioCodec::G722,
+    AudioCodec::Pcmu,
+    AudioCodec::Pcma,
+])?);
+# Ok(())
+# }
+```
+
+Outbound calls offer exactly these codecs, in this order. Inbound calls
+are answered with the first of them the caller offered, or refused with
+`488 Not Acceptable Here` if there is none. Read the result from
+`call.remote_media.codec`.
 
 ## TLS
 
@@ -198,7 +227,7 @@ match SipEndpoint::new(&account, cancel).await {
 | `resolve`   | Working — RFC 3263 (subset) SRV + A/AAAA fallback.     |
 | `caller`    | Working — outbound dial, hold/resume, DTMF, hangup.    |
 | `callee`    | Working — inbound INVITE accept/reject.                |
-| `sdp`       | Working — Opus, G.722 + G.711 offer/answer (negotiation only). |
+| `sdp`       | Working — Opus, G.722 + G.711 offer/answer, codec choice (negotiation only). |
 | `rtp`       | Working — header parser, receive loop, send loop.      |
 | `tls_error` | Working — typed `CertFailure` / `UntrustedCertificate` reporting for TLS. |
 

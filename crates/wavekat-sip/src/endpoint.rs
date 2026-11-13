@@ -26,7 +26,7 @@ use crate::account::{SipAccount, Transport};
 use crate::callee::IncomingCall;
 use crate::inbound::InboundRequest;
 use crate::resolve::resolve_sip_server;
-use crate::sdp::parse_sdp;
+use crate::sdp::{parse_sdp, CodecList};
 use crate::stack::dialog::DialogId;
 use crate::stack::response::build_response;
 use crate::stack::transaction::{gen_tag, TransactionKey};
@@ -73,6 +73,8 @@ pub struct SipEndpoint {
     terminations: TerminationRegistry,
     /// Inbound INVITEs not yet accepted/rejected, for `CANCEL` handling.
     incoming_invites: IncomingRegistry,
+    /// The codecs calls on this endpoint may use, most preferred first.
+    codecs: StdMutex<CodecList>,
 }
 
 impl SipEndpoint {
@@ -151,6 +153,7 @@ impl SipEndpoint {
             dialogs: dialogs.clone(),
             terminations: terminations.clone(),
             incoming_invites: incoming_invites.clone(),
+            codecs: StdMutex::new(CodecList::default()),
         });
 
         // Inbound router: new INVITE → calls stream; in-dialog re-INVITE / INFO
@@ -234,6 +237,24 @@ impl SipEndpoint {
         if let Ok(mut map) = self.incoming_invites.lock() {
             map.remove(key);
         }
+    }
+
+    /// Choose the codecs calls on this endpoint may use, most preferred
+    /// first. [`crate::Caller::dial`] offers exactly these, and
+    /// [`crate::IncomingCall::accept`] answers with the first of them the
+    /// caller offered (or `488` if none). Applies to calls set up after
+    /// this returns; calls already established keep their codec.
+    ///
+    /// The default is [`CodecList::default`]: Opus, G.722, PCMU, PCMA.
+    pub fn set_codecs(&self, codecs: CodecList) {
+        if let Ok(mut current) = self.codecs.lock() {
+            *current = codecs;
+        }
+    }
+
+    /// The codecs calls on this endpoint may use, most preferred first.
+    pub fn codecs(&self) -> CodecList {
+        self.codecs.lock().map(|c| c.clone()).unwrap_or_default()
     }
 
     /// Local IP this endpoint is bound to.
@@ -500,6 +521,22 @@ mod tests {
             result.is_err(),
             "an unresolvable server must not yield an endpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn codecs_default_to_the_full_list_and_can_be_replaced() {
+        use crate::sdp::AudioCodec;
+        let account = make_account(Some("127.0.0.1"), Some(5060));
+        let cancel = CancellationToken::new();
+        let endpoint = SipEndpoint::new(&account, cancel)
+            .await
+            .expect("binds a UDP endpoint");
+        assert_eq!(endpoint.codecs(), CodecList::default());
+
+        let g711 = CodecList::new([AudioCodec::Pcma, AudioCodec::Pcmu]).unwrap();
+        endpoint.set_codecs(g711.clone());
+        assert_eq!(endpoint.codecs(), g711);
+        endpoint.shutdown();
     }
 
     /// A TCP endpoint against a real listener reports the connection's own
