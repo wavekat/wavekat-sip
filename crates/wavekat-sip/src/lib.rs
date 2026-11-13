@@ -23,9 +23,10 @@
 //!   ([`IncomingCall`]).
 //! - **SDP** — offer/answer for Opus (RFC 7587, preferred), G.722 and
 //!   G.711 (PCMU + PCMA) with round-trip parsing ([`build_sdp_offer`],
-//!   [`parse_sdp`]); answers and mid-call re-offers pin the negotiated
-//!   codec ([`CodecMenu`]). Negotiation only — encode/decode stays with
-//!   the consumer.
+//!   [`parse_sdp`]); the application chooses which codecs it may use and
+//!   in what order ([`CodecList`], [`SipEndpoint::set_codecs`]); answers
+//!   and mid-call re-offers pin the negotiated codec ([`CodecMenu`]).
+//!   Negotiation only — encode/decode stays with the consumer.
 //! - **RTP** — header parser ([`RtpHeader`]), a debug-friendly receive loop
 //!   ([`receive_rtp`]), and a codec-agnostic send loop ([`send_loop`]).
 //! - **TLS** — SIP over TLS ([`Transport::Tls`]), gated behind the `tls`
@@ -195,9 +196,9 @@ pub use rtp::dtmf::{
 pub use rtp::dtmf_recv::{parse_event_payload, DtmfEvent, DtmfEventPayload, DtmfReceiver};
 pub use rtp::{receive_rtp, send_loop, RtpHeader, RtpSendConfig};
 pub use sdp::{
-    build_sdp_offer, build_sdp_with, parse_sdp, select_codec, select_dtmf, AudioCodec, CodecMenu,
-    DtmfSpec, MediaDirection, RemoteMedia, DTMF_DEFAULT_PT, DTMF_WIDEBAND_DEFAULT_PT, G722_PT,
-    G722_RTP_CLOCK_RATE, OPUS_DEFAULT_PT, OPUS_RTP_CLOCK_RATE,
+    build_sdp_offer, build_sdp_offer_with, build_sdp_with, parse_sdp, select_codec, select_dtmf,
+    AudioCodec, CodecList, CodecMenu, DtmfSpec, MediaDirection, RemoteMedia, DTMF_DEFAULT_PT,
+    DTMF_WIDEBAND_DEFAULT_PT, G722_PT, G722_RTP_CLOCK_RATE, OPUS_DEFAULT_PT, OPUS_RTP_CLOCK_RATE,
 };
 pub use session_timer::{
     min_se_in, negotiate_uac, negotiate_uas, require_timer_header, session_expires_in,

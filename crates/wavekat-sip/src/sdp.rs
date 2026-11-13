@@ -8,14 +8,17 @@
 //!
 //! ## Offer, answer, re-offer
 //!
-//! - **Initial offer** ([`build_sdp_offer`]): the full menu, Opus first
-//!   (`opus/48000/2` with `useinbandfec=1`), then G.722, then PCMU/PCMA, plus
-//!   `telephone-event` at both the 8 kHz and 48 kHz clocks so whichever
-//!   codec the peer picks it finds a matching-clock DTMF entry.
+//! - **Initial offer** ([`build_sdp_offer_with`]): the codecs of a
+//!   [`CodecList`], in its order. The default list is Opus
+//!   (`opus/48000/2` with `useinbandfec=1`), then G.722, then PCMU/PCMA.
+//!   `telephone-event/8000` is always offered, and `telephone-event/48000`
+//!   too when Opus is, so whichever codec the peer picks it finds a
+//!   matching-clock DTMF entry.
 //! - **Answer**: a real RFC 3264 intersection — echo back *only* the
-//!   codec we selected from the offer (via [`select_codec`] /
+//!   codec we selected from the offer (via [`CodecList::select`] /
 //!   [`select_dtmf`]), at the offer's own payload-type numbers, built
-//!   with [`CodecMenu::Pinned`].
+//!   with [`CodecMenu::Pinned`]. The selection is the first codec in
+//!   *our* list that the offer contains.
 //! - **Mid-call re-offers** (hold/resume, session refresh): also
 //!   [`CodecMenu::Pinned`] to the already-negotiated codec. Re-offering
 //!   the full menu would let the peer switch codecs mid-call, which the
@@ -146,6 +149,12 @@ impl AudioCodec {
         }
     }
 
+    /// `true` when `self` and `other` are the same codec, whatever
+    /// payload type Opus rides on in each.
+    pub fn same_codec(&self, other: &AudioCodec) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+
     /// The `a=rtpmap:` encoding string (`<name>/<clock>[/<channels>]`).
     fn rtpmap_encoding(&self) -> &'static str {
         match self {
@@ -172,12 +181,100 @@ pub struct DtmfSpec {
     pub clock_rate: u32,
 }
 
+/// The codecs this side may use on a call, in order of preference.
+///
+/// Set one on the endpoint with [`crate::SipEndpoint::set_codecs`]:
+/// [`crate::Caller::dial`] offers exactly these codecs in this order, and
+/// [`crate::IncomingCall::accept`] answers with the first of them the
+/// caller's offer contains ([`Self::select`]). List only codecs the
+/// application can encode and decode.
+///
+/// The default is Opus (at [`OPUS_DEFAULT_PT`]), G.722, PCMU, PCMA.
+///
+/// ```
+/// use wavekat_sip::{AudioCodec, CodecList};
+///
+/// // A G.711-only application, A-law first.
+/// let codecs = CodecList::new([AudioCodec::Pcma, AudioCodec::Pcmu]).unwrap();
+/// assert_eq!(codecs.codecs(), &[AudioCodec::Pcma, AudioCodec::Pcmu]);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodecList(Vec<AudioCodec>);
+
+impl CodecList {
+    /// A list of `codecs`, most preferred first.
+    ///
+    /// Fails if the list is empty, names a codec twice, or puts Opus on a
+    /// payload type outside the dynamic range (96-127) or on one of the
+    /// `telephone-event` numbers we offer ([`DTMF_DEFAULT_PT`],
+    /// [`DTMF_WIDEBAND_DEFAULT_PT`]).
+    pub fn new(codecs: impl IntoIterator<Item = AudioCodec>) -> Result<Self, String> {
+        let mut list: Vec<AudioCodec> = Vec::new();
+        for codec in codecs {
+            if let AudioCodec::Opus { payload_type } = codec {
+                if !(96..=127).contains(&payload_type) {
+                    return Err(format!(
+                        "Opus needs a dynamic payload type (96-127), got {payload_type}"
+                    ));
+                }
+                if payload_type == DTMF_DEFAULT_PT || payload_type == DTMF_WIDEBAND_DEFAULT_PT {
+                    return Err(format!(
+                        "Opus payload type {payload_type} is taken by telephone-event"
+                    ));
+                }
+            }
+            if list.iter().any(|c| c.same_codec(&codec)) {
+                return Err(format!("{codec:?} is listed more than once"));
+            }
+            list.push(codec);
+        }
+        if list.is_empty() {
+            return Err("the codec list is empty".to_string());
+        }
+        Ok(Self(list))
+    }
+
+    /// The codecs, most preferred first.
+    pub fn codecs(&self) -> &[AudioCodec] {
+        &self.0
+    }
+
+    /// `true` if the list has this codec (at any payload type, for Opus).
+    pub fn contains(&self, codec: &AudioCodec) -> bool {
+        self.0.iter().any(|c| c.same_codec(codec))
+    }
+
+    /// Pick the codec to answer `offer` with: the first codec in this
+    /// list that the offer also contains, with Opus at the **offer's**
+    /// payload type. `None` when there is nothing in common — the
+    /// SIP-correct response then is `488 Not Acceptable Here`.
+    pub fn select(&self, offer: &RemoteMedia) -> Option<AudioCodec> {
+        self.0
+            .iter()
+            .find_map(|ours| offer.codecs.iter().copied().find(|c| c.same_codec(ours)))
+    }
+}
+
+impl Default for CodecList {
+    fn default() -> Self {
+        Self(vec![
+            AudioCodec::Opus {
+                payload_type: OPUS_DEFAULT_PT,
+            },
+            AudioCodec::G722,
+            AudioCodec::Pcmu,
+            AudioCodec::Pcma,
+        ])
+    }
+}
+
 /// Which audio codecs an SDP body advertises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecMenu {
-    /// The full initial-offer menu: Opus (preferred, at
-    /// [`OPUS_DEFAULT_PT`]), then G.722, then PCMU/PCMA, with
-    /// `telephone-event` at both clocks. Use for initial offers only.
+    /// The default [`CodecList`] as an initial offer: Opus (preferred,
+    /// at [`OPUS_DEFAULT_PT`]), then G.722, then PCMU/PCMA, with
+    /// `telephone-event` at both clocks. Use for initial offers only;
+    /// [`build_sdp_offer_with`] offers any other list.
     Full,
     /// Exactly one codec (plus optionally one `telephone-event` entry)
     /// — the shape of every answer and every post-negotiation re-offer.
@@ -193,19 +290,56 @@ pub enum CodecMenu {
     },
 }
 
-/// Build the initial SDP offer: the full codec menu ([`CodecMenu::Full`]),
-/// `a=sendrecv`, `o=` version 0.
+/// Build the initial SDP offer with the default codecs
+/// ([`CodecMenu::Full`]), `a=sendrecv`, `o=` version 0.
 ///
 /// Answers and re-offers must **not** use this — see [`CodecMenu`] and
 /// [`build_sdp_with`].
 pub fn build_sdp_offer(local_ip: IpAddr, rtp_port: u16) -> Vec<u8> {
-    build_sdp_with(
+    build_sdp_offer_with(local_ip, rtp_port, &CodecList::default())
+}
+
+/// Build an initial SDP offer listing exactly `codecs`, in their order,
+/// with `a=sendrecv` and `o=` version 0. `telephone-event/8000` is always
+/// offered; `telephone-event/48000` only alongside Opus.
+pub fn build_sdp_offer_with(local_ip: IpAddr, rtp_port: u16, codecs: &CodecList) -> Vec<u8> {
+    let mut pts = Vec::new();
+    let mut attrs = Vec::new();
+    push_offer(codecs, &mut pts, &mut attrs);
+    render(
         local_ip,
         rtp_port,
-        CodecMenu::Full,
+        &pts,
+        &attrs,
         MediaDirection::SendRecv,
         0,
     )
+}
+
+/// Append the `m=` payload types and `a=` lines that offer `codecs`.
+fn push_offer(codecs: &CodecList, pts: &mut Vec<String>, attrs: &mut Vec<String>) {
+    for codec in codecs.codecs() {
+        let pt = codec.payload_type();
+        pts.push(pt.to_string());
+        attrs.push(format!("a=rtpmap:{pt} {}", codec.rtpmap_encoding()));
+        if matches!(codec, AudioCodec::Opus { .. }) {
+            attrs.push(format!("a=fmtp:{pt} useinbandfec=1"));
+        }
+    }
+    pts.push(DTMF_DEFAULT_PT.to_string());
+    attrs.push(format!("a=rtpmap:{DTMF_DEFAULT_PT} telephone-event/8000"));
+    attrs.push(format!("a=fmtp:{DTMF_DEFAULT_PT} 0-15"));
+    let with_opus = codecs
+        .codecs()
+        .iter()
+        .any(|c| matches!(c, AudioCodec::Opus { .. }));
+    if with_opus {
+        pts.push(DTMF_WIDEBAND_DEFAULT_PT.to_string());
+        attrs.push(format!(
+            "a=rtpmap:{DTMF_WIDEBAND_DEFAULT_PT} telephone-event/{OPUS_RTP_CLOCK_RATE}"
+        ));
+        attrs.push(format!("a=fmtp:{DTMF_WIDEBAND_DEFAULT_PT} 0-15"));
+    }
 }
 
 /// Build an SDP body with an explicit codec `menu`, media `direction`,
@@ -228,27 +362,7 @@ pub fn build_sdp_with(
     let mut attrs: Vec<String> = Vec::new();
 
     match menu {
-        CodecMenu::Full => {
-            pts.extend([
-                OPUS_DEFAULT_PT.to_string(),
-                G722_PT.to_string(),
-                "0".into(),
-                "8".into(),
-                DTMF_DEFAULT_PT.to_string(),
-                DTMF_WIDEBAND_DEFAULT_PT.to_string(),
-            ]);
-            attrs.push(format!("a=rtpmap:{OPUS_DEFAULT_PT} opus/48000/2"));
-            attrs.push(format!("a=fmtp:{OPUS_DEFAULT_PT} useinbandfec=1"));
-            attrs.push(format!("a=rtpmap:{G722_PT} G722/8000"));
-            attrs.push("a=rtpmap:0 PCMU/8000".into());
-            attrs.push("a=rtpmap:8 PCMA/8000".into());
-            attrs.push(format!("a=rtpmap:{DTMF_DEFAULT_PT} telephone-event/8000"));
-            attrs.push(format!("a=fmtp:{DTMF_DEFAULT_PT} 0-15"));
-            attrs.push(format!(
-                "a=rtpmap:{DTMF_WIDEBAND_DEFAULT_PT} telephone-event/{OPUS_RTP_CLOCK_RATE}"
-            ));
-            attrs.push(format!("a=fmtp:{DTMF_WIDEBAND_DEFAULT_PT} 0-15"));
-        }
+        CodecMenu::Full => push_offer(&CodecList::default(), &mut pts, &mut attrs),
         CodecMenu::Pinned { codec, dtmf } => {
             let pt = codec.payload_type();
             pts.push(pt.to_string());
@@ -270,6 +384,18 @@ pub fn build_sdp_with(
         }
     }
 
+    render(local_ip, rtp_port, &pts, &attrs, direction, version)
+}
+
+/// Assemble an SDP body from its `m=` payload types and `a=` lines.
+fn render(
+    local_ip: IpAddr,
+    rtp_port: u16,
+    pts: &[String],
+    attrs: &[String],
+    direction: MediaDirection,
+    version: u32,
+) -> Vec<u8> {
     let pt_list = pts.join(" ");
     let attr_lines = attrs.join("\r\n");
     let dir = direction.attribute();
@@ -304,11 +430,15 @@ pub struct RemoteMedia {
     ///
     /// When parsed from an **answer** this *is* the negotiated codec.
     /// When parsed from an **offer** it is only the peer's first
-    /// preference — the selection is ours to make ([`select_codec`]).
+    /// preference — the selection is ours to make ([`CodecList::select`]).
     /// [`crate::IncomingCall::accept`] rewrites this field to the codec
     /// it actually selected, so on an established [`crate::Call`] it is
     /// always the negotiated codec.
     pub codec: Option<AudioCodec>,
+    /// Every codec this stack knows on the `m=audio` line, in the
+    /// peer's order, each codec once (at its first payload type).
+    /// [`CodecList::select`] picks from these.
+    pub codecs: Vec<AudioCodec>,
     /// The payload type Opus rides on, if Opus appears **anywhere** in
     /// the menu (not just first). This is what lets the answer side
     /// prefer Opus over a peer that offers `0 8 111`.
@@ -332,16 +462,15 @@ impl RemoteMedia {
     }
 }
 
-/// Pick the audio codec for an answer, per the WaveKat policy: **prefer
-/// Opus wherever it appears in the offer, else the peer's first codec
-/// we know (G.722 or G.711, in the peer's order of preference)**.
-/// Returns `None` when the offer contains nothing this stack knows —
-/// the SIP-correct response then is `488 Not Acceptable Here`.
+/// Pick the audio codec for an answer from the default [`CodecList`]:
+/// Opus wherever it appears in the offer, else G.722, else PCMU, else
+/// PCMA. Returns `None` when the offer contains nothing this stack
+/// knows — the SIP-correct response then is `488 Not Acceptable Here`.
+///
+/// Same as `CodecList::default().select(offer)`; use
+/// [`CodecList::select`] for any other list.
 pub fn select_codec(offer: &RemoteMedia) -> Option<AudioCodec> {
-    offer
-        .opus_payload_type
-        .map(|payload_type| AudioCodec::Opus { payload_type })
-        .or(offer.codec)
+    CodecList::default().select(offer)
 }
 
 /// Pick the `telephone-event` entry to answer with, given the selected
@@ -433,11 +562,17 @@ pub fn parse_sdp(sdp_bytes: &[u8]) -> Result<RemoteMedia, String> {
         }
     };
 
-    let codec = audio_pts.iter().copied().find_map(resolve);
-    let opus_payload_type = audio_pts
-        .iter()
-        .copied()
-        .find(|&pt| matches!(resolve(pt), Some(AudioCodec::Opus { .. })));
+    let mut codecs: Vec<AudioCodec> = Vec::new();
+    for codec in audio_pts.iter().copied().filter_map(resolve) {
+        if !codecs.iter().any(|c| c.same_codec(&codec)) {
+            codecs.push(codec);
+        }
+    }
+    let codec = codecs.first().copied();
+    let opus_payload_type = codecs.iter().find_map(|c| match c {
+        AudioCodec::Opus { payload_type } => Some(*payload_type),
+        _ => None,
+    });
 
     // telephone-event must both be named in an rtpmap *and* listed on
     // the m=audio line for the negotiation to be valid — at any clock
@@ -463,6 +598,7 @@ pub fn parse_sdp(sdp_bytes: &[u8]) -> Result<RemoteMedia, String> {
             port,
             payload_type: pt,
             codec,
+            codecs,
             opus_payload_type,
             dtmf_events,
         }),
@@ -766,9 +902,9 @@ mod tests {
     fn select_codec_falls_back_to_g711_without_opus() {
         let sdp = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 8 0\r\n";
         let media = parse_sdp(sdp).unwrap();
-        // No Opus in the offer → the peer's first G.711, no Opus in the
-        // answer.
-        assert_eq!(select_codec(&media), Some(AudioCodec::Pcma));
+        // No Opus in the offer → G.711, in the default list's order
+        // (PCMU before PCMA), not the peer's.
+        assert_eq!(select_codec(&media), Some(AudioCodec::Pcmu));
     }
 
     #[test]
@@ -816,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn select_codec_follows_the_peers_order_between_g722_and_g711() {
+    fn select_codec_prefers_g722_over_g711_in_any_offer_order() {
         let wide_first = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 9 8 0\r\n";
         assert_eq!(
             select_codec(&parse_sdp(wide_first).unwrap()),
@@ -825,7 +961,7 @@ mod tests {
         let narrow_first = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 8 9\r\n";
         assert_eq!(
             select_codec(&parse_sdp(narrow_first).unwrap()),
-            Some(AudioCodec::Pcma)
+            Some(AudioCodec::G722)
         );
         // Opus still wins wherever it sits.
         let with_opus = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 9 0 111\r\na=rtpmap:111 opus/48000/2\r\n";
@@ -850,6 +986,140 @@ mod tests {
         assert!(text.contains("a=rtpmap:9 G722/8000\r\n"));
         assert!(!text.contains("fmtp:9"));
         assert_eq!(parse_sdp(&body).unwrap().codec, Some(AudioCodec::G722));
+    }
+
+    #[test]
+    fn codec_list_default_is_the_full_menu_in_order() {
+        assert_eq!(
+            CodecList::default().codecs(),
+            &[
+                AudioCodec::Opus { payload_type: 111 },
+                AudioCodec::G722,
+                AudioCodec::Pcmu,
+                AudioCodec::Pcma,
+            ]
+        );
+        // The default offer is byte for byte the CodecMenu::Full one.
+        assert_eq!(
+            build_sdp_offer_with(ip(), 5004, &CodecList::default()),
+            build_sdp_with(ip(), 5004, CodecMenu::Full, MediaDirection::SendRecv, 0)
+        );
+    }
+
+    #[test]
+    fn codec_list_refuses_bad_lists() {
+        assert!(CodecList::new([]).unwrap_err().contains("empty"));
+        let twice = CodecList::new([
+            AudioCodec::Opus { payload_type: 111 },
+            AudioCodec::Opus { payload_type: 112 },
+        ]);
+        assert!(twice.unwrap_err().contains("more than once"));
+        let static_pt = CodecList::new([AudioCodec::Opus { payload_type: 9 }]);
+        assert!(static_pt.unwrap_err().contains("96-127"));
+        for taken in [DTMF_DEFAULT_PT, DTMF_WIDEBAND_DEFAULT_PT] {
+            let clash = CodecList::new([AudioCodec::Opus {
+                payload_type: taken,
+            }]);
+            assert!(clash.unwrap_err().contains("telephone-event"));
+        }
+        assert!(CodecList::new([AudioCodec::Opus { payload_type: 120 }]).is_ok());
+    }
+
+    #[test]
+    fn codec_list_contains_ignores_the_opus_payload_type() {
+        let list = CodecList::new([AudioCodec::Opus { payload_type: 120 }]).unwrap();
+        assert!(list.contains(&AudioCodec::Opus { payload_type: 111 }));
+        assert!(!list.contains(&AudioCodec::Pcmu));
+    }
+
+    #[test]
+    fn offer_lists_exactly_the_chosen_codecs_in_order() {
+        // G.711 only: no Opus, so no 48 kHz telephone-event either.
+        let g711 = CodecList::new([AudioCodec::Pcma, AudioCodec::Pcmu]).unwrap();
+        let text = String::from_utf8(build_sdp_offer_with(ip(), 5004, &g711)).unwrap();
+        assert!(text.contains("m=audio 5004 RTP/AVP 8 0 101\r\n"), "{text}");
+        assert!(text.contains("a=rtpmap:8 PCMA/8000\r\n"));
+        assert!(text.contains("a=rtpmap:101 telephone-event/8000\r\n"));
+        assert!(!text.contains("opus"));
+        assert!(!text.contains("G722"));
+        assert!(!text.contains("telephone-event/48000"));
+        assert!(text.contains("a=sendrecv\r\n"));
+        assert!(text.contains("o=wavekat 0 0 IN IP4 10.0.0.1\r\n"));
+
+        // G.722 first, Opus on a payload type of our choosing.
+        let wide =
+            CodecList::new([AudioCodec::G722, AudioCodec::Opus { payload_type: 120 }]).unwrap();
+        let text = String::from_utf8(build_sdp_offer_with(ip(), 5004, &wide)).unwrap();
+        assert!(
+            text.contains("m=audio 5004 RTP/AVP 9 120 101 110\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("a=rtpmap:120 opus/48000/2\r\n"));
+        assert!(text.contains("a=fmtp:120 useinbandfec=1\r\n"));
+        assert!(text.contains("a=rtpmap:110 telephone-event/48000\r\n"));
+
+        // And the offer parses back to the same codecs, in order.
+        let media = parse_sdp(&build_sdp_offer_with(ip(), 5004, &wide)).unwrap();
+        assert_eq!(media.codecs, wide.codecs());
+    }
+
+    #[test]
+    fn parse_lists_every_known_codec_once_in_the_peers_order() {
+        // 96 is unknown, 112 is a second Opus entry, 101 is DTMF.
+        let sdp = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 96 8 111 112 9 0 101\r\n\
+                    a=rtpmap:96 iLBC/8000\r\n\
+                    a=rtpmap:111 opus/48000/2\r\n\
+                    a=rtpmap:112 opus/48000/2\r\n\
+                    a=rtpmap:101 telephone-event/8000\r\n";
+        let media = parse_sdp(sdp).unwrap();
+        assert_eq!(
+            media.codecs,
+            vec![
+                AudioCodec::Pcma,
+                AudioCodec::Opus { payload_type: 111 },
+                AudioCodec::G722,
+                AudioCodec::Pcmu,
+            ]
+        );
+        assert_eq!(media.codec, Some(AudioCodec::Pcma));
+        assert_eq!(media.opus_payload_type, Some(111));
+    }
+
+    #[test]
+    fn select_follows_our_list_not_the_offer_order() {
+        let offer = parse_sdp(
+            b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 0 8 9 102\r\n\
+              a=rtpmap:102 opus/48000/2\r\n",
+        )
+        .unwrap();
+        let list = |codecs: &[AudioCodec]| CodecList::new(codecs.iter().copied()).unwrap();
+
+        // Our first choice wins wherever the peer put it.
+        assert_eq!(
+            list(&[AudioCodec::Pcma, AudioCodec::Pcmu]).select(&offer),
+            Some(AudioCodec::Pcma)
+        );
+        assert_eq!(
+            list(&[AudioCodec::G722, AudioCodec::Opus { payload_type: 111 }]).select(&offer),
+            Some(AudioCodec::G722)
+        );
+        // Opus is answered at the offer's payload type, not ours.
+        assert_eq!(
+            list(&[AudioCodec::Opus { payload_type: 111 }]).select(&offer),
+            Some(AudioCodec::Opus { payload_type: 102 })
+        );
+        // Codecs the peer did not offer are skipped.
+        let g722_only =
+            parse_sdp(b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 5000 RTP/AVP 9\r\n").unwrap();
+        assert_eq!(
+            list(&[AudioCodec::Pcmu, AudioCodec::G722]).select(&g722_only),
+            Some(AudioCodec::G722)
+        );
+        // Nothing in common: no answer (488).
+        assert_eq!(
+            list(&[AudioCodec::Pcmu, AudioCodec::Pcma]).select(&g722_only),
+            None
+        );
     }
 
     #[test]

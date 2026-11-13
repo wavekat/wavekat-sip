@@ -43,14 +43,14 @@ below.
 
 Single `m=audio` line, one round of offer/answer:
 
-- Offer generated at `dial` time (`build_sdp_offer` — the full menu,
-  Opus preferred, G.711 fallback), answer parsed from the 2xx
-  (`parse_sdp`) — UAC direction.
+- Offer generated at `dial` time (`build_sdp_offer_with` — the
+  endpoint's `CodecList`, by default Opus, G.722, PCMU, PCMA), answer
+  parsed from the 2xx (`parse_sdp`) — UAC direction.
 - Offer parsed from the inbound INVITE, answer generated in the 200 OK
-  as a **real §6.1 intersection**: only the selected codec (Opus
-  wherever offered, at the offer's payload type, else the offer's first
-  G.711) plus the matching `telephone-event` entry, echoed at the
-  offer's numbers (`select_codec` / `select_dtmf` /
+  as a **real §6.1 intersection**: only the selected codec (the first
+  codec in the endpoint's `CodecList` the offer contains, Opus at the
+  offer's payload type) plus the matching `telephone-event` entry,
+  echoed at the offer's numbers (`CodecList::select` / `select_dtmf` /
   `CodecMenu::Pinned`); a no-common-codec offer is refused
   `488 Not Acceptable Here` — UAS direction.
 

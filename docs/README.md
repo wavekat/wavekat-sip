@@ -42,3 +42,4 @@ Two kinds of documents live here:
 | [22-register-probe.md](22-register-probe.md) | `Registrar::probe`: a credential-free REGISTER binding query (RFC 3261 §10.2.3) to check a registrar is listening on a transport without signing in |
 | [23-stream-keepalive.md](23-stream-keepalive.md) | RFC 5626 §3.5.1 CRLF keepalive on TCP/TLS: ping idle connections, and close one that fails a write or stops answering |
 | [24-asterisk-e2e.md](24-asterisk-e2e.md) | End-to-end tests against a real Asterisk in Docker (`make e2e-asterisk`), and the hosted-runner CI job that runs them |
+| [25-codec-list.md](25-codec-list.md) | `CodecList`: the application chooses which codecs calls may use and in what order, set on the `SipEndpoint` |

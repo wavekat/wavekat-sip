@@ -14,7 +14,9 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use wavekat_sip::re_exports::Uri;
-use wavekat_sip::{AudioCodec, Caller, DtmfDigit, SipAccount, SipEndpoint, TlsPolicy, Transport};
+use wavekat_sip::{
+    AudioCodec, Caller, CodecList, DtmfDigit, SipAccount, SipEndpoint, TlsPolicy, Transport,
+};
 
 fn account(server: &str, port: u16) -> SipAccount {
     SipAccount {
@@ -869,5 +871,103 @@ async fn ring_sends_180_sharing_the_final_response_tag() {
         "180 Ringing and 200 OK must carry the same UAS To tag (RFC 3261 §12.1.1)"
     );
 
+    cancel.cancel();
+}
+
+/// Each endpoint's codec list shapes the call: the caller offers only its
+/// own codecs, and the callee answers with the first of *its* codecs the
+/// offer contains — here G.722, although PCMU comes first in the offer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codec_lists_decide_the_negotiated_codec() {
+    let cancel = CancellationToken::new();
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    callee.set_codecs(CodecList::new([AudioCodec::Pcma, AudioCodec::G722]).unwrap());
+
+    let caller_account = account("127.0.0.1", callee.local_addr().port());
+    let caller_ep = SipEndpoint::new(&caller_account, cancel.clone())
+        .await
+        .expect("bind caller");
+    caller_ep.set_codecs(CodecList::new([AudioCodec::Pcmu, AudioCodec::G722]).unwrap());
+
+    let callee_for_task = callee.clone();
+    let accepted = tokio::spawn(async move {
+        let incoming = callee_for_task
+            .next_incoming_call()
+            .await
+            .expect("inbound call arrives");
+        // The offer carries exactly the caller's list, in its order.
+        assert_eq!(
+            incoming.remote_media.codecs,
+            vec![AudioCodec::Pcmu, AudioCodec::G722]
+        );
+        incoming.accept().await.expect("accept inbound call")
+    });
+
+    let caller = Caller::new(caller_account, caller_ep.clone());
+    let target: Uri = "sip:1001@127.0.0.1".try_into().unwrap();
+    let mut call = timeout(Duration::from_secs(10), caller.dial(target))
+        .await
+        .expect("dial completes within 10s")
+        .expect("call is answered");
+    assert_eq!(call.remote_media.codec, Some(AudioCodec::G722));
+    // G.722's RTP clock is 8 kHz, so DTMF rides telephone-event/8000.
+    assert_eq!(call.remote_media.dtmf().map(|d| d.clock_rate), Some(8000));
+
+    let callee_call = timeout(Duration::from_secs(10), accepted)
+        .await
+        .expect("accept finishes within 10s")
+        .expect("accept task did not panic");
+    assert_eq!(callee_call.remote_media.codec, Some(AudioCodec::G722));
+
+    timeout(Duration::from_secs(10), call.hangup())
+        .await
+        .expect("hangup completes within 10s")
+        .expect("BYE acknowledged");
+    cancel.cancel();
+}
+
+/// With no codec in common the callee answers `488` and the dial fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_common_codec_is_refused_with_488() {
+    let cancel = CancellationToken::new();
+    let callee_account = account("127.0.0.1", 5060);
+    let callee = SipEndpoint::new(&callee_account, cancel.clone())
+        .await
+        .expect("bind callee");
+    callee.set_codecs(CodecList::new([AudioCodec::Pcmu, AudioCodec::Pcma]).unwrap());
+
+    let caller_account = account("127.0.0.1", callee.local_addr().port());
+    let caller_ep = SipEndpoint::new(&caller_account, cancel.clone())
+        .await
+        .expect("bind caller");
+    caller_ep.set_codecs(CodecList::new([AudioCodec::G722]).unwrap());
+
+    let callee_for_task = callee.clone();
+    let refused = tokio::spawn(async move {
+        let incoming = callee_for_task
+            .next_incoming_call()
+            .await
+            .expect("inbound call arrives");
+        incoming.accept().await.err().map(|e| e.to_string())
+    });
+
+    let caller = Caller::new(caller_account, caller_ep.clone());
+    let target: Uri = "sip:1001@127.0.0.1".try_into().unwrap();
+    let err = timeout(Duration::from_secs(10), caller.dial(target))
+        .await
+        .expect("dial completes within 10s")
+        .err()
+        .expect("the call is refused");
+    assert!(err.to_string().contains("488"), "{err}");
+
+    let callee_err = timeout(Duration::from_secs(10), refused)
+        .await
+        .expect("accept finishes within 10s")
+        .expect("accept task did not panic")
+        .expect("accept fails");
+    assert!(callee_err.contains("answered 488"), "{callee_err}");
     cancel.cancel();
 }

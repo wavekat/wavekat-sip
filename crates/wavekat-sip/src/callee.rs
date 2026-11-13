@@ -18,9 +18,7 @@ use tracing::{debug, info};
 
 use crate::caller::Call;
 use crate::endpoint::SipEndpoint;
-use crate::sdp::{
-    build_sdp_with, select_codec, select_dtmf, CodecMenu, MediaDirection, RemoteMedia,
-};
+use crate::sdp::{build_sdp_with, select_dtmf, CodecMenu, MediaDirection, RemoteMedia};
 use crate::session_timer::{negotiate_uas, require_timer_header, supported_timer_header};
 use crate::stack::dialog::Dialog;
 use crate::stack::response::{build_response, ResponseBody};
@@ -118,22 +116,22 @@ impl IncomingCall {
     /// Accept the call: bind an RTP socket, answer `200 OK` with an SDP answer,
     /// and return the established [`Call`].
     ///
-    /// The answer is a real RFC 3264 intersection of the offer: Opus wherever
-    /// the offer contains it (at the offer's payload type), else the offer's
-    /// first G.722 or G.711 — echoed back as a [`CodecMenu::Pinned`] body, never the
-    /// full menu. The returned call's [`RemoteMedia::codec`] is rewritten to
+    /// The answer is a real RFC 3264 intersection of the offer: the first
+    /// codec in the endpoint's list ([`SipEndpoint::codecs`]) that the offer
+    /// contains, Opus at the offer's payload type — echoed back as a
+    /// [`CodecMenu::Pinned`] body, never the full menu. The returned call's [`RemoteMedia::codec`] is rewritten to
     /// that selection, so it is always the *negotiated* codec, not the peer's
     /// first preference.
     ///
-    /// If the offer contains no codec this stack knows, the INVITE is answered
-    /// `488 Not Acceptable Here` and an error is returned. Check
-    /// [`IncomingCall::remote_media`]'s `codec`/`opus_payload_type` before
-    /// accepting to decide earlier.
+    /// If the offer contains none of those codecs, the INVITE is answered
+    /// `488 Not Acceptable Here` and an error is returned. To decide earlier,
+    /// check `endpoint.codecs().select(&incoming.remote_media)` before
+    /// accepting.
     pub async fn accept(self) -> Result<Call, BoxError> {
         // No longer cancellable once we commit to answering.
         self.endpoint.unregister_incoming(&self.key);
 
-        let Some(codec) = select_codec(&self.remote_media) else {
+        let Some(codec) = self.endpoint.codecs().select(&self.remote_media) else {
             // Nothing we can speak: the SIP-correct refusal is a 488 final.
             let response = build_response(
                 &self.request,
@@ -145,7 +143,7 @@ impl IncomingCall {
             .ok_or("could not build 488 response")?;
             self.endpoint.ua().answer(self.key, response).await;
             return Err(format!(
-                "no supported codec in the offer (first payload type {}); answered 488",
+                "no codec in common with the offer (first payload type {}); answered 488",
                 self.remote_media.payload_type
             )
             .into());
